@@ -1,0 +1,202 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Repository;
+
+use Doctrine\DBAL\ArrayParameterType;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\ParameterType;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
+
+final class ContractBalanceReadRepository
+{
+    public function __construct(
+        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        private readonly Connection $connection,
+    ) {
+    }
+
+    /**
+     * @return list<array{address:string,balance_raw:string,inflow_raw:string,outflow_raw:string}>
+     */
+    public function findBalancesByContract(string $contractId, int $networkCode, int $limit, int $offset = 0): array
+    {
+        $contractDbId = $this->resolveContractDbId($contractId, $networkCode);
+        if ($contractDbId === null) {
+            return [];
+        }
+
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT
+                holder_address AS address,
+                CAST(balance_raw AS CHAR) AS balance_raw,
+                CAST(inflow_raw AS CHAR) AS inflow_raw,
+                CAST(outflow_raw AS CHAR) AS outflow_raw
+             FROM contract_holder_balances
+             WHERE contract_id = :contract_id
+               AND network = :network
+             ORDER BY balance_raw DESC, holder_address ASC
+             LIMIT :limit_rows OFFSET :offset_rows',
+            [
+                'contract_id' => $contractDbId,
+                'network' => $networkCode,
+                'limit_rows' => $limit,
+                'offset_rows' => $offset,
+            ],
+            [
+                'contract_id' => ParameterType::INTEGER,
+                'network' => ParameterType::INTEGER,
+                'limit_rows' => ParameterType::INTEGER,
+                'offset_rows' => ParameterType::INTEGER,
+            ]
+        );
+
+        if (!is_array($rows) || $rows === []) {
+            return [];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @return list<array{related_contract_id:string,balance_raw:string,inflow_raw:string,outflow_raw:string}>
+     */
+    public function findHolderBalancesAcrossContracts(string $holderAddress, int $networkCode, int $limit, int $offset = 0): array
+    {
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT
+                chb.contract_id,
+                CAST(chb.balance_raw AS CHAR) AS balance_raw,
+                CAST(chb.inflow_raw AS CHAR) AS inflow_raw,
+                CAST(chb.outflow_raw AS CHAR) AS outflow_raw
+             FROM contract_holder_balances chb
+             WHERE chb.holder_address = :holder_address
+               AND chb.network = :network
+             ORDER BY ABS(chb.balance_raw) DESC, chb.contract_id ASC
+             LIMIT :limit_rows OFFSET :offset_rows',
+            [
+                'holder_address' => $holderAddress,
+                'network' => $networkCode,
+                'limit_rows' => $limit,
+                'offset_rows' => $offset,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'limit_rows' => ParameterType::INTEGER,
+                'offset_rows' => ParameterType::INTEGER,
+            ]
+        );
+
+        if (!is_array($rows) || $rows === []) {
+            return [];
+        }
+
+        return $this->mapContractRows($rows, 'contract_id');
+    }
+
+    private function resolveContractDbId(string $contractId, int $networkCode): ?int
+    {
+        $rowId = $this->connection->fetchOne(
+            'SELECT id
+             FROM contracts
+             WHERE contract_id = :contract_id
+               AND network = :network
+             LIMIT 1',
+            [
+                'contract_id' => $contractId,
+                'network' => $networkCode,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+
+        if ($rowId === false) {
+            return null;
+        }
+
+        $normalizedId = (int) $rowId;
+        if ($normalizedId <= 0) {
+            return null;
+        }
+
+        return $normalizedId;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     * @return list<array{related_contract_id:string,balance_raw:string,inflow_raw:string,outflow_raw:string}>
+     */
+    private function mapContractRows(array $rows, string $idKey): array
+    {
+        $contractDbIds = [];
+        foreach ($rows as $row) {
+            $contractDbId = isset($row[$idKey]) ? (int) $row[$idKey] : 0;
+            if ($contractDbId > 0) {
+                $contractDbIds[] = $contractDbId;
+            }
+        }
+
+        $contractMap = $this->loadContractAddressMap($contractDbIds);
+        if ($contractMap === []) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($rows as $row) {
+            $contractDbId = isset($row[$idKey]) ? (int) $row[$idKey] : 0;
+            $relatedContractId = $contractMap[$contractDbId] ?? null;
+            if (!is_string($relatedContractId) || $relatedContractId === '') {
+                continue;
+            }
+
+            $result[] = [
+                'related_contract_id' => $relatedContractId,
+                'balance_raw' => (string) ($row['balance_raw'] ?? '0'),
+                'inflow_raw' => (string) ($row['inflow_raw'] ?? '0'),
+                'outflow_raw' => (string) ($row['outflow_raw'] ?? '0'),
+            ];
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param list<int> $contractDbIds
+     * @return array<int,string>
+     */
+    private function loadContractAddressMap(array $contractDbIds): array
+    {
+        $contractDbIds = array_values(array_unique(array_filter(
+            array_map(static fn (mixed $id): int => (int) $id, $contractDbIds),
+            static fn (int $id): bool => $id > 0
+        )));
+        if ($contractDbIds === []) {
+            return [];
+        }
+
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT id, contract_id
+             FROM contracts
+             WHERE id IN (:ids)',
+            ['ids' => $contractDbIds],
+            ['ids' => ArrayParameterType::INTEGER]
+        );
+        if (!is_array($rows) || $rows === []) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($rows as $row) {
+            $id = isset($row['id']) ? (int) $row['id'] : 0;
+            $contractId = trim((string) ($row['contract_id'] ?? ''));
+            if ($id <= 0 || $contractId === '') {
+                continue;
+            }
+            $map[$id] = $contractId;
+        }
+
+        return $map;
+    }
+}

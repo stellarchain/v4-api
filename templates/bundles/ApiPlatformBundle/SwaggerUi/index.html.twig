@@ -1,0 +1,11 @@
+{% extends "@!ApiPlatform/SwaggerUi/index.html.twig" %}
+
+{% block header %}{% endblock %}
+
+{% block stylesheet %}
+    {{ parent() }}
+    <style>
+        body { margin: 0; }
+        #formats { display: none; }
+    </style>
+{% endblock %}

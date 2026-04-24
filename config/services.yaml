@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../vendor/symfony/dependency-injection/Loader/schema/services.schema.json
+
+# This file is the entry point to configure your own services.
+# Files in the packages/ subdirectory configure your dependencies.
+# See also https://symfony.com/doc/current/service_container/import.html
+
+# Put parameters here that don't need to change on each machine where the app is deployed
+# https://symfony.com/doc/current/best_practices.html#use-parameters-for-application-configuration
+parameters:
+    app.empty_string: ''
+    app.true_string: '1'
+    app.false_string: '0'
+    app.default_mailer_from: 'support@stellarchain.io'
+    app.default_mailer_from_name: 'Stellarchain.io Explorer'
+    app.default_order_verification_admin_email: 'support@stellarchain.io'
+    app.default_spaces_region: 'us-east-1'
+    app.default_spaces_endpoint: 'https://nyc3.digitaloceanspaces.com'
+    app.default_spaces_public_base_url: ''
+    app.default_spaces_bucket: ''
+    app.default_spaces_key: ''
+    app.default_spaces_secret: ''
+    app.spaces_region: '%env(default:app.default_spaces_region:DO_SPACES_REGION)%'
+    app.spaces_endpoint: '%env(default:app.default_spaces_endpoint:DO_SPACES_ENDPOINT)%'
+    app.spaces_public_base_url: '%env(default:app.default_spaces_public_base_url:DO_SPACES_PUBLIC_BASE_URL)%'
+    app.spaces_bucket: '%env(default:app.default_spaces_bucket:DO_SPACES_BUCKET)%'
+    app.spaces_key: '%env(default:app.default_spaces_key:DO_SPACES_KEY)%'
+    app.spaces_secret: '%env(default:app.default_spaces_secret:DO_SPACES_SECRET)%'
+    app.spaces_path_style_endpoint: '%env(bool:default:app.false_string:DO_SPACES_PATH_STYLE_ENDPOINT)%'
+    app.spaces_visibility_public: '%env(bool:default:app.true_string:DO_SPACES_VISIBILITY_PUBLIC)%'
+    app.order_mailer_from: '%env(default:app.default_mailer_from:ORDER_MAILER_FROM)%'
+    app.order_mailer_from_name: '%env(default:app.default_mailer_from_name:ORDER_MAILER_FROM_NAME)%'
+    app.order_verification_admin_email: '%env(default:app.default_order_verification_admin_email:ORDER_VERIFICATION_ADMIN_EMAIL)%'
+    app.order_monitor_account_default: '%env(default:app.empty_string:STELLAR_ORDER_MONITOR_ACCOUNT)%'
+    app.order_monitor_account_mainnet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_MAINNET)%'
+    app.order_monitor_account_testnet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_TESTNET)%'
+    app.order_monitor_account_futurenet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_FUTURENET)%'
+
+services:
+    # default configuration for services in *this* file
+    _defaults:
+        autowire: true      # Automatically injects dependencies in your services.
+        autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
+
+    # makes classes in src/ available to be used as services
+    # this creates a service per class whose id is the fully-qualified class name
+    App\:
+        resource: '../src/'
+
+    App\Service\Statistics\NetworkMetricSyncServiceInterface: '@App\Service\Statistics\NetworkMetricSyncService'
+
+    App\Service\Orders\OrderMonitorAccountResolver:
+        arguments:
+            $mainnetMonitorAccount: '%app.order_monitor_account_mainnet%'
+            $testnetMonitorAccount: '%app.order_monitor_account_testnet%'
+            $futurenetMonitorAccount: '%app.order_monitor_account_futurenet%'
+
+    App\Service\Orders\OrderEmailNotifier:
+        arguments:
+            $fromAddress: '%app.order_mailer_from%'
+            $fromName: '%app.order_mailer_from_name%'
+            $verificationAdminEmail: '%app.order_verification_admin_email%'
+
+    Aws\S3\S3Client:
+        arguments:
+            -
+                version: 'latest'
+                region: '%app.spaces_region%'
+                endpoint: '%app.spaces_endpoint%'
+                use_path_style_endpoint: '%app.spaces_path_style_endpoint%'
+                credentials:
+                    key: '%app.spaces_key%'
+                    secret: '%app.spaces_secret%'
+
+    Aws\S3\S3ClientInterface: '@Aws\S3\S3Client'
+
+    App\Service\Storage\ObjectStorageService:
+        arguments:
+            $bucket: '%app.spaces_bucket%'
+            $publicBaseUrl: '%app.spaces_public_base_url%'
+            $defaultVisibilityPublic: '%app.spaces_visibility_public%'
+
+    App\Serializer\ContractCollectionJsonLdNormalizer:
+        tags:
+            - { name: 'serializer.normalizer', priority: 200 }
+
+    # add more service definitions when explicit configuration is needed
+    # please note that last definitions always *replace* previous ones
