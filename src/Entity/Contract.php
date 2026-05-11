@@ -174,6 +174,24 @@ class Contract
     #[ORM\Column(name: 'source_code_verified', options: ['default' => false])]
     private bool $sourceCodeVerified = false;
 
+    #[ORM\Column(name: 'sep55_verified', options: ['default' => false])]
+    private bool $sep55Verified = false;
+
+    #[ORM\Column(name: 'github_address', length: 255, nullable: true)]
+    private ?string $githubAddress = null;
+
+    #[ORM\Column(name: 'sep55_commit_hash', length: 64, nullable: true)]
+    private ?string $sep55CommitHash = null;
+
+    #[ORM\Column(name: 'sep55_attestation_url', length: 255, nullable: true)]
+    private ?string $sep55AttestationUrl = null;
+
+    #[ORM\Column(name: 'sep55_error', type: 'text', nullable: true)]
+    private ?string $sep55Error = null;
+
+    #[ORM\Column(name: 'sep55_last_checked_at', type: 'datetime_immutable', nullable: true)]
+    private ?\DateTimeImmutable $sep55LastCheckedAt = null;
+
     #[ORM\Column(name: 'contract_type', nullable: true)]
     private ?int $contractType = null;
 
@@ -324,6 +342,87 @@ class Contract
     public function setSourceCodeVerified(bool $sourceCodeVerified): self
     {
         $this->sourceCodeVerified = $sourceCodeVerified;
+
+        return $this;
+    }
+
+    public function isSep55Verified(): bool
+    {
+        return $this->sep55Verified;
+    }
+
+    public function setSep55Verified(bool $sep55Verified): self
+    {
+        $this->sep55Verified = $sep55Verified;
+
+        return $this;
+    }
+
+    public function getGithubAddress(): ?string
+    {
+        return $this->githubAddress;
+    }
+
+    public function setGithubAddress(?string $githubAddress): self
+    {
+        $this->githubAddress = is_string($githubAddress) && trim($githubAddress) !== ''
+            ? trim($githubAddress)
+            : null;
+
+        return $this;
+    }
+
+    public function getSep55CommitHash(): ?string
+    {
+        return $this->sep55CommitHash;
+    }
+
+    public function setSep55CommitHash(?string $sep55CommitHash): self
+    {
+        $normalized = is_string($sep55CommitHash) ? strtolower(trim($sep55CommitHash)) : '';
+        $this->sep55CommitHash = preg_match('/^[0-9a-f]{7,64}$/', $normalized) === 1
+            ? $normalized
+            : null;
+
+        return $this;
+    }
+
+    public function getSep55AttestationUrl(): ?string
+    {
+        return $this->sep55AttestationUrl;
+    }
+
+    public function setSep55AttestationUrl(?string $sep55AttestationUrl): self
+    {
+        $this->sep55AttestationUrl = is_string($sep55AttestationUrl) && trim($sep55AttestationUrl) !== ''
+            ? trim($sep55AttestationUrl)
+            : null;
+
+        return $this;
+    }
+
+    public function getSep55Error(): ?string
+    {
+        return $this->sep55Error;
+    }
+
+    public function setSep55Error(?string $sep55Error): self
+    {
+        $this->sep55Error = is_string($sep55Error) && trim($sep55Error) !== ''
+            ? trim($sep55Error)
+            : null;
+
+        return $this;
+    }
+
+    public function getSep55LastCheckedAt(): ?\DateTimeImmutable
+    {
+        return $this->sep55LastCheckedAt;
+    }
+
+    public function setSep55LastCheckedAt(?\DateTimeImmutable $sep55LastCheckedAt): self
+    {
+        $this->sep55LastCheckedAt = $sep55LastCheckedAt;
 
         return $this;
     }

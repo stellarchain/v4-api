@@ -6,6 +6,7 @@ use App\Command\Support\NetworkOptionTrait;
 use App\Entity\Contract;
 use App\Repository\ContractRepository;
 use App\Service\SorobanRpcService;
+use App\Service\Stellar\Soroban\Sep55ContractVerificationService;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ParameterType;
 use Doctrine\ORM\EntityManagerInterface;
@@ -26,6 +27,7 @@ final class DecompileWasmContractCommand extends Command
 
     public function __construct(
         private readonly SorobanRpcService $sorobanRpcService,
+        private readonly Sep55ContractVerificationService $sep55ContractVerificationService,
         private readonly ContractRepository $contractRepository,
         private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
@@ -58,9 +60,10 @@ final class DecompileWasmContractCommand extends Command
             return Command::FAILURE;
         }
 
+        $sep55Verification = $this->runSep55Verification($result);
         $wasmPath = $this->saveWasmIfRequested($result, $validated['saveWasm']);
-        $this->persistContractMetadata($result, $validated['network'], $validated['persistContract']);
-        $this->renderResult($io, $result, $validated['network'], $validated['printSource'], $wasmPath);
+        $this->persistContractMetadata($result, $validated['network'], $validated['persistContract'], $sep55Verification);
+        $this->renderResult($io, $result, $validated['network'], $validated['printSource'], $wasmPath, $sep55Verification);
 
         $io->success('WASM decompile completed.');
 
@@ -122,8 +125,22 @@ final class DecompileWasmContractCommand extends Command
      *   wasmCodeBase64:?string,
      *   contractSourceCode:?string
      * } $result
+     * @param array{
+     *   isVerified:bool,
+     *   githubAddress:?string,
+     *   commitHash:?string,
+     *   attestationUrl:?string,
+     *   error:?string
+     * } $sep55Verification
      */
-    private function renderResult(SymfonyStyle $io, array $result, string $network, bool $printSource, ?string $wasmPath): void
+    private function renderResult(
+        SymfonyStyle $io,
+        array $result,
+        string $network,
+        bool $printSource,
+        ?string $wasmPath,
+        array $sep55Verification,
+    ): void
     {
         $rows = [
             ['contractId', $result['contractId']],
@@ -132,6 +149,11 @@ final class DecompileWasmContractCommand extends Command
             ['wasmId', (string) ($result['wasmId'] ?? '')],
             ['wasmSha256', $result['wasmSha256']],
             ['sourceLength', (string) strlen((string) ($result['contractSourceCode'] ?? ''))],
+            ['sep55Verified', $sep55Verification['isVerified'] ? '1' : '0'],
+            ['githubAddress', (string) ($sep55Verification['githubAddress'] ?? '')],
+            ['sep55CommitHash', (string) ($sep55Verification['commitHash'] ?? '')],
+            ['sep55AttestationUrl', (string) ($sep55Verification['attestationUrl'] ?? '')],
+            ['sep55Error', (string) ($sep55Verification['error'] ?? '')],
         ];
         if ($wasmPath !== null) {
             $rows[] = ['wasmPath', $wasmPath];
@@ -152,8 +174,15 @@ final class DecompileWasmContractCommand extends Command
 
     /**
      * @param array{contractId:string,contractIdHex:string,wasmId:string|null,wasmSha256:string,contractSourceCode:string|null} $result
+     * @param array{
+     *   isVerified:bool,
+     *   githubAddress:?string,
+     *   commitHash:?string,
+     *   attestationUrl:?string,
+     *   error:?string
+     * } $sep55Verification
      */
-    private function persistContractMetadata(array $result, string $network, bool $createIfMissing): void
+    private function persistContractMetadata(array $result, string $network, bool $createIfMissing, array $sep55Verification): void
     {
         $networkCode = $this->stellarNetworkResolver->resolveNetworkCode($network) ?? 1;
         $contract = $this->contractRepository->findOneByContractIdAndNetwork($result['contractId'], $networkCode);
@@ -177,11 +206,28 @@ final class DecompileWasmContractCommand extends Command
         $sourceKey = is_string($result['wasmId'] ?? null) && $result['wasmId'] !== ''
             ? $result['wasmId']
             : $result['wasmSha256'];
+        $checkedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
         $this->entityManager->getConnection()->update(
             'contracts',
-            ['wasm_id' => $sourceKey],
+            [
+                'wasm_id' => $sourceKey,
+                'sep55_verified' => $sep55Verification['isVerified'] ? 1 : 0,
+                'github_address' => $sep55Verification['githubAddress'],
+                'sep55_commit_hash' => $sep55Verification['commitHash'],
+                'sep55_attestation_url' => $sep55Verification['attestationUrl'],
+                'sep55_error' => $sep55Verification['error'],
+                'sep55_last_checked_at' => $checkedAt,
+            ],
             ['id' => (int) $contract->getId()],
-            ['id' => ParameterType::INTEGER],
+            [
+                'id' => ParameterType::INTEGER,
+                'sep55_verified' => ParameterType::INTEGER,
+                'github_address' => $sep55Verification['githubAddress'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                'sep55_commit_hash' => $sep55Verification['commitHash'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                'sep55_attestation_url' => $sep55Verification['attestationUrl'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                'sep55_error' => $sep55Verification['error'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                'sep55_last_checked_at' => ParameterType::STRING,
+            ],
         );
     }
 
@@ -217,5 +263,51 @@ final class DecompileWasmContractCommand extends Command
         }
 
         return $targetPath;
+    }
+
+    /**
+     * @param array<string,mixed> $result
+     * @return array{
+     *   isVerified:bool,
+     *   githubAddress:?string,
+     *   commitHash:?string,
+     *   attestationUrl:?string,
+     *   error:?string
+     * }
+     */
+    private function runSep55Verification(array $result): array
+    {
+        $wasmSha256 = is_string($result['wasmSha256'] ?? null) ? strtolower(trim((string) $result['wasmSha256'])) : '';
+        $wasmCodeBase64 = is_string($result['wasmCodeBase64'] ?? null) ? trim((string) $result['wasmCodeBase64']) : '';
+        if ($wasmSha256 === '' || $wasmCodeBase64 === '') {
+            return [
+                'isVerified' => false,
+                'githubAddress' => null,
+                'commitHash' => null,
+                'attestationUrl' => null,
+                'error' => 'WASM bytes are missing for SEP-55 verification.',
+            ];
+        }
+
+        $wasmBytes = base64_decode($wasmCodeBase64, true);
+        if (!is_string($wasmBytes) || $wasmBytes === '') {
+            return [
+                'isVerified' => false,
+                'githubAddress' => null,
+                'commitHash' => null,
+                'attestationUrl' => null,
+                'error' => 'Invalid WASM base64 payload.',
+            ];
+        }
+
+        $verified = $this->sep55ContractVerificationService->verifyFromWasm($wasmSha256, $wasmBytes);
+
+        return [
+            'isVerified' => (bool) ($verified['isVerified'] ?? false),
+            'githubAddress' => is_string($verified['githubAddress'] ?? null) ? $verified['githubAddress'] : null,
+            'commitHash' => is_string($verified['commitHash'] ?? null) ? $verified['commitHash'] : null,
+            'attestationUrl' => is_string($verified['attestationUrl'] ?? null) ? $verified['attestationUrl'] : null,
+            'error' => is_string($verified['error'] ?? null) ? $verified['error'] : null,
+        ];
     }
 }
