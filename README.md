@@ -30,6 +30,7 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
   - `app:import-account-metrics` from `resources/known_accounts_with_balance_and_transactions.csv`
   - `app:market:sync-snapshots` (reads Horizon DB with direct `SELECT` queries and persists local market snapshots)
   - `app:horizon:sync-network-metrics` (reads the currently ingested Horizon DB chunk and persists paginated network metric points)
+  - `app:statistics:init-schema` (creates the network metrics storage table on the configured statistics database)
 - API docs UI tweaks (logo/header removed, top margin removed, footer hidden).
 - PHP extensions enabled: `bcmath`, `pcntl`, `gmp`, `pdo_mysql`, `intl`, `opcache`, `zip`, `apcu`.
 
@@ -48,6 +49,7 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
    ```bash
    docker compose exec php bin/console app:import-known-accounts
    docker compose exec php bin/console app:import-account-metrics
+   docker compose exec php php bin/console app:statistics:init-schema --no-debug
    docker compose exec php php bin/console app:market:sync-snapshots --network=testnet --top=1000 --no-debug
    docker compose exec php php bin/console app:horizon:sync-network-metrics --network=testnet --bucket-minutes=10 --no-debug
    ```
@@ -60,6 +62,12 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
    - `https://api.stellarchain.dev/v1/accounts`
 - `https://api.stellarchain.dev/v1/market/assets?network=testnet&limit=50`
 - `https://api.stellarchain.dev/v1/network-metrics?network=testnet&metricKey=transactions&bucketMinutes=10`
+
+## Statistics Database
+
+- `DATABASE_STATISTICS_URL` controls where `app:horizon:sync-network-metrics` writes `network_metric_point` rows.
+- By default it falls back to `DATABASE_URL`, preserving the existing app behavior.
+- For an isolated historical backfill worker, point it at a separate MySQL or PostgreSQL database, then run `app:statistics:init-schema` before starting the backfill.
 
 ## Sorting Examples
 

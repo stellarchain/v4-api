@@ -15,6 +15,15 @@ HORIZON_WORKERS="${HORIZON_WORKERS:-4}"
 
 APP_MODE="${APP_MODE:-docker}"
 CONSOLE_BIN="${CONSOLE_BIN:-bin/console-no-debug}"
+APP_ENV_PASSTHROUGH_VARS=(
+    APP_ENV
+    APP_DEBUG
+    DATABASE_URL
+    DATABASE_STATISTICS_URL
+    DATABASE_HORIZON_URL
+    DATABASE_HORIZON_URL_TESTNET
+    DATABASE_HORIZON_URL_MAINNET
+)
 
 RUN_CONTRACT_SCAN="${RUN_CONTRACT_SCAN:-1}"
 CONTRACT_BATCH_SIZE="${CONTRACT_BATCH_SIZE:-5000}"
@@ -92,7 +101,13 @@ require_positive_int() {
 build_app_cmd() {
     case "$APP_MODE" in
         docker)
-            APP_CMD=(docker compose exec -T php php)
+            APP_CMD=(docker compose exec -T)
+            for env_name in "${APP_ENV_PASSTHROUGH_VARS[@]}"; do
+                if [[ -n "${!env_name:-}" ]]; then
+                    APP_CMD+=(-e "$env_name=${!env_name}")
+                fi
+            done
+            APP_CMD+=(php php)
             ;;
         host)
             APP_CMD=(php)
