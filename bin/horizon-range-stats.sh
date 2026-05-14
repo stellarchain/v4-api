@@ -12,6 +12,8 @@ END_LEDGER="${END_LEDGER:-}"
 HORIZON_BIN="${HORIZON_BIN:-stellar-horizon}"
 HORIZON_MODE="${HORIZON_MODE:-reingest-range}"
 HORIZON_WORKERS="${HORIZON_WORKERS:-4}"
+HORIZON_DATABASE_URL="${HORIZON_DATABASE_URL:-}"
+HORIZON_NETWORK="${HORIZON_NETWORK:-}"
 
 APP_MODE="${APP_MODE:-docker}"
 CONSOLE_BIN="${CONSOLE_BIN:-bin/console-no-debug}"
@@ -50,6 +52,8 @@ Environment:
   START_LEDGER=...
   END_LEDGER=...
   HORIZON_BIN=stellar-horizon
+  HORIZON_DATABASE_URL=postgresql://.../horizon
+  HORIZON_NETWORK=pubnet|testnet|futurenet
   HORIZON_MODE=reingest-range|ingest-range
   HORIZON_WORKERS=4
   APP_MODE=docker|host
@@ -128,6 +132,18 @@ run_horizon_ingest() {
     local start_ledger="$1"
     local end_ledger="$2"
     local cmd=()
+    local horizon_network="$HORIZON_NETWORK"
+
+    if [[ -z "$horizon_network" ]]; then
+        case "$NETWORK" in
+            mainnet)
+                horizon_network="pubnet"
+                ;;
+            testnet|futurenet)
+                horizon_network="$NETWORK"
+                ;;
+        esac
+    fi
 
     case "$HORIZON_MODE" in
         reingest-range)
@@ -143,6 +159,19 @@ run_horizon_ingest() {
     esac
 
     log "Running Horizon ingest: ${cmd[*]}"
+    if [[ -n "$HORIZON_DATABASE_URL" && -n "$horizon_network" ]]; then
+        DATABASE_URL="$HORIZON_DATABASE_URL" NETWORK="$horizon_network" "${cmd[@]}"
+        return
+    fi
+    if [[ -n "$HORIZON_DATABASE_URL" ]]; then
+        DATABASE_URL="$HORIZON_DATABASE_URL" "${cmd[@]}"
+        return
+    fi
+    if [[ -n "$horizon_network" ]]; then
+        NETWORK="$horizon_network" "${cmd[@]}"
+        return
+    fi
+
     "${cmd[@]}"
 }
 
