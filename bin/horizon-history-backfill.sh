@@ -58,10 +58,10 @@ load_state() {
 save_state() {
     mkdir -p "$(dirname "$STATE_FILE")"
     cat >"$STATE_FILE" <<EOF
-NETWORK=${NETWORK}
-CURRENT_END_LEDGER=${CURRENT_END_LEDGER}
-LEDGERS_PER_RANGE=${LEDGERS_PER_RANGE}
-UPDATED_AT=$(date '+%Y-%m-%d %H:%M:%S')
+NETWORK='${NETWORK}'
+CURRENT_END_LEDGER='${CURRENT_END_LEDGER}'
+LEDGERS_PER_RANGE='${LEDGERS_PER_RANGE}'
+UPDATED_AT='$(date '+%Y-%m-%d %H:%M:%S')'
 EOF
 }
 
