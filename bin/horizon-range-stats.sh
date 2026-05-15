@@ -69,7 +69,7 @@ Environment:
   RUN_MARKET_OVERVIEW=1
   RUN_LOCAL_RESET=0
   ALLOW_MAINNET_RESET=0
-  HORIZON_RETENTION_MODE=none|processed-range
+  HORIZON_RETENTION_MODE=none|processed-range|truncate-history
   POST_RANGE_CLEANUP_COMMAND='docker compose exec horizon psql ...'
 
 Notes:
@@ -266,6 +266,12 @@ run_horizon_retention() {
                 -v start_ledger="$START_LEDGER" \
                 -v end_ledger="$END_LEDGER" \
                 -f "$ROOT_DIR/bin/sql/horizon-delete-processed-range.sql"
+            ;;
+        truncate-history)
+            log "Truncating all Horizon history tables after processed range $START_LEDGER..$END_LEDGER"
+            psql "$HORIZON_DATABASE_URL" \
+                -v ON_ERROR_STOP=1 \
+                -f "$ROOT_DIR/bin/sql/horizon-truncate-history.sql"
             ;;
         *)
             echo "Unsupported HORIZON_RETENTION_MODE: $HORIZON_RETENTION_MODE" >&2
