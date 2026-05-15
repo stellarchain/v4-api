@@ -53,7 +53,7 @@ Environment:
   END_LEDGER=...
   HORIZON_BIN=stellar-horizon
   HORIZON_DATABASE_URL=postgresql://.../horizon
-  HORIZON_NETWORK=pubnet|testnet|futurenet
+  HORIZON_NETWORK=pubnet|testnet|futurenet|passphrase
   HORIZON_MODE=reingest-range|ingest-range
   HORIZON_WORKERS=4
   APP_MODE=docker|host
@@ -144,6 +144,9 @@ run_horizon_ingest() {
                 ;;
         esac
     fi
+    if [[ "$horizon_network" == "passphrase" ]]; then
+        horizon_network=""
+    fi
 
     case "$HORIZON_MODE" in
         reingest-range)
@@ -160,19 +163,19 @@ run_horizon_ingest() {
 
     log "Running Horizon ingest: ${cmd[*]}"
     if [[ -n "$HORIZON_DATABASE_URL" && -n "$horizon_network" ]]; then
-        DATABASE_URL="$HORIZON_DATABASE_URL" NETWORK="$horizon_network" "${cmd[@]}"
+        env -u NETWORK_PASSPHRASE DATABASE_URL="$HORIZON_DATABASE_URL" NETWORK="$horizon_network" "${cmd[@]}"
         return
     fi
     if [[ -n "$HORIZON_DATABASE_URL" ]]; then
-        DATABASE_URL="$HORIZON_DATABASE_URL" "${cmd[@]}"
+        env -u NETWORK DATABASE_URL="$HORIZON_DATABASE_URL" "${cmd[@]}"
         return
     fi
     if [[ -n "$horizon_network" ]]; then
-        NETWORK="$horizon_network" "${cmd[@]}"
+        env -u NETWORK_PASSPHRASE NETWORK="$horizon_network" "${cmd[@]}"
         return
     fi
 
-    "${cmd[@]}"
+    env -u NETWORK "${cmd[@]}"
 }
 
 run_local_reset() {
