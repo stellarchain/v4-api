@@ -41,6 +41,7 @@ ALLOW_MAINNET_RESET="${ALLOW_MAINNET_RESET:-0}"
 
 # Optional host/container specific cleanup hook for the Horizon DB after one range.
 POST_RANGE_CLEANUP_COMMAND="${POST_RANGE_CLEANUP_COMMAND:-}"
+HORIZON_RETENTION_MODE="${HORIZON_RETENTION_MODE:-none}"
 
 usage() {
     cat <<'EOF'
@@ -68,6 +69,7 @@ Environment:
   RUN_MARKET_OVERVIEW=1
   RUN_LOCAL_RESET=0
   ALLOW_MAINNET_RESET=0
+  HORIZON_RETENTION_MODE=none|processed-range
   POST_RANGE_CLEANUP_COMMAND='docker compose exec horizon psql ...'
 
 Notes:
@@ -233,12 +235,43 @@ run_stats_pipeline() {
 }
 
 run_cleanup_hook() {
+    run_horizon_retention
+
     if [[ -z "$POST_RANGE_CLEANUP_COMMAND" ]]; then
         return 0
     fi
 
     log "Running post-range cleanup hook"
     /bin/bash -lc "$POST_RANGE_CLEANUP_COMMAND"
+}
+
+run_horizon_retention() {
+    if [[ "$HORIZON_RETENTION_MODE" == "none" ]]; then
+        return 0
+    fi
+    if [[ -z "$HORIZON_DATABASE_URL" ]]; then
+        echo "HORIZON_RETENTION_MODE requires HORIZON_DATABASE_URL." >&2
+        exit 1
+    fi
+    if ! command -v psql >/dev/null 2>&1; then
+        echo "HORIZON_RETENTION_MODE requires psql on PATH." >&2
+        exit 1
+    fi
+
+    case "$HORIZON_RETENTION_MODE" in
+        processed-range)
+            log "Deleting processed Horizon history range $START_LEDGER..$END_LEDGER"
+            psql "$HORIZON_DATABASE_URL" \
+                -v ON_ERROR_STOP=1 \
+                -v start_ledger="$START_LEDGER" \
+                -v end_ledger="$END_LEDGER" \
+                -f "$ROOT_DIR/bin/sql/horizon-delete-processed-range.sql"
+            ;;
+        *)
+            echo "Unsupported HORIZON_RETENTION_MODE: $HORIZON_RETENTION_MODE" >&2
+            exit 1
+            ;;
+    esac
 }
 
 main() {
