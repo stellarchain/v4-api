@@ -24,7 +24,7 @@ require_positive_int "NETWORK_CODE" "$NETWORK_CODE"
 require_positive_int "BUCKET_MINUTES" "$BUCKET_MINUTES"
 
 echo "== Processes =="
-ps -eo pid,ppid,%cpu,%mem,etime,cmd | grep -E 'stellar-horizon.*db reingest|horizon-history-backfill|horizon-range-stats|sync-network-metrics|sync-payment-flow-events' | grep -v grep || echo "No backfill processes found"
+ps -eo pid,ppid,%cpu,%mem,etime,cmd | grep -E 'stellar-horizon.*db reingest|horizon-history-backfill|horizon-range-stats|sync-network-metrics|sync-payment-flow-events|sync-asset-market-history|sync-account-activity-summary' | grep -v grep || echo "No backfill processes found"
 
 echo
 echo "== State =="
@@ -161,4 +161,71 @@ FROM payment_flow_event
 WHERE network = $NETWORK_CODE
 ORDER BY ledger DESC, operation_id DESC
 LIMIT 10;
+"
+
+echo
+echo "== Asset market history summary =="
+psql "$STATS_PG" -c "
+SELECT
+  COUNT(*) AS rows,
+  COUNT(DISTINCT asset_code || ':' || asset_issuer) AS assets,
+  MIN(bucket_start) AS first_bucket,
+  MAX(bucket_start) AS last_bucket,
+  SUM(trades_count) AS trades,
+  SUM(volume_xlm) AS volume_xlm
+FROM asset_market_metric_point
+WHERE network = $NETWORK_CODE
+  AND bucket_minutes = $BUCKET_MINUTES;
+"
+
+echo
+echo "== Top asset market history rows =="
+psql "$STATS_PG" -c "
+SELECT asset_code, asset_issuer, COUNT(*) AS buckets, SUM(trades_count) AS trades, SUM(volume_xlm) AS volume_xlm
+FROM asset_market_metric_point
+WHERE network = $NETWORK_CODE
+  AND bucket_minutes = $BUCKET_MINUTES
+GROUP BY asset_code, asset_issuer
+ORDER BY trades DESC
+LIMIT 20;
+"
+
+echo
+echo "== Asset state snapshots summary =="
+psql "$STATS_PG" -c "
+SELECT
+  COUNT(*) AS rows,
+  COUNT(DISTINCT asset_code || ':' || asset_issuer) AS assets,
+  MIN(snapshot_at) AS first_snapshot,
+  MAX(snapshot_at) AS last_snapshot
+FROM asset_state_snapshot
+WHERE network = $NETWORK_CODE;
+"
+
+echo
+echo "== Account activity summary =="
+psql "$STATS_PG" -c "
+SELECT
+  COUNT(*) AS rows,
+  COUNT(DISTINCT account_address) AS accounts,
+  MIN(first_ledger) AS min_ledger,
+  MAX(last_ledger) AS max_ledger,
+  SUM(total_transactions) AS transactions,
+  SUM(payment_sent_count) AS sent_payments,
+  SUM(payment_received_count) AS received_payments,
+  SUM(trade_operation_count) AS trade_operations,
+  SUM(contract_operation_count) AS contract_operations
+FROM account_activity_summary
+WHERE network = $NETWORK_CODE;
+"
+
+echo
+echo "== Top account activity rows =="
+psql "$STATS_PG" -c "
+SELECT account_address, SUM(total_transactions) AS transactions, SUM(payment_sent_count) AS sent, SUM(payment_received_count) AS received, SUM(native_sent) AS native_sent, SUM(native_received) AS native_received
+FROM account_activity_summary
+WHERE network = $NETWORK_CODE
+GROUP BY account_address
+ORDER BY transactions DESC
+LIMIT 20;
 "

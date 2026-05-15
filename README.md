@@ -31,6 +31,8 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
   - `app:market:sync-snapshots` (reads Horizon DB with direct `SELECT` queries and persists local market snapshots)
   - `app:horizon:sync-network-metrics` (reads the currently ingested Horizon DB chunk and persists paginated network metric points)
   - `app:horizon:sync-payment-flow-events` (extracts compact payment/create/merge flow events from a Horizon DB chunk)
+  - `app:horizon:sync-asset-market-history` (extracts asset/XLM market buckets and active asset state snapshots from a Horizon DB chunk)
+  - `app:horizon:sync-account-activity-summary` (extracts compact account activity summaries from a Horizon DB chunk)
   - `app:statistics:init-schema` (creates the historical statistics storage tables on the configured statistics database)
 - API docs UI tweaks (logo/header removed, top margin removed, footer hidden).
 - PHP extensions enabled: `bcmath`, `pcntl`, `gmp`, `pdo_mysql`, `intl`, `opcache`, `zip`, `apcu`.
@@ -70,6 +72,8 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 - By default it falls back to `DATABASE_URL`, preserving the existing app behavior.
 - For an isolated historical backfill worker, point it at a separate MySQL or PostgreSQL database, then run `app:statistics:init-schema` before starting the backfill.
 - `RUN_PAYMENT_FLOW_EVENTS=1` can be added to `bin/horizon-history-backfill.sh` to preserve direct payment/path-payment/create-account/account-merge flow events before Horizon history tables are truncated.
+- `RUN_ASSET_MARKET_HISTORY=1` preserves per-asset XLM market buckets and active asset state snapshots.
+- `RUN_ACCOUNT_ACTIVITY_SUMMARY=1` preserves compact per-range account summaries for later account ranking/statistics imports.
 
 ## Sorting Examples
 

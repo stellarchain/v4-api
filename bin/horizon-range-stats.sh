@@ -33,6 +33,9 @@ RUN_NETWORK_METRICS="${RUN_NETWORK_METRICS:-1}"
 NETWORK_METRICS_BUCKET_MINUTES="${NETWORK_METRICS_BUCKET_MINUTES:-10}"
 RUN_PAYMENT_FLOW_EVENTS="${RUN_PAYMENT_FLOW_EVENTS:-0}"
 PAYMENT_FLOW_BATCH_SIZE="${PAYMENT_FLOW_BATCH_SIZE:-5000}"
+RUN_ASSET_MARKET_HISTORY="${RUN_ASSET_MARKET_HISTORY:-0}"
+ASSET_MARKET_BUCKET_MINUTES="${ASSET_MARKET_BUCKET_MINUTES:-$NETWORK_METRICS_BUCKET_MINUTES}"
+RUN_ACCOUNT_ACTIVITY_SUMMARY="${RUN_ACCOUNT_ACTIVITY_SUMMARY:-0}"
 RUN_COINGECKO_WARM="${RUN_COINGECKO_WARM:-1}"
 RUN_MARKET_SNAPSHOTS="${RUN_MARKET_SNAPSHOTS:-1}"
 MARKET_TOP="${MARKET_TOP:-0}"
@@ -67,6 +70,9 @@ Environment:
   NETWORK_METRICS_BUCKET_MINUTES=10
   RUN_PAYMENT_FLOW_EVENTS=0
   PAYMENT_FLOW_BATCH_SIZE=5000
+  RUN_ASSET_MARKET_HISTORY=0
+  ASSET_MARKET_BUCKET_MINUTES=10
+  RUN_ACCOUNT_ACTIVITY_SUMMARY=0
   RUN_COINGECKO_WARM=1
   RUN_MARKET_SNAPSHOTS=1
   MARKET_TOP=0
@@ -231,6 +237,23 @@ run_stats_pipeline() {
             --batch-size="$PAYMENT_FLOW_BATCH_SIZE"
     fi
 
+    if [[ "$RUN_ASSET_MARKET_HISTORY" == "1" ]]; then
+        log "Extracting asset market history"
+        run_console app:horizon:sync-asset-market-history \
+            --network="$NETWORK" \
+            --bucket-minutes="$ASSET_MARKET_BUCKET_MINUTES" \
+            --start-ledger="$START_LEDGER" \
+            --end-ledger="$END_LEDGER"
+    fi
+
+    if [[ "$RUN_ACCOUNT_ACTIVITY_SUMMARY" == "1" ]]; then
+        log "Extracting account activity summaries"
+        run_console app:horizon:sync-account-activity-summary \
+            --network="$NETWORK" \
+            --start-ledger="$START_LEDGER" \
+            --end-ledger="$END_LEDGER"
+    fi
+
     if [[ "$RUN_COINGECKO_WARM" == "1" ]]; then
         log "Refreshing XLM/USD and global CoinGecko cache"
         run_console app:warm-coingecko-cache
@@ -307,6 +330,7 @@ main() {
     require_positive_int "CONTRACT_BATCH_SIZE" "$CONTRACT_BATCH_SIZE"
     require_positive_int "NETWORK_METRICS_BUCKET_MINUTES" "$NETWORK_METRICS_BUCKET_MINUTES"
     require_positive_int "PAYMENT_FLOW_BATCH_SIZE" "$PAYMENT_FLOW_BATCH_SIZE"
+    require_positive_int "ASSET_MARKET_BUCKET_MINUTES" "$ASSET_MARKET_BUCKET_MINUTES"
 
     if [[ "$START_LEDGER" -gt "$END_LEDGER" ]]; then
         echo "START_LEDGER must be <= END_LEDGER" >&2
