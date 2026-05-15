@@ -7,6 +7,9 @@ DROP TABLE IF EXISTS
     asset_state_snapshot,
     asset_market_metric_point,
     payment_flow_event,
+    payment_flow_transaction,
+    payment_flow_asset,
+    payment_flow_address,
     network_metric_point
 CASCADE;
 

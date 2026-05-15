@@ -73,39 +73,77 @@ SQL
 
         $this->statisticsConnection->executeStatement(
             <<<SQL
-CREATE TABLE IF NOT EXISTS payment_flow_event (
+CREATE TABLE IF NOT EXISTS payment_flow_address (
+    id BIGINT AUTO_INCREMENT NOT NULL,
+    network INT NOT NULL,
+    address VARCHAR(64) NOT NULL,
+    created_at DATETIME NOT NULL,
+    UNIQUE INDEX uniq_payment_flow_address (network, address),
+    PRIMARY KEY(id)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE `utf8mb4_unicode_ci` ENGINE = InnoDB
+SQL
+        );
+
+        $this->statisticsConnection->executeStatement(
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_asset (
+    id BIGINT AUTO_INCREMENT NOT NULL,
+    network INT NOT NULL,
+    asset_type VARCHAR(32) NOT NULL,
+    asset_code VARCHAR(32) NOT NULL DEFAULT '',
+    asset_issuer VARCHAR(64) NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL,
+    UNIQUE INDEX uniq_payment_flow_asset (network, asset_type, asset_code, asset_issuer),
+    PRIMARY KEY(id)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE `utf8mb4_unicode_ci` ENGINE = InnoDB
+SQL
+        );
+
+        $this->statisticsConnection->executeStatement(
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_transaction (
     id BIGINT AUTO_INCREMENT NOT NULL,
     network INT NOT NULL,
     ledger INT NOT NULL,
     closed_at DATETIME NOT NULL,
     tx_hash VARCHAR(64) NOT NULL,
-    operation_id BIGINT NOT NULL,
-    operation_index INT DEFAULT NULL,
-    operation_type VARCHAR(48) NOT NULL,
-    successful TINYINT(1) NOT NULL DEFAULT 1,
-    source_account VARCHAR(64) DEFAULT NULL,
-    from_address VARCHAR(64) DEFAULT NULL,
-    to_address VARCHAR(64) DEFAULT NULL,
-    source_asset_type VARCHAR(32) DEFAULT NULL,
-    source_asset_code VARCHAR(32) DEFAULT NULL,
-    source_asset_issuer VARCHAR(64) DEFAULT NULL,
-    source_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
-    destination_asset_type VARCHAR(32) DEFAULT NULL,
-    destination_asset_code VARCHAR(32) DEFAULT NULL,
-    destination_asset_issuer VARCHAR(64) DEFAULT NULL,
-    destination_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
-    asset_type VARCHAR(32) NOT NULL,
-    asset_code VARCHAR(32) DEFAULT NULL,
-    asset_issuer VARCHAR(64) DEFAULT NULL,
-    amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    source_account_id BIGINT DEFAULT NULL,
     memo_type VARCHAR(32) DEFAULT NULL,
     memo VARCHAR(255) DEFAULT NULL,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
+    UNIQUE INDEX uniq_payment_flow_transaction_hash (network, tx_hash),
+    INDEX idx_payment_flow_transaction_ledger (network, ledger, id),
+    INDEX idx_payment_flow_transaction_source (network, source_account_id, ledger),
+    PRIMARY KEY(id)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE `utf8mb4_unicode_ci` ENGINE = InnoDB
+SQL
+        );
+
+        $this->statisticsConnection->executeStatement(
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_event (
+    id BIGINT AUTO_INCREMENT NOT NULL,
+    network INT NOT NULL,
+    ledger INT NOT NULL,
+    tx_id BIGINT NOT NULL,
+    operation_id BIGINT NOT NULL,
+    operation_index INT DEFAULT NULL,
+    operation_type VARCHAR(48) NOT NULL,
+    successful TINYINT(1) NOT NULL DEFAULT 1,
+    source_account_id BIGINT DEFAULT NULL,
+    from_address_id BIGINT DEFAULT NULL,
+    to_address_id BIGINT DEFAULT NULL,
+    source_asset_id BIGINT DEFAULT NULL,
+    source_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    destination_asset_id BIGINT DEFAULT NULL,
+    destination_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
     UNIQUE INDEX uniq_payment_flow_event_operation (network, operation_id),
-    INDEX idx_payment_flow_event_from (network, from_address, closed_at, id),
-    INDEX idx_payment_flow_event_to (network, to_address, closed_at, id),
-    INDEX idx_payment_flow_event_tx_hash (network, tx_hash),
+    INDEX idx_payment_flow_event_from (network, from_address_id, ledger, id),
+    INDEX idx_payment_flow_event_to (network, to_address_id, ledger, id),
+    INDEX idx_payment_flow_event_tx (network, tx_id),
     INDEX idx_payment_flow_event_ledger (network, ledger),
     PRIMARY KEY(id)
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE `utf8mb4_unicode_ci` ENGINE = InnoDB
@@ -227,50 +265,71 @@ SQL,
             'CREATE INDEX IF NOT EXISTS idx_network_metric_point_query ON network_metric_point (network, metric_key, bucket_minutes, bucket_start, id)',
             'CREATE INDEX IF NOT EXISTS idx_network_metric_point_group ON network_metric_point (network, metric_group, bucket_minutes, bucket_start)',
             <<<SQL
-CREATE TABLE IF NOT EXISTS payment_flow_event (
+CREATE TABLE IF NOT EXISTS payment_flow_address (
+    id BIGSERIAL PRIMARY KEY,
+    network INT NOT NULL,
+    address VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
+            'CREATE UNIQUE INDEX IF NOT EXISTS uniq_payment_flow_address ON payment_flow_address (network, address)',
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_asset (
+    id BIGSERIAL PRIMARY KEY,
+    network INT NOT NULL,
+    asset_type VARCHAR(32) NOT NULL,
+    asset_code VARCHAR(32) NOT NULL DEFAULT '',
+    asset_issuer VARCHAR(64) NOT NULL DEFAULT '',
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
+            'CREATE UNIQUE INDEX IF NOT EXISTS uniq_payment_flow_asset ON payment_flow_asset (network, asset_type, asset_code, asset_issuer)',
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_transaction (
     id BIGSERIAL PRIMARY KEY,
     network INT NOT NULL,
     ledger INT NOT NULL,
     closed_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
     tx_hash VARCHAR(64) NOT NULL,
-    operation_id BIGINT NOT NULL,
-    operation_index INT DEFAULT NULL,
-    operation_type VARCHAR(48) NOT NULL,
-    successful BOOLEAN NOT NULL DEFAULT TRUE,
-    source_account VARCHAR(64) DEFAULT NULL,
-    from_address VARCHAR(64) DEFAULT NULL,
-    to_address VARCHAR(64) DEFAULT NULL,
-    source_asset_type VARCHAR(32) DEFAULT NULL,
-    source_asset_code VARCHAR(32) DEFAULT NULL,
-    source_asset_issuer VARCHAR(64) DEFAULT NULL,
-    source_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
-    destination_asset_type VARCHAR(32) DEFAULT NULL,
-    destination_asset_code VARCHAR(32) DEFAULT NULL,
-    destination_asset_issuer VARCHAR(64) DEFAULT NULL,
-    destination_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
-    asset_type VARCHAR(32) NOT NULL,
-    asset_code VARCHAR(32) DEFAULT NULL,
-    asset_issuer VARCHAR(64) DEFAULT NULL,
-    amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    source_account_id BIGINT DEFAULT NULL,
     memo_type VARCHAR(32) DEFAULT NULL,
     memo VARCHAR(255) DEFAULT NULL,
     created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
     updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
 )
 SQL,
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS source_asset_type VARCHAR(32) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS source_asset_code VARCHAR(32) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS source_asset_issuer VARCHAR(64) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS source_amount_decimal NUMERIC(36, 14) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS destination_asset_type VARCHAR(32) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS destination_asset_code VARCHAR(32) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS destination_asset_issuer VARCHAR(64) DEFAULT NULL',
-            'ALTER TABLE payment_flow_event ADD COLUMN IF NOT EXISTS destination_amount_decimal NUMERIC(36, 14) DEFAULT NULL',
+            'CREATE UNIQUE INDEX IF NOT EXISTS uniq_payment_flow_transaction_hash ON payment_flow_transaction (network, tx_hash)',
+            'CREATE INDEX IF NOT EXISTS idx_payment_flow_transaction_ledger ON payment_flow_transaction (network, ledger, id)',
+            'CREATE INDEX IF NOT EXISTS idx_payment_flow_transaction_source ON payment_flow_transaction (network, source_account_id, ledger)',
+            <<<SQL
+CREATE TABLE IF NOT EXISTS payment_flow_event (
+    id BIGSERIAL PRIMARY KEY,
+    network INT NOT NULL,
+    ledger INT NOT NULL,
+    tx_id BIGINT NOT NULL,
+    operation_id BIGINT NOT NULL,
+    operation_index INT DEFAULT NULL,
+    operation_type VARCHAR(48) NOT NULL,
+    successful BOOLEAN NOT NULL DEFAULT TRUE,
+    source_account_id BIGINT DEFAULT NULL,
+    from_address_id BIGINT DEFAULT NULL,
+    to_address_id BIGINT DEFAULT NULL,
+    source_asset_id BIGINT DEFAULT NULL,
+    source_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    destination_asset_id BIGINT DEFAULT NULL,
+    destination_amount_decimal NUMERIC(36, 14) DEFAULT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
+    updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_payment_flow_event_operation ON payment_flow_event (network, operation_id)',
-            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_from ON payment_flow_event (network, from_address, closed_at, id)',
-            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_to ON payment_flow_event (network, to_address, closed_at, id)',
-            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_tx_hash ON payment_flow_event (network, tx_hash)',
+            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_from ON payment_flow_event (network, from_address_id, ledger, id)',
+            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_to ON payment_flow_event (network, to_address_id, ledger, id)',
+            'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_tx ON payment_flow_event (network, tx_id)',
             'CREATE INDEX IF NOT EXISTS idx_payment_flow_event_ledger ON payment_flow_event (network, ledger)',
+            'DROP INDEX IF EXISTS idx_payment_flow_event_from_old',
+            'DROP INDEX IF EXISTS idx_payment_flow_event_to_old',
+            'DROP INDEX IF EXISTS idx_payment_flow_event_tx_hash',
             'DROP INDEX IF EXISTS idx_payment_flow_event_asset',
             <<<SQL
 CREATE TABLE IF NOT EXISTS asset_market_metric_point (

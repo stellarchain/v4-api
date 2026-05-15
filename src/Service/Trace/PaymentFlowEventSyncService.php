@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Service\Trace;
 
 use App\Service\Stellar\StellarNetworkResolver;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
@@ -24,6 +25,12 @@ final class PaymentFlowEventSyncService
         8 => 'account_merge',
         13 => 'path_payment_strict_send',
     ];
+
+    /** @var array<int,array<string,int>> */
+    private array $addressIdCache = [];
+
+    /** @var array<int,array<string,int>> */
+    private array $assetIdCache = [];
 
     public function __construct(
         #[Autowire(service: 'doctrine.dbal.statistics_connection')]
@@ -279,24 +286,7 @@ SELECT
     CASE
         WHEN ho.type IN (0, 8) THEN NULL
         ELSE NULLIF(ho.details->>'asset_issuer', '')
-    END AS destination_asset_issuer,
-    CASE
-        WHEN ho.type = 0 THEN COALESCE(NULLIF(ho.details->>'starting_balance', ''), NULLIF(ho.details->>'amount', ''))
-        WHEN ho.type = 8 THEN NULL
-        ELSE NULLIF(ho.details->>'amount', '')
-    END AS amount_decimal,
-    CASE
-        WHEN ho.type IN (0, 8) THEN 'native'
-        ELSE COALESCE(NULLIF(ho.details->>'asset_type', ''), 'native')
-    END AS asset_type,
-    CASE
-        WHEN ho.type IN (0, 8) THEN NULL
-        ELSE NULLIF(ho.details->>'asset_code', '')
-    END AS asset_code,
-    CASE
-        WHEN ho.type IN (0, 8) THEN NULL
-        ELSE NULLIF(ho.details->>'asset_issuer', '')
-    END AS asset_issuer
+    END AS destination_asset_issuer
 FROM history_operations ho
 INNER JOIN history_transactions ht ON ht.id = ho.transaction_id
 INNER JOIN history_ledgers hl ON hl.sequence = ht.{$ledgerColumn}
@@ -345,18 +335,30 @@ SQL;
         if ($fromAddress === '' && $toAddress === '') {
             return null;
         }
+
         $sourceAccount = $this->normalizeString($row['operation_source_account'] ?? null, 64);
         if ($sourceAccount === '') {
             $sourceAccount = $this->normalizeString($row['tx_source_account'] ?? null, 64);
         }
-        $sourceAssetType = $this->normalizeString($row['source_asset_type'] ?? null, 32) ?: 'native';
-        $destinationAssetType = $this->normalizeString($row['destination_asset_type'] ?? null, 32) ?: 'native';
+        $transactionSourceAccount = $this->normalizeString($row['tx_source_account'] ?? null, 64);
+
+        [$sourceAssetType, $sourceAssetCode, $sourceAssetIssuer] = $this->normalizeAssetComponents(
+            $this->normalizeString($row['source_asset_type'] ?? null, 32) ?: 'native',
+            $this->normalizeString($row['source_asset_code'] ?? null, 32) ?: null,
+            $this->normalizeString($row['source_asset_issuer'] ?? null, 64) ?: null
+        );
+        [$destinationAssetType, $destinationAssetCode, $destinationAssetIssuer] = $this->normalizeAssetComponents(
+            $this->normalizeString($row['destination_asset_type'] ?? null, 32) ?: 'native',
+            $this->normalizeString($row['destination_asset_code'] ?? null, 32) ?: null,
+            $this->normalizeString($row['destination_asset_issuer'] ?? null, 64) ?: null
+        );
 
         return [
             'network' => $networkCode,
             'ledger' => $ledger,
             'closed_at' => $closedAt,
             'tx_hash' => $txHash,
+            'transaction_source_account' => $transactionSourceAccount ?: null,
             'operation_id' => $operationId,
             'operation_index' => $this->toInt($row['operation_index'] ?? null),
             'operation_type' => self::OPERATION_TYPE_NAMES[$operationTypeId] ?? sprintf('operation_%d', $operationTypeId),
@@ -365,17 +367,13 @@ SQL;
             'from_address' => $fromAddress ?: null,
             'to_address' => $toAddress ?: null,
             'source_asset_type' => $sourceAssetType,
-            'source_asset_code' => $this->normalizeString($row['source_asset_code'] ?? null, 32) ?: null,
-            'source_asset_issuer' => $this->normalizeString($row['source_asset_issuer'] ?? null, 64) ?: null,
+            'source_asset_code' => $sourceAssetCode,
+            'source_asset_issuer' => $sourceAssetIssuer,
             'source_amount_decimal' => $this->normalizeDecimalString($row['source_amount_decimal'] ?? null),
             'destination_asset_type' => $destinationAssetType,
-            'destination_asset_code' => $this->normalizeString($row['destination_asset_code'] ?? null, 32) ?: null,
-            'destination_asset_issuer' => $this->normalizeString($row['destination_asset_issuer'] ?? null, 64) ?: null,
+            'destination_asset_code' => $destinationAssetCode,
+            'destination_asset_issuer' => $destinationAssetIssuer,
             'destination_amount_decimal' => $this->normalizeDecimalString($row['destination_amount_decimal'] ?? null),
-            'asset_type' => $destinationAssetType,
-            'asset_code' => $this->normalizeString($row['asset_code'] ?? $row['destination_asset_code'] ?? null, 32) ?: null,
-            'asset_issuer' => $this->normalizeString($row['asset_issuer'] ?? $row['destination_asset_issuer'] ?? null, 64) ?: null,
-            'amount_decimal' => $this->normalizeDecimalString($row['amount_decimal'] ?? $row['destination_amount_decimal'] ?? null),
             'memo_type' => $this->normalizeString($row['memo_type'] ?? null, 32) ?: null,
             'memo' => $this->normalizeString($row['memo'] ?? null, 255) ?: null,
         ];
@@ -388,49 +386,54 @@ SQL;
     {
         $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $nowString = $now->format('Y-m-d H:i:s');
+        $network = (int) $events[0]['network'];
         $rowsWritten = 0;
-        $sql = $this->buildUpsertSql();
+        $sql = $this->buildEventUpsertSql();
 
         $this->statisticsConnection->beginTransaction();
         try {
+            $addressIds = $this->ensureAddressIds($network, $events, $nowString);
+            $assetIds = $this->ensureAssetIds($network, $events, $nowString);
+            $transactionIds = $this->ensureTransactionIds($network, $events, $addressIds, $nowString);
+
             foreach ($events as $event) {
+                $txId = $transactionIds[(string) $event['tx_hash']] ?? null;
+                if ($txId === null) {
+                    continue;
+                }
+
                 $this->statisticsConnection->executeStatement(
                     $sql,
                     [
-                        'network' => $event['network'],
+                        'network' => $network,
                         'ledger' => $event['ledger'],
-                        'closed_at' => $event['closed_at'],
-                        'tx_hash' => $event['tx_hash'],
+                        'tx_id' => $txId,
                         'operation_id' => $event['operation_id'],
                         'operation_index' => $event['operation_index'],
                         'operation_type' => $event['operation_type'],
                         'successful' => $event['successful'],
-                        'source_account' => $event['source_account'],
-                        'from_address' => $event['from_address'],
-                        'to_address' => $event['to_address'],
-                        'source_asset_type' => $event['source_asset_type'],
-                        'source_asset_code' => $event['source_asset_code'],
-                        'source_asset_issuer' => $event['source_asset_issuer'],
+                        'source_account_id' => $this->resolveAddressId($addressIds, $event['source_account'] ?? null),
+                        'from_address_id' => $this->resolveAddressId($addressIds, $event['from_address'] ?? null),
+                        'to_address_id' => $this->resolveAddressId($addressIds, $event['to_address'] ?? null),
+                        'source_asset_id' => $this->resolveAssetId($assetIds, $event, 'source'),
                         'source_amount_decimal' => $event['source_amount_decimal'],
-                        'destination_asset_type' => $event['destination_asset_type'],
-                        'destination_asset_code' => $event['destination_asset_code'],
-                        'destination_asset_issuer' => $event['destination_asset_issuer'],
+                        'destination_asset_id' => $this->resolveAssetId($assetIds, $event, 'destination'),
                         'destination_amount_decimal' => $event['destination_amount_decimal'],
-                        'asset_type' => $event['asset_type'],
-                        'asset_code' => $event['asset_code'],
-                        'asset_issuer' => $event['asset_issuer'],
-                        'amount_decimal' => $event['amount_decimal'],
-                        'memo_type' => $event['memo_type'],
-                        'memo' => $event['memo'],
                         'created_at' => $nowString,
                         'updated_at' => $nowString,
                     ],
                     [
                         'network' => ParameterType::INTEGER,
                         'ledger' => ParameterType::INTEGER,
+                        'tx_id' => ParameterType::INTEGER,
                         'operation_id' => ParameterType::INTEGER,
                         'operation_index' => ParameterType::INTEGER,
                         'successful' => ParameterType::BOOLEAN,
+                        'source_account_id' => ParameterType::INTEGER,
+                        'from_address_id' => ParameterType::INTEGER,
+                        'to_address_id' => ParameterType::INTEGER,
+                        'source_asset_id' => ParameterType::INTEGER,
+                        'destination_asset_id' => ParameterType::INTEGER,
                     ]
                 );
                 $rowsWritten++;
@@ -445,38 +448,263 @@ SQL;
         return $rowsWritten;
     }
 
-    private function buildUpsertSql(): string
+    /**
+     * @param list<array<string,mixed>> $events
+     * @return array<string,int>
+     */
+    private function ensureAddressIds(int $network, array $events, string $nowString): array
+    {
+        $addresses = [];
+        foreach ($events as $event) {
+            foreach (['transaction_source_account', 'source_account', 'from_address', 'to_address'] as $field) {
+                $address = $this->normalizeString($event[$field] ?? null, 64);
+                if ($address !== '') {
+                    $addresses[$address] = true;
+                }
+            }
+        }
+
+        if ($addresses === []) {
+            return $this->addressIdCache[$network] ?? [];
+        }
+
+        $this->addressIdCache[$network] ??= [];
+        $missing = array_values(array_diff(array_keys($addresses), array_keys($this->addressIdCache[$network])));
+
+        if ($missing !== []) {
+            $sql = $this->buildAddressUpsertSql();
+            foreach ($missing as $address) {
+                $this->statisticsConnection->executeStatement(
+                    $sql,
+                    [
+                        'network' => $network,
+                        'address' => $address,
+                        'created_at' => $nowString,
+                    ],
+                    [
+                        'network' => ParameterType::INTEGER,
+                    ]
+                );
+            }
+
+            $rows = $this->statisticsConnection->fetchAllAssociative(
+                'SELECT id, address FROM payment_flow_address WHERE network = :network AND address IN (:addresses)',
+                [
+                    'network' => $network,
+                    'addresses' => $missing,
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'addresses' => ArrayParameterType::STRING,
+                ]
+            );
+            foreach ($rows as $row) {
+                $address = (string) ($row['address'] ?? '');
+                $id = $this->toInt($row['id'] ?? null);
+                if ($address !== '' && $id !== null) {
+                    $this->addressIdCache[$network][$address] = $id;
+                }
+            }
+        }
+
+        return $this->addressIdCache[$network];
+    }
+
+    /**
+     * @param list<array<string,mixed>> $events
+     * @return array<string,int>
+     */
+    private function ensureAssetIds(int $network, array $events, string $nowString): array
+    {
+        $assets = [];
+        foreach ($events as $event) {
+            foreach (['source', 'destination'] as $prefix) {
+                $key = $this->buildAssetKey(
+                    (string) $event[$prefix . '_asset_type'],
+                    (string) $event[$prefix . '_asset_code'],
+                    (string) $event[$prefix . '_asset_issuer']
+                );
+                $assets[$key] = true;
+            }
+        }
+
+        $this->assetIdCache[$network] ??= [];
+        $missing = array_values(array_diff(array_keys($assets), array_keys($this->assetIdCache[$network])));
+
+        if ($missing !== []) {
+            $sql = $this->buildAssetUpsertSql();
+            foreach ($missing as $key) {
+                [$assetType, $assetCode, $assetIssuer] = $this->parseAssetKey($key);
+                $this->statisticsConnection->executeStatement(
+                    $sql,
+                    [
+                        'network' => $network,
+                        'asset_type' => $assetType,
+                        'asset_code' => $assetCode,
+                        'asset_issuer' => $assetIssuer,
+                        'created_at' => $nowString,
+                    ],
+                    [
+                        'network' => ParameterType::INTEGER,
+                    ]
+                );
+
+                $id = $this->statisticsConnection->fetchOne(
+                    'SELECT id FROM payment_flow_asset WHERE network = :network AND asset_type = :asset_type AND asset_code = :asset_code AND asset_issuer = :asset_issuer',
+                    [
+                        'network' => $network,
+                        'asset_type' => $assetType,
+                        'asset_code' => $assetCode,
+                        'asset_issuer' => $assetIssuer,
+                    ],
+                    [
+                        'network' => ParameterType::INTEGER,
+                    ]
+                );
+                $assetId = $this->toInt($id);
+                if ($assetId !== null) {
+                    $this->assetIdCache[$network][$key] = $assetId;
+                }
+            }
+        }
+
+        return $this->assetIdCache[$network];
+    }
+
+    /**
+     * @param list<array<string,mixed>> $events
+     * @param array<string,int> $addressIds
+     * @return array<string,int>
+     */
+    private function ensureTransactionIds(int $network, array $events, array $addressIds, string $nowString): array
+    {
+        $transactions = [];
+        foreach ($events as $event) {
+            $txHash = (string) $event['tx_hash'];
+            if (isset($transactions[$txHash])) {
+                continue;
+            }
+
+            $transactions[$txHash] = [
+                'ledger' => $event['ledger'],
+                'closed_at' => $event['closed_at'],
+                'source_account_id' => $this->resolveAddressId($addressIds, $event['transaction_source_account'] ?? null),
+                'memo_type' => $event['memo_type'],
+                'memo' => $event['memo'],
+            ];
+        }
+
+        if ($transactions === []) {
+            return [];
+        }
+
+        $sql = $this->buildTransactionUpsertSql();
+        foreach ($transactions as $txHash => $transaction) {
+            $this->statisticsConnection->executeStatement(
+                $sql,
+                [
+                    'network' => $network,
+                    'ledger' => $transaction['ledger'],
+                    'closed_at' => $transaction['closed_at'],
+                    'tx_hash' => $txHash,
+                    'source_account_id' => $transaction['source_account_id'],
+                    'memo_type' => $transaction['memo_type'],
+                    'memo' => $transaction['memo'],
+                    'created_at' => $nowString,
+                    'updated_at' => $nowString,
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'ledger' => ParameterType::INTEGER,
+                    'source_account_id' => ParameterType::INTEGER,
+                ]
+            );
+        }
+
+        $rows = $this->statisticsConnection->fetchAllAssociative(
+            'SELECT id, tx_hash FROM payment_flow_transaction WHERE network = :network AND tx_hash IN (:tx_hashes)',
+            [
+                'network' => $network,
+                'tx_hashes' => array_keys($transactions),
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'tx_hashes' => ArrayParameterType::STRING,
+            ]
+        );
+
+        $ids = [];
+        foreach ($rows as $row) {
+            $txHash = (string) ($row['tx_hash'] ?? '');
+            $id = $this->toInt($row['id'] ?? null);
+            if ($txHash !== '' && $id !== null) {
+                $ids[$txHash] = $id;
+            }
+        }
+
+        return $ids;
+    }
+
+    private function buildAddressUpsertSql(): string
     {
         $platform = $this->statisticsConnection->getDatabasePlatform();
 
         if ($platform instanceof AbstractMySQLPlatform) {
             return <<<SQL
-INSERT INTO payment_flow_event
-    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, source_asset_type, source_asset_code, source_asset_issuer, source_amount_decimal, destination_asset_type, destination_asset_code, destination_asset_issuer, destination_amount_decimal, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, created_at, updated_at)
+INSERT INTO payment_flow_address (network, address, created_at)
+VALUES (:network, :address, :created_at)
+ON DUPLICATE KEY UPDATE address = VALUES(address)
+SQL;
+        }
+
+        if ($platform instanceof PostgreSQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_address (network, address, created_at)
+VALUES (:network, :address, :created_at)
+ON CONFLICT (network, address) DO NOTHING
+SQL;
+        }
+
+        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+    }
+
+    private function buildAssetUpsertSql(): string
+    {
+        $platform = $this->statisticsConnection->getDatabasePlatform();
+
+        if ($platform instanceof AbstractMySQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_asset (network, asset_type, asset_code, asset_issuer, created_at)
+VALUES (:network, :asset_type, :asset_code, :asset_issuer, :created_at)
+ON DUPLICATE KEY UPDATE asset_type = VALUES(asset_type)
+SQL;
+        }
+
+        if ($platform instanceof PostgreSQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_asset (network, asset_type, asset_code, asset_issuer, created_at)
+VALUES (:network, :asset_type, :asset_code, :asset_issuer, :created_at)
+ON CONFLICT (network, asset_type, asset_code, asset_issuer) DO NOTHING
+SQL;
+        }
+
+        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+    }
+
+    private function buildTransactionUpsertSql(): string
+    {
+        $platform = $this->statisticsConnection->getDatabasePlatform();
+
+        if ($platform instanceof AbstractMySQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_transaction
+    (network, ledger, closed_at, tx_hash, source_account_id, memo_type, memo, created_at, updated_at)
 VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :source_asset_type, :source_asset_code, :source_asset_issuer, :source_amount_decimal, :destination_asset_type, :destination_asset_code, :destination_asset_issuer, :destination_amount_decimal, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, :created_at, :updated_at)
+    (:network, :ledger, :closed_at, :tx_hash, :source_account_id, :memo_type, :memo, :created_at, :updated_at)
 ON DUPLICATE KEY UPDATE
     ledger = VALUES(ledger),
     closed_at = VALUES(closed_at),
-    tx_hash = VALUES(tx_hash),
-    operation_index = VALUES(operation_index),
-    operation_type = VALUES(operation_type),
-    successful = VALUES(successful),
-    source_account = VALUES(source_account),
-    from_address = VALUES(from_address),
-    to_address = VALUES(to_address),
-    source_asset_type = VALUES(source_asset_type),
-    source_asset_code = VALUES(source_asset_code),
-    source_asset_issuer = VALUES(source_asset_issuer),
-    source_amount_decimal = VALUES(source_amount_decimal),
-    destination_asset_type = VALUES(destination_asset_type),
-    destination_asset_code = VALUES(destination_asset_code),
-    destination_asset_issuer = VALUES(destination_asset_issuer),
-    destination_amount_decimal = VALUES(destination_amount_decimal),
-    asset_type = VALUES(asset_type),
-    asset_code = VALUES(asset_code),
-    asset_issuer = VALUES(asset_issuer),
-    amount_decimal = VALUES(amount_decimal),
+    source_account_id = VALUES(source_account_id),
     memo_type = VALUES(memo_type),
     memo = VALUES(memo),
     updated_at = VALUES(updated_at)
@@ -485,34 +713,69 @@ SQL;
 
         if ($platform instanceof PostgreSQLPlatform) {
             return <<<SQL
-INSERT INTO payment_flow_event
-    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, source_asset_type, source_asset_code, source_asset_issuer, source_amount_decimal, destination_asset_type, destination_asset_code, destination_asset_issuer, destination_amount_decimal, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, created_at, updated_at)
+INSERT INTO payment_flow_transaction
+    (network, ledger, closed_at, tx_hash, source_account_id, memo_type, memo, created_at, updated_at)
 VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :source_asset_type, :source_asset_code, :source_asset_issuer, :source_amount_decimal, :destination_asset_type, :destination_asset_code, :destination_asset_issuer, :destination_amount_decimal, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, :created_at, :updated_at)
-ON CONFLICT (network, operation_id) DO UPDATE SET
+    (:network, :ledger, :closed_at, :tx_hash, :source_account_id, :memo_type, :memo, :created_at, :updated_at)
+ON CONFLICT (network, tx_hash) DO UPDATE SET
     ledger = EXCLUDED.ledger,
     closed_at = EXCLUDED.closed_at,
-    tx_hash = EXCLUDED.tx_hash,
+    source_account_id = EXCLUDED.source_account_id,
+    memo_type = EXCLUDED.memo_type,
+    memo = EXCLUDED.memo,
+    updated_at = EXCLUDED.updated_at
+SQL;
+        }
+
+        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+    }
+
+    private function buildEventUpsertSql(): string
+    {
+        $platform = $this->statisticsConnection->getDatabasePlatform();
+
+        if ($platform instanceof AbstractMySQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_event
+    (network, ledger, tx_id, operation_id, operation_index, operation_type, successful, source_account_id, from_address_id, to_address_id, source_asset_id, source_amount_decimal, destination_asset_id, destination_amount_decimal, created_at, updated_at)
+VALUES
+    (:network, :ledger, :tx_id, :operation_id, :operation_index, :operation_type, :successful, :source_account_id, :from_address_id, :to_address_id, :source_asset_id, :source_amount_decimal, :destination_asset_id, :destination_amount_decimal, :created_at, :updated_at)
+ON DUPLICATE KEY UPDATE
+    ledger = VALUES(ledger),
+    tx_id = VALUES(tx_id),
+    operation_index = VALUES(operation_index),
+    operation_type = VALUES(operation_type),
+    successful = VALUES(successful),
+    source_account_id = VALUES(source_account_id),
+    from_address_id = VALUES(from_address_id),
+    to_address_id = VALUES(to_address_id),
+    source_asset_id = VALUES(source_asset_id),
+    source_amount_decimal = VALUES(source_amount_decimal),
+    destination_asset_id = VALUES(destination_asset_id),
+    destination_amount_decimal = VALUES(destination_amount_decimal),
+    updated_at = VALUES(updated_at)
+SQL;
+        }
+
+        if ($platform instanceof PostgreSQLPlatform) {
+            return <<<SQL
+INSERT INTO payment_flow_event
+    (network, ledger, tx_id, operation_id, operation_index, operation_type, successful, source_account_id, from_address_id, to_address_id, source_asset_id, source_amount_decimal, destination_asset_id, destination_amount_decimal, created_at, updated_at)
+VALUES
+    (:network, :ledger, :tx_id, :operation_id, :operation_index, :operation_type, :successful, :source_account_id, :from_address_id, :to_address_id, :source_asset_id, :source_amount_decimal, :destination_asset_id, :destination_amount_decimal, :created_at, :updated_at)
+ON CONFLICT (network, operation_id) DO UPDATE SET
+    ledger = EXCLUDED.ledger,
+    tx_id = EXCLUDED.tx_id,
     operation_index = EXCLUDED.operation_index,
     operation_type = EXCLUDED.operation_type,
     successful = EXCLUDED.successful,
-    source_account = EXCLUDED.source_account,
-    from_address = EXCLUDED.from_address,
-    to_address = EXCLUDED.to_address,
-    source_asset_type = EXCLUDED.source_asset_type,
-    source_asset_code = EXCLUDED.source_asset_code,
-    source_asset_issuer = EXCLUDED.source_asset_issuer,
+    source_account_id = EXCLUDED.source_account_id,
+    from_address_id = EXCLUDED.from_address_id,
+    to_address_id = EXCLUDED.to_address_id,
+    source_asset_id = EXCLUDED.source_asset_id,
     source_amount_decimal = EXCLUDED.source_amount_decimal,
-    destination_asset_type = EXCLUDED.destination_asset_type,
-    destination_asset_code = EXCLUDED.destination_asset_code,
-    destination_asset_issuer = EXCLUDED.destination_asset_issuer,
+    destination_asset_id = EXCLUDED.destination_asset_id,
     destination_amount_decimal = EXCLUDED.destination_amount_decimal,
-    asset_type = EXCLUDED.asset_type,
-    asset_code = EXCLUDED.asset_code,
-    asset_issuer = EXCLUDED.asset_issuer,
-    amount_decimal = EXCLUDED.amount_decimal,
-    memo_type = EXCLUDED.memo_type,
-    memo = EXCLUDED.memo,
     updated_at = EXCLUDED.updated_at
 SQL;
         }
@@ -532,6 +795,62 @@ SQL;
         };
 
         return $this->doctrine->getConnection($connectionName);
+    }
+
+    private function resolveAddressId(array $addressIds, mixed $address): ?int
+    {
+        $normalized = $this->normalizeString($address, 64);
+
+        return $normalized === '' ? null : ($addressIds[$normalized] ?? null);
+    }
+
+    private function resolveAssetId(array $assetIds, array $event, string $prefix): ?int
+    {
+        $key = $this->buildAssetKey(
+            (string) $event[$prefix . '_asset_type'],
+            (string) $event[$prefix . '_asset_code'],
+            (string) $event[$prefix . '_asset_issuer']
+        );
+
+        return $assetIds[$key] ?? null;
+    }
+
+    private function buildAssetKey(string $assetType, ?string $assetCode, ?string $assetIssuer): string
+    {
+        [$assetType, $assetCode, $assetIssuer] = $this->normalizeAssetComponents($assetType, $assetCode, $assetIssuer);
+
+        return implode("\0", [$assetType, $assetCode, $assetIssuer]);
+    }
+
+    /**
+     * @return array{0:string,1:string,2:string}
+     */
+    private function parseAssetKey(string $key): array
+    {
+        $parts = explode("\0", $key, 3);
+
+        return [
+            $parts[0] ?? 'native',
+            $parts[1] ?? 'XLM',
+            $parts[2] ?? '',
+        ];
+    }
+
+    /**
+     * @return array{0:string,1:string,2:string}
+     */
+    private function normalizeAssetComponents(string $assetType, ?string $assetCode, ?string $assetIssuer): array
+    {
+        $assetType = $this->normalizeString($assetType, 32) ?: 'native';
+        if ($assetType === 'native') {
+            return ['native', 'XLM', ''];
+        }
+
+        return [
+            $assetType,
+            $this->normalizeString($assetCode, 32),
+            $this->normalizeString($assetIssuer, 64),
+        ];
     }
 
     private function formatUtcDateTime(mixed $value): ?string

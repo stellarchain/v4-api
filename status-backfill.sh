@@ -115,6 +115,9 @@ SELECT
 FROM pg_stat_user_tables
 WHERE relname IN (
   'network_metric_point',
+  'payment_flow_address',
+  'payment_flow_asset',
+  'payment_flow_transaction',
   'payment_flow_event',
   'asset_market_metric_point',
   'asset_state_snapshot',
@@ -143,17 +146,19 @@ WITH row_estimate AS (
   WHERE relname = 'payment_flow_event'
 ),
 first_event AS (
-  SELECT ledger, closed_at
-  FROM payment_flow_event
-  WHERE network = $NETWORK_CODE
-  ORDER BY ledger ASC, operation_id ASC
+  SELECT p.ledger, t.closed_at
+  FROM payment_flow_event p
+  INNER JOIN payment_flow_transaction t ON t.id = p.tx_id
+  WHERE p.network = $NETWORK_CODE
+  ORDER BY p.ledger ASC, p.operation_id ASC
   LIMIT 1
 ),
 last_event AS (
-  SELECT ledger, closed_at
-  FROM payment_flow_event
-  WHERE network = $NETWORK_CODE
-  ORDER BY ledger DESC, operation_id DESC
+  SELECT p.ledger, t.closed_at
+  FROM payment_flow_event p
+  INNER JOIN payment_flow_transaction t ON t.id = p.tx_id
+  WHERE p.network = $NETWORK_CODE
+  ORDER BY p.ledger DESC, p.operation_id DESC
   LIMIT 1
 )
 SELECT
@@ -184,6 +189,15 @@ ORDER BY rows DESC, operation_type ASC;
 "
 
 echo
+echo "== Payment flow dictionaries =="
+psql "$STATS_PG" -c "
+SELECT
+  (SELECT COUNT(*) FROM payment_flow_address WHERE network = $NETWORK_CODE) AS addresses,
+  (SELECT COUNT(*) FROM payment_flow_asset WHERE network = $NETWORK_CODE) AS assets,
+  (SELECT COUNT(*) FROM payment_flow_transaction WHERE network = $NETWORK_CODE) AS transactions;
+"
+
+echo
 echo "== Payment flow by destination asset (last $STATUS_FLOW_RECENT_LEDGERS ledgers) =="
 psql "$STATS_PG" -c "
 WITH bounds AS (
@@ -194,20 +208,19 @@ WITH bounds AS (
   LIMIT 1
 )
 SELECT
-  COALESCE(destination_asset_type, asset_type, 'native') AS asset_type,
-  COALESCE(destination_asset_code, asset_code, 'XLM') AS asset_code,
-  COALESCE(destination_asset_issuer, asset_issuer, '') AS asset_issuer,
+  da.asset_type,
+  COALESCE(NULLIF(da.asset_code, ''), 'XLM') AS asset_code,
+  da.asset_issuer,
   COUNT(*) AS rows,
-  MIN(closed_at) AS first_closed_at,
-  MAX(closed_at) AS last_closed_at
+  MIN(t.closed_at) AS first_closed_at,
+  MAX(t.closed_at) AS last_closed_at
 FROM payment_flow_event p
 CROSS JOIN bounds b
+LEFT JOIN payment_flow_asset da ON da.id = p.destination_asset_id
+INNER JOIN payment_flow_transaction t ON t.id = p.tx_id
 WHERE p.network = $NETWORK_CODE
   AND p.ledger BETWEEN GREATEST(1, b.max_ledger - $STATUS_FLOW_RECENT_LEDGERS + 1) AND b.max_ledger
-GROUP BY
-  COALESCE(destination_asset_type, asset_type, 'native'),
-  COALESCE(destination_asset_code, asset_code, 'XLM'),
-  COALESCE(destination_asset_issuer, asset_issuer, '')
+GROUP BY da.asset_type, da.asset_code, da.asset_issuer
 ORDER BY rows DESC
 LIMIT 20;
 "
@@ -216,20 +229,25 @@ echo
 echo "== Recent payment flow rows =="
 psql "$STATS_PG" -c "
 SELECT
-  ledger,
-  closed_at,
-  operation_type,
-  from_address,
-  to_address,
-  source_asset_type,
-  COALESCE(source_asset_code, 'XLM') AS source_asset_code,
-  source_amount_decimal,
-  destination_asset_type,
-  COALESCE(destination_asset_code, 'XLM') AS destination_asset_code,
-  destination_amount_decimal
-FROM payment_flow_event
-WHERE network = $NETWORK_CODE
-ORDER BY ledger DESC, operation_id DESC
+  p.ledger,
+  t.closed_at,
+  p.operation_type,
+  fa.address AS from_address,
+  ta.address AS to_address,
+  sa.asset_type AS source_asset_type,
+  COALESCE(NULLIF(sa.asset_code, ''), 'XLM') AS source_asset_code,
+  p.source_amount_decimal,
+  da.asset_type AS destination_asset_type,
+  COALESCE(NULLIF(da.asset_code, ''), 'XLM') AS destination_asset_code,
+  p.destination_amount_decimal
+FROM payment_flow_event p
+INNER JOIN payment_flow_transaction t ON t.id = p.tx_id
+LEFT JOIN payment_flow_address fa ON fa.id = p.from_address_id
+LEFT JOIN payment_flow_address ta ON ta.id = p.to_address_id
+LEFT JOIN payment_flow_asset sa ON sa.id = p.source_asset_id
+LEFT JOIN payment_flow_asset da ON da.id = p.destination_asset_id
+WHERE p.network = $NETWORK_CODE
+ORDER BY p.ledger DESC, p.operation_id DESC
 LIMIT 10;
 "
 
