@@ -30,7 +30,8 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
   - `app:import-account-metrics` from `resources/known_accounts_with_balance_and_transactions.csv`
   - `app:market:sync-snapshots` (reads Horizon DB with direct `SELECT` queries and persists local market snapshots)
   - `app:horizon:sync-network-metrics` (reads the currently ingested Horizon DB chunk and persists paginated network metric points)
-  - `app:statistics:init-schema` (creates the network metrics storage table on the configured statistics database)
+  - `app:horizon:sync-payment-flow-events` (extracts compact payment/create/merge flow events from a Horizon DB chunk)
+  - `app:statistics:init-schema` (creates the historical statistics storage tables on the configured statistics database)
 - API docs UI tweaks (logo/header removed, top margin removed, footer hidden).
 - PHP extensions enabled: `bcmath`, `pcntl`, `gmp`, `pdo_mysql`, `intl`, `opcache`, `zip`, `apcu`.
 
@@ -65,9 +66,10 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 
 ## Statistics Database
 
-- `DATABASE_STATISTICS_URL` controls where `app:horizon:sync-network-metrics` writes `network_metric_point` rows.
+- `DATABASE_STATISTICS_URL` controls where `app:horizon:sync-network-metrics` and `app:horizon:sync-payment-flow-events` write historical rows.
 - By default it falls back to `DATABASE_URL`, preserving the existing app behavior.
 - For an isolated historical backfill worker, point it at a separate MySQL or PostgreSQL database, then run `app:statistics:init-schema` before starting the backfill.
+- `RUN_PAYMENT_FLOW_EVENTS=1` can be added to `bin/horizon-history-backfill.sh` to preserve direct payment/path-payment/create-account/account-merge flow events before Horizon history tables are truncated.
 
 ## Sorting Examples
 

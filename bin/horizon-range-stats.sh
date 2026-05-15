@@ -31,6 +31,8 @@ RUN_CONTRACT_SCAN="${RUN_CONTRACT_SCAN:-1}"
 CONTRACT_BATCH_SIZE="${CONTRACT_BATCH_SIZE:-5000}"
 RUN_NETWORK_METRICS="${RUN_NETWORK_METRICS:-1}"
 NETWORK_METRICS_BUCKET_MINUTES="${NETWORK_METRICS_BUCKET_MINUTES:-10}"
+RUN_PAYMENT_FLOW_EVENTS="${RUN_PAYMENT_FLOW_EVENTS:-0}"
+PAYMENT_FLOW_BATCH_SIZE="${PAYMENT_FLOW_BATCH_SIZE:-5000}"
 RUN_COINGECKO_WARM="${RUN_COINGECKO_WARM:-1}"
 RUN_MARKET_SNAPSHOTS="${RUN_MARKET_SNAPSHOTS:-1}"
 MARKET_TOP="${MARKET_TOP:-0}"
@@ -63,6 +65,8 @@ Environment:
   CONTRACT_BATCH_SIZE=5000
   RUN_NETWORK_METRICS=1
   NETWORK_METRICS_BUCKET_MINUTES=10
+  RUN_PAYMENT_FLOW_EVENTS=0
+  PAYMENT_FLOW_BATCH_SIZE=5000
   RUN_COINGECKO_WARM=1
   RUN_MARKET_SNAPSHOTS=1
   MARKET_TOP=0
@@ -218,6 +222,15 @@ run_stats_pipeline() {
             --end-ledger="$END_LEDGER"
     fi
 
+    if [[ "$RUN_PAYMENT_FLOW_EVENTS" == "1" ]]; then
+        log "Extracting payment flow events"
+        run_console app:horizon:sync-payment-flow-events \
+            --network="$NETWORK" \
+            --start-ledger="$START_LEDGER" \
+            --end-ledger="$END_LEDGER" \
+            --batch-size="$PAYMENT_FLOW_BATCH_SIZE"
+    fi
+
     if [[ "$RUN_COINGECKO_WARM" == "1" ]]; then
         log "Refreshing XLM/USD and global CoinGecko cache"
         run_console app:warm-coingecko-cache
@@ -293,6 +306,7 @@ main() {
     require_positive_int "HORIZON_WORKERS" "$HORIZON_WORKERS"
     require_positive_int "CONTRACT_BATCH_SIZE" "$CONTRACT_BATCH_SIZE"
     require_positive_int "NETWORK_METRICS_BUCKET_MINUTES" "$NETWORK_METRICS_BUCKET_MINUTES"
+    require_positive_int "PAYMENT_FLOW_BATCH_SIZE" "$PAYMENT_FLOW_BATCH_SIZE"
 
     if [[ "$START_LEDGER" -gt "$END_LEDGER" ]]; then
         echo "START_LEDGER must be <= END_LEDGER" >&2
