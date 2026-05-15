@@ -91,6 +91,9 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
             $transactions = $this->toInt($row['transactions'] ?? null, 0);
             $operations = $this->toInt($row['operations'] ?? null, 0);
             $avgLedgerSeconds = $this->toFloat($row['avg_ledger_sec'] ?? null) ?? 0.0;
+            $observedSeconds = $ledgers > 0 && $avgLedgerSeconds > 0.0
+                ? $ledgers * $avgLedgerSeconds
+                : $bucketSeconds;
 
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ledgers', (string) $ledgers);
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'transactions', (string) $transactions);
@@ -98,8 +101,8 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-success', (string) $this->toInt($row['tx_success'] ?? null, 0));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-failed', (string) $this->toInt($row['tx_failed'] ?? null, 0));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'avg-ledger-sec', $this->normalizeDecimal($avgLedgerSeconds));
-            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tps', $this->safeDivide($transactions, $avgLedgerSeconds));
-            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops', $this->safeDivide($operations, $avgLedgerSeconds));
+            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tps', $this->safeDivide($transactions, $observedSeconds));
+            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops', $this->safeDivide($operations, $observedSeconds));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-ledger', $this->safeDivide($transactions, $ledgers));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops-ledger', $this->safeDivide($operations, $ledgers));
         }
