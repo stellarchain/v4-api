@@ -92,6 +92,34 @@ WHERE network = $NETWORK_CODE
 "
 
 echo
+echo "== Statistics DB size =="
+psql "$STATS_PG" -c "
+SELECT
+  current_database() AS database,
+  pg_size_pretty(pg_database_size(current_database())) AS total_size;
+"
+
+echo
+echo "== Statistics table sizes =="
+psql "$STATS_PG" -c "
+SELECT
+  relname AS table_name,
+  pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+  pg_size_pretty(pg_relation_size(relid)) AS table_size,
+  pg_size_pretty(pg_indexes_size(relid)) AS index_size,
+  n_live_tup AS estimated_rows
+FROM pg_stat_user_tables
+WHERE relname IN (
+  'network_metric_point',
+  'payment_flow_event',
+  'asset_market_metric_point',
+  'asset_state_snapshot',
+  'account_activity_summary'
+)
+ORDER BY pg_total_relation_size(relid) DESC;
+"
+
+echo
 echo "== Statistics by metric =="
 psql "$STATS_PG" -c "
 SELECT metric_key, COUNT(*) AS rows, MIN(bucket_start) AS first_bucket, MAX(bucket_start) AS last_bucket
