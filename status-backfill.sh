@@ -4,8 +4,11 @@ set -euo pipefail
 NETWORK="${NETWORK:-mainnet}"
 NETWORK_CODE="${NETWORK_CODE:-1}"
 BUCKET_MINUTES="${BUCKET_MINUTES:-5}"
+STATUS_FLOW_RECENT_LEDGERS="${STATUS_FLOW_RECENT_LEDGERS:-10000}"
 STATE_FILE="${STATE_FILE:-.tmp/horizon-history-backfill-${NETWORK}.state}"
 LOG_FILE="${LOG_FILE:-var/log/horizon-network-metrics-backfill-${NETWORK}.log}"
+export PSQL_PAGER="${PSQL_PAGER:-cat}"
+export PAGER="${PAGER:-cat}"
 
 : "${HORIZON_PG:?Missing HORIZON_PG}"
 : "${STATS_PG:?Missing STATS_PG}"
@@ -22,6 +25,7 @@ require_positive_int() {
 
 require_positive_int "NETWORK_CODE" "$NETWORK_CODE"
 require_positive_int "BUCKET_MINUTES" "$BUCKET_MINUTES"
+require_positive_int "STATUS_FLOW_RECENT_LEDGERS" "$STATUS_FLOW_RECENT_LEDGERS"
 
 echo "== Processes =="
 ps -eo pid,ppid,%cpu,%mem,etime,cmd | grep -E 'stellar-horizon.*db reingest|horizon-history-backfill|horizon-range-stats|sync-network-metrics|sync-payment-flow-events|sync-asset-market-history|sync-account-activity-summary' | grep -v grep || echo "No backfill processes found"
@@ -133,42 +137,77 @@ ORDER BY metric_key;
 echo
 echo "== Payment flow summary =="
 psql "$STATS_PG" -c "
+WITH row_estimate AS (
+  SELECT COALESCE(n_live_tup, 0) AS estimated_rows
+  FROM pg_stat_user_tables
+  WHERE relname = 'payment_flow_event'
+),
+first_event AS (
+  SELECT ledger, closed_at
+  FROM payment_flow_event
+  WHERE network = $NETWORK_CODE
+  ORDER BY ledger ASC, operation_id ASC
+  LIMIT 1
+),
+last_event AS (
+  SELECT ledger, closed_at
+  FROM payment_flow_event
+  WHERE network = $NETWORK_CODE
+  ORDER BY ledger DESC, operation_id DESC
+  LIMIT 1
+)
 SELECT
-  COUNT(*) AS rows,
-  COUNT(DISTINCT tx_hash) AS transactions,
-  COUNT(DISTINCT from_address) AS from_addresses,
-  COUNT(DISTINCT to_address) AS to_addresses,
-  MIN(ledger) AS min_ledger,
-  MAX(ledger) AS max_ledger,
-  MIN(closed_at) AS first_closed_at,
-  MAX(closed_at) AS last_closed_at
-FROM payment_flow_event
-WHERE network = $NETWORK_CODE;
+  COALESCE((SELECT estimated_rows FROM row_estimate), 0) AS estimated_rows,
+  (SELECT ledger FROM first_event) AS min_ledger,
+  (SELECT ledger FROM last_event) AS max_ledger,
+  (SELECT closed_at FROM first_event) AS first_closed_at,
+  (SELECT closed_at FROM last_event) AS last_closed_at;
 "
 
 echo
-echo "== Payment flow by operation type =="
+echo "== Payment flow by operation type (last $STATUS_FLOW_RECENT_LEDGERS ledgers) =="
 psql "$STATS_PG" -c "
-SELECT operation_type, COUNT(*) AS rows
-FROM payment_flow_event
-WHERE network = $NETWORK_CODE
+WITH bounds AS (
+  SELECT ledger AS max_ledger
+  FROM payment_flow_event
+  WHERE network = $NETWORK_CODE
+  ORDER BY ledger DESC, operation_id DESC
+  LIMIT 1
+)
+SELECT operation_type, COUNT(*) AS rows, MIN(ledger) AS min_ledger, MAX(ledger) AS max_ledger
+FROM payment_flow_event p
+CROSS JOIN bounds b
+WHERE p.network = $NETWORK_CODE
+  AND p.ledger BETWEEN GREATEST(1, b.max_ledger - $STATUS_FLOW_RECENT_LEDGERS + 1) AND b.max_ledger
 GROUP BY operation_type
 ORDER BY rows DESC, operation_type ASC;
 "
 
 echo
-echo "== Payment flow by asset =="
+echo "== Payment flow by destination asset (last $STATUS_FLOW_RECENT_LEDGERS ledgers) =="
 psql "$STATS_PG" -c "
+WITH bounds AS (
+  SELECT ledger AS max_ledger
+  FROM payment_flow_event
+  WHERE network = $NETWORK_CODE
+  ORDER BY ledger DESC, operation_id DESC
+  LIMIT 1
+)
 SELECT
-  asset_type,
-  COALESCE(asset_code, 'XLM') AS asset_code,
-  COALESCE(asset_issuer, '') AS asset_issuer,
+  COALESCE(destination_asset_type, asset_type, 'native') AS asset_type,
+  COALESCE(destination_asset_code, asset_code, 'XLM') AS asset_code,
+  COALESCE(destination_asset_issuer, asset_issuer, '') AS asset_issuer,
   COUNT(*) AS rows,
   MIN(closed_at) AS first_closed_at,
   MAX(closed_at) AS last_closed_at
-FROM payment_flow_event
-WHERE network = $NETWORK_CODE
-GROUP BY asset_type, asset_code, asset_issuer
+FROM payment_flow_event p
+CROSS JOIN bounds b
+WHERE p.network = $NETWORK_CODE
+  AND p.ledger BETWEEN GREATEST(1, b.max_ledger - $STATUS_FLOW_RECENT_LEDGERS + 1) AND b.max_ledger
+GROUP BY
+  COALESCE(destination_asset_type, asset_type, 'native'),
+  COALESCE(destination_asset_code, asset_code, 'XLM'),
+  COALESCE(destination_asset_issuer, asset_issuer, '')
 ORDER BY rows DESC
 LIMIT 20;
 "
@@ -182,9 +221,12 @@ SELECT
   operation_type,
   from_address,
   to_address,
-  asset_type,
-  COALESCE(asset_code, 'XLM') AS asset_code,
-  amount_decimal
+  source_asset_type,
+  COALESCE(source_asset_code, 'XLM') AS source_asset_code,
+  source_amount_decimal,
+  destination_asset_type,
+  COALESCE(destination_asset_code, 'XLM') AS destination_asset_code,
+  destination_amount_decimal
 FROM payment_flow_event
 WHERE network = $NETWORK_CODE
 ORDER BY ledger DESC, operation_id DESC

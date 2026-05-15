@@ -245,21 +245,58 @@ SELECT
     CASE
         WHEN ho.type = 0 THEN COALESCE(NULLIF(ho.details->>'starting_balance', ''), NULLIF(ho.details->>'amount', ''))
         WHEN ho.type = 8 THEN NULL
-        ELSE COALESCE(NULLIF(ho.details->>'amount', ''), NULLIF(ho.details->>'source_amount', ''))
+        WHEN ho.type = 1 THEN NULLIF(ho.details->>'amount', '')
+        ELSE NULLIF(ho.details->>'source_amount', '')
+    END AS source_amount_decimal,
+    CASE
+        WHEN ho.type IN (0, 8) THEN 'native'
+        WHEN ho.type = 1 THEN COALESCE(NULLIF(ho.details->>'asset_type', ''), 'native')
+        ELSE COALESCE(NULLIF(ho.details->>'source_asset_type', ''), 'native')
+    END AS source_asset_type,
+    CASE
+        WHEN ho.type IN (0, 8) THEN NULL
+        WHEN ho.type = 1 THEN NULLIF(ho.details->>'asset_code', '')
+        ELSE NULLIF(ho.details->>'source_asset_code', '')
+    END AS source_asset_code,
+    CASE
+        WHEN ho.type IN (0, 8) THEN NULL
+        WHEN ho.type = 1 THEN NULLIF(ho.details->>'asset_issuer', '')
+        ELSE NULLIF(ho.details->>'source_asset_issuer', '')
+    END AS source_asset_issuer,
+    CASE
+        WHEN ho.type = 0 THEN COALESCE(NULLIF(ho.details->>'starting_balance', ''), NULLIF(ho.details->>'amount', ''))
+        WHEN ho.type = 8 THEN NULL
+        ELSE NULLIF(ho.details->>'amount', '')
+    END AS destination_amount_decimal,
+    CASE
+        WHEN ho.type IN (0, 8) THEN 'native'
+        ELSE COALESCE(NULLIF(ho.details->>'asset_type', ''), 'native')
+    END AS destination_asset_type,
+    CASE
+        WHEN ho.type IN (0, 8) THEN NULL
+        ELSE NULLIF(ho.details->>'asset_code', '')
+    END AS destination_asset_code,
+    CASE
+        WHEN ho.type IN (0, 8) THEN NULL
+        ELSE NULLIF(ho.details->>'asset_issuer', '')
+    END AS destination_asset_issuer,
+    CASE
+        WHEN ho.type = 0 THEN COALESCE(NULLIF(ho.details->>'starting_balance', ''), NULLIF(ho.details->>'amount', ''))
+        WHEN ho.type = 8 THEN NULL
+        ELSE NULLIF(ho.details->>'amount', '')
     END AS amount_decimal,
     CASE
         WHEN ho.type IN (0, 8) THEN 'native'
-        ELSE COALESCE(NULLIF(ho.details->>'asset_type', ''), NULLIF(ho.details->>'source_asset_type', ''), 'native')
+        ELSE COALESCE(NULLIF(ho.details->>'asset_type', ''), 'native')
     END AS asset_type,
     CASE
         WHEN ho.type IN (0, 8) THEN NULL
-        ELSE COALESCE(NULLIF(ho.details->>'asset_code', ''), NULLIF(ho.details->>'source_asset_code', ''))
+        ELSE NULLIF(ho.details->>'asset_code', '')
     END AS asset_code,
     CASE
         WHEN ho.type IN (0, 8) THEN NULL
-        ELSE COALESCE(NULLIF(ho.details->>'asset_issuer', ''), NULLIF(ho.details->>'source_asset_issuer', ''))
-    END AS asset_issuer,
-    CAST(ho.details AS TEXT) AS raw_details
+        ELSE NULLIF(ho.details->>'asset_issuer', '')
+    END AS asset_issuer
 FROM history_operations ho
 INNER JOIN history_transactions ht ON ht.id = ho.transaction_id
 INNER JOIN history_ledgers hl ON hl.sequence = ht.{$ledgerColumn}
@@ -312,6 +349,8 @@ SQL;
         if ($sourceAccount === '') {
             $sourceAccount = $this->normalizeString($row['tx_source_account'] ?? null, 64);
         }
+        $sourceAssetType = $this->normalizeString($row['source_asset_type'] ?? null, 32) ?: 'native';
+        $destinationAssetType = $this->normalizeString($row['destination_asset_type'] ?? null, 32) ?: 'native';
 
         return [
             'network' => $networkCode,
@@ -325,13 +364,20 @@ SQL;
             'source_account' => $sourceAccount ?: null,
             'from_address' => $fromAddress ?: null,
             'to_address' => $toAddress ?: null,
-            'asset_type' => $this->normalizeString($row['asset_type'] ?? 'native', 32) ?: 'native',
-            'asset_code' => $this->normalizeString($row['asset_code'] ?? null, 32) ?: null,
-            'asset_issuer' => $this->normalizeString($row['asset_issuer'] ?? null, 64) ?: null,
-            'amount_decimal' => $this->normalizeDecimalString($row['amount_decimal'] ?? null),
+            'source_asset_type' => $sourceAssetType,
+            'source_asset_code' => $this->normalizeString($row['source_asset_code'] ?? null, 32) ?: null,
+            'source_asset_issuer' => $this->normalizeString($row['source_asset_issuer'] ?? null, 64) ?: null,
+            'source_amount_decimal' => $this->normalizeDecimalString($row['source_amount_decimal'] ?? null),
+            'destination_asset_type' => $destinationAssetType,
+            'destination_asset_code' => $this->normalizeString($row['destination_asset_code'] ?? null, 32) ?: null,
+            'destination_asset_issuer' => $this->normalizeString($row['destination_asset_issuer'] ?? null, 64) ?: null,
+            'destination_amount_decimal' => $this->normalizeDecimalString($row['destination_amount_decimal'] ?? null),
+            'asset_type' => $destinationAssetType,
+            'asset_code' => $this->normalizeString($row['asset_code'] ?? $row['destination_asset_code'] ?? null, 32) ?: null,
+            'asset_issuer' => $this->normalizeString($row['asset_issuer'] ?? $row['destination_asset_issuer'] ?? null, 64) ?: null,
+            'amount_decimal' => $this->normalizeDecimalString($row['amount_decimal'] ?? $row['destination_amount_decimal'] ?? null),
             'memo_type' => $this->normalizeString($row['memo_type'] ?? null, 32) ?: null,
             'memo' => $this->normalizeString($row['memo'] ?? null, 255) ?: null,
-            'raw_details' => $this->normalizeJsonText($row['raw_details'] ?? null),
         ];
     }
 
@@ -362,13 +408,20 @@ SQL;
                         'source_account' => $event['source_account'],
                         'from_address' => $event['from_address'],
                         'to_address' => $event['to_address'],
+                        'source_asset_type' => $event['source_asset_type'],
+                        'source_asset_code' => $event['source_asset_code'],
+                        'source_asset_issuer' => $event['source_asset_issuer'],
+                        'source_amount_decimal' => $event['source_amount_decimal'],
+                        'destination_asset_type' => $event['destination_asset_type'],
+                        'destination_asset_code' => $event['destination_asset_code'],
+                        'destination_asset_issuer' => $event['destination_asset_issuer'],
+                        'destination_amount_decimal' => $event['destination_amount_decimal'],
                         'asset_type' => $event['asset_type'],
                         'asset_code' => $event['asset_code'],
                         'asset_issuer' => $event['asset_issuer'],
                         'amount_decimal' => $event['amount_decimal'],
                         'memo_type' => $event['memo_type'],
                         'memo' => $event['memo'],
-                        'raw_details' => $event['raw_details'],
                         'created_at' => $nowString,
                         'updated_at' => $nowString,
                     ],
@@ -399,9 +452,9 @@ SQL;
         if ($platform instanceof AbstractMySQLPlatform) {
             return <<<SQL
 INSERT INTO payment_flow_event
-    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, raw_details, created_at, updated_at)
+    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, source_asset_type, source_asset_code, source_asset_issuer, source_amount_decimal, destination_asset_type, destination_asset_code, destination_asset_issuer, destination_amount_decimal, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, created_at, updated_at)
 VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, :raw_details, :created_at, :updated_at)
+    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :source_asset_type, :source_asset_code, :source_asset_issuer, :source_amount_decimal, :destination_asset_type, :destination_asset_code, :destination_asset_issuer, :destination_amount_decimal, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, :created_at, :updated_at)
 ON DUPLICATE KEY UPDATE
     ledger = VALUES(ledger),
     closed_at = VALUES(closed_at),
@@ -412,13 +465,20 @@ ON DUPLICATE KEY UPDATE
     source_account = VALUES(source_account),
     from_address = VALUES(from_address),
     to_address = VALUES(to_address),
+    source_asset_type = VALUES(source_asset_type),
+    source_asset_code = VALUES(source_asset_code),
+    source_asset_issuer = VALUES(source_asset_issuer),
+    source_amount_decimal = VALUES(source_amount_decimal),
+    destination_asset_type = VALUES(destination_asset_type),
+    destination_asset_code = VALUES(destination_asset_code),
+    destination_asset_issuer = VALUES(destination_asset_issuer),
+    destination_amount_decimal = VALUES(destination_amount_decimal),
     asset_type = VALUES(asset_type),
     asset_code = VALUES(asset_code),
     asset_issuer = VALUES(asset_issuer),
     amount_decimal = VALUES(amount_decimal),
     memo_type = VALUES(memo_type),
     memo = VALUES(memo),
-    raw_details = VALUES(raw_details),
     updated_at = VALUES(updated_at)
 SQL;
         }
@@ -426,9 +486,9 @@ SQL;
         if ($platform instanceof PostgreSQLPlatform) {
             return <<<SQL
 INSERT INTO payment_flow_event
-    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, raw_details, created_at, updated_at)
+    (network, ledger, closed_at, tx_hash, operation_id, operation_index, operation_type, successful, source_account, from_address, to_address, source_asset_type, source_asset_code, source_asset_issuer, source_amount_decimal, destination_asset_type, destination_asset_code, destination_asset_issuer, destination_amount_decimal, asset_type, asset_code, asset_issuer, amount_decimal, memo_type, memo, created_at, updated_at)
 VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, CAST(:raw_details AS JSONB), :created_at, :updated_at)
+    (:network, :ledger, :closed_at, :tx_hash, :operation_id, :operation_index, :operation_type, :successful, :source_account, :from_address, :to_address, :source_asset_type, :source_asset_code, :source_asset_issuer, :source_amount_decimal, :destination_asset_type, :destination_asset_code, :destination_asset_issuer, :destination_amount_decimal, :asset_type, :asset_code, :asset_issuer, :amount_decimal, :memo_type, :memo, :created_at, :updated_at)
 ON CONFLICT (network, operation_id) DO UPDATE SET
     ledger = EXCLUDED.ledger,
     closed_at = EXCLUDED.closed_at,
@@ -439,13 +499,20 @@ ON CONFLICT (network, operation_id) DO UPDATE SET
     source_account = EXCLUDED.source_account,
     from_address = EXCLUDED.from_address,
     to_address = EXCLUDED.to_address,
+    source_asset_type = EXCLUDED.source_asset_type,
+    source_asset_code = EXCLUDED.source_asset_code,
+    source_asset_issuer = EXCLUDED.source_asset_issuer,
+    source_amount_decimal = EXCLUDED.source_amount_decimal,
+    destination_asset_type = EXCLUDED.destination_asset_type,
+    destination_asset_code = EXCLUDED.destination_asset_code,
+    destination_asset_issuer = EXCLUDED.destination_asset_issuer,
+    destination_amount_decimal = EXCLUDED.destination_amount_decimal,
     asset_type = EXCLUDED.asset_type,
     asset_code = EXCLUDED.asset_code,
     asset_issuer = EXCLUDED.asset_issuer,
     amount_decimal = EXCLUDED.amount_decimal,
     memo_type = EXCLUDED.memo_type,
     memo = EXCLUDED.memo,
-    raw_details = EXCLUDED.raw_details,
     updated_at = EXCLUDED.updated_at
 SQL;
         }
@@ -522,34 +589,6 @@ SQL;
         $fraction = rtrim($fraction, '0');
 
         return $fraction === '' ? $integer : sprintf('%s.%s', $integer, $fraction);
-    }
-
-    private function normalizeJsonText(mixed $value): ?string
-    {
-        if ($value === null) {
-            return null;
-        }
-        if (is_array($value)) {
-            $encoded = json_encode($value, JSON_UNESCAPED_SLASHES);
-
-            return $encoded === false ? null : $encoded;
-        }
-
-        $raw = trim((string) $value);
-        if ($raw === '') {
-            return null;
-        }
-
-        $decoded = json_decode($raw, true);
-        if (json_last_error() === JSON_ERROR_NONE) {
-            $encoded = json_encode($decoded, JSON_UNESCAPED_SLASHES);
-
-            return $encoded === false ? null : $encoded;
-        }
-
-        $encoded = json_encode(['raw' => $raw], JSON_UNESCAPED_SLASHES);
-
-        return $encoded === false ? null : $encoded;
     }
 
     private function toInt(mixed $value): ?int
