@@ -16,6 +16,8 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class PaymentFlowEventSyncService
 {
     private const DEFAULT_BATCH_SIZE = 5000;
+    private const UPSERT_BATCH_SIZE = 1000;
+    private const SELECT_BATCH_SIZE = 5000;
 
     /** @var array<int,string> */
     private const OPERATION_TYPE_NAMES = [
@@ -387,8 +389,6 @@ SQL;
         $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $nowString = $now->format('Y-m-d H:i:s');
         $network = (int) $events[0]['network'];
-        $rowsWritten = 0;
-        $sql = $this->buildEventUpsertSql();
 
         $this->statisticsConnection->beginTransaction();
         try {
@@ -396,48 +396,14 @@ SQL;
             $assetIds = $this->ensureAssetIds($network, $events, $nowString);
             $transactionIds = $this->ensureTransactionIds($network, $events, $addressIds, $nowString);
 
-            foreach ($events as $event) {
-                $txId = $transactionIds[(string) $event['tx_hash']] ?? null;
-                if ($txId === null) {
-                    continue;
-                }
-
-                $this->statisticsConnection->executeStatement(
-                    $sql,
-                    [
-                        'network' => $network,
-                        'ledger' => $event['ledger'],
-                        'tx_id' => $txId,
-                        'operation_id' => $event['operation_id'],
-                        'operation_index' => $event['operation_index'],
-                        'operation_type' => $event['operation_type'],
-                        'successful' => $event['successful'],
-                        'source_account_id' => $this->resolveAddressId($addressIds, $event['source_account'] ?? null),
-                        'from_address_id' => $this->resolveAddressId($addressIds, $event['from_address'] ?? null),
-                        'to_address_id' => $this->resolveAddressId($addressIds, $event['to_address'] ?? null),
-                        'source_asset_id' => $this->resolveAssetId($assetIds, $event, 'source'),
-                        'source_amount_decimal' => $event['source_amount_decimal'],
-                        'destination_asset_id' => $this->resolveAssetId($assetIds, $event, 'destination'),
-                        'destination_amount_decimal' => $event['destination_amount_decimal'],
-                        'created_at' => $nowString,
-                        'updated_at' => $nowString,
-                    ],
-                    [
-                        'network' => ParameterType::INTEGER,
-                        'ledger' => ParameterType::INTEGER,
-                        'tx_id' => ParameterType::INTEGER,
-                        'operation_id' => ParameterType::INTEGER,
-                        'operation_index' => ParameterType::INTEGER,
-                        'successful' => ParameterType::BOOLEAN,
-                        'source_account_id' => ParameterType::INTEGER,
-                        'from_address_id' => ParameterType::INTEGER,
-                        'to_address_id' => ParameterType::INTEGER,
-                        'source_asset_id' => ParameterType::INTEGER,
-                        'destination_asset_id' => ParameterType::INTEGER,
-                    ]
-                );
-                $rowsWritten++;
-            }
+            $rowsWritten = $this->bulkUpsertPaymentEvents(
+                $network,
+                $events,
+                $addressIds,
+                $assetIds,
+                $transactionIds,
+                $nowString
+            );
 
             $this->statisticsConnection->commit();
         } catch (\Throwable $exception) {
@@ -472,39 +438,8 @@ SQL;
         $missing = array_values(array_diff(array_keys($addresses), array_keys($this->addressIdCache[$network])));
 
         if ($missing !== []) {
-            $sql = $this->buildAddressUpsertSql();
-            foreach ($missing as $address) {
-                $this->statisticsConnection->executeStatement(
-                    $sql,
-                    [
-                        'network' => $network,
-                        'address' => $address,
-                        'created_at' => $nowString,
-                    ],
-                    [
-                        'network' => ParameterType::INTEGER,
-                    ]
-                );
-            }
-
-            $rows = $this->statisticsConnection->fetchAllAssociative(
-                'SELECT id, address FROM payment_flow_address WHERE network = :network AND address IN (:addresses)',
-                [
-                    'network' => $network,
-                    'addresses' => $missing,
-                ],
-                [
-                    'network' => ParameterType::INTEGER,
-                    'addresses' => ArrayParameterType::STRING,
-                ]
-            );
-            foreach ($rows as $row) {
-                $address = (string) ($row['address'] ?? '');
-                $id = $this->toInt($row['id'] ?? null);
-                if ($address !== '' && $id !== null) {
-                    $this->addressIdCache[$network][$address] = $id;
-                }
-            }
+            $this->bulkUpsertAddresses($network, $missing, $nowString);
+            $this->loadAddressIds($network, $missing);
         }
 
         return $this->addressIdCache[$network];
@@ -532,40 +467,8 @@ SQL;
         $missing = array_values(array_diff(array_keys($assets), array_keys($this->assetIdCache[$network])));
 
         if ($missing !== []) {
-            $sql = $this->buildAssetUpsertSql();
-            foreach ($missing as $key) {
-                [$assetType, $assetCode, $assetIssuer] = $this->parseAssetKey($key);
-                $this->statisticsConnection->executeStatement(
-                    $sql,
-                    [
-                        'network' => $network,
-                        'asset_type' => $assetType,
-                        'asset_code' => $assetCode,
-                        'asset_issuer' => $assetIssuer,
-                        'created_at' => $nowString,
-                    ],
-                    [
-                        'network' => ParameterType::INTEGER,
-                    ]
-                );
-
-                $id = $this->statisticsConnection->fetchOne(
-                    'SELECT id FROM payment_flow_asset WHERE network = :network AND asset_type = :asset_type AND asset_code = :asset_code AND asset_issuer = :asset_issuer',
-                    [
-                        'network' => $network,
-                        'asset_type' => $assetType,
-                        'asset_code' => $assetCode,
-                        'asset_issuer' => $assetIssuer,
-                    ],
-                    [
-                        'network' => ParameterType::INTEGER,
-                    ]
-                );
-                $assetId = $this->toInt($id);
-                if ($assetId !== null) {
-                    $this->assetIdCache[$network][$key] = $assetId;
-                }
-            }
+            $this->bulkUpsertAssets($network, $missing, $nowString);
+            $this->loadAllAssetIds($network);
         }
 
         return $this->assetIdCache[$network];
@@ -598,11 +501,171 @@ SQL;
             return [];
         }
 
-        $sql = $this->buildTransactionUpsertSql();
-        foreach ($transactions as $txHash => $transaction) {
-            $this->statisticsConnection->executeStatement(
-                $sql,
+        $this->bulkUpsertTransactions($network, $transactions, $nowString);
+
+        $ids = [];
+        foreach (array_chunk(array_keys($transactions), self::SELECT_BATCH_SIZE) as $txHashBatch) {
+            $rows = $this->statisticsConnection->fetchAllAssociative(
+                'SELECT id, tx_hash FROM payment_flow_transaction WHERE network = :network AND tx_hash IN (:tx_hashes)',
                 [
+                    'network' => $network,
+                    'tx_hashes' => $txHashBatch,
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'tx_hashes' => ArrayParameterType::STRING,
+                ]
+            );
+
+            foreach ($rows as $row) {
+                $txHash = (string) ($row['tx_hash'] ?? '');
+                $id = $this->toInt($row['id'] ?? null);
+                if ($txHash !== '' && $id !== null) {
+                    $ids[$txHash] = $id;
+                }
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * @param list<string> $addresses
+     */
+    private function bulkUpsertAddresses(int $network, array $addresses, string $nowString): void
+    {
+        foreach (array_chunk($addresses, self::UPSERT_BATCH_SIZE) as $addressBatch) {
+            $rows = [];
+            foreach ($addressBatch as $address) {
+                $rows[] = [
+                    'network' => $network,
+                    'address' => $address,
+                    'created_at' => $nowString,
+                ];
+            }
+
+            [$valuesSql, $params, $types] = $this->buildBulkValues(
+                $rows,
+                ['network', 'address', 'created_at'],
+                ['network']
+            );
+
+            $sql = <<<SQL
+INSERT INTO payment_flow_address (network, address, created_at)
+VALUES {$valuesSql}
+SQL;
+
+            $platform = $this->statisticsConnection->getDatabasePlatform();
+            if ($platform instanceof AbstractMySQLPlatform) {
+                $sql .= "\nON DUPLICATE KEY UPDATE address = VALUES(address)";
+            } elseif ($platform instanceof PostgreSQLPlatform) {
+                $sql .= "\nON CONFLICT (network, address) DO NOTHING";
+            } else {
+                throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+            }
+
+            $this->statisticsConnection->executeStatement($sql, $params, $types);
+        }
+    }
+
+    /**
+     * @param list<string> $addresses
+     */
+    private function loadAddressIds(int $network, array $addresses): void
+    {
+        foreach (array_chunk($addresses, self::SELECT_BATCH_SIZE) as $addressBatch) {
+            $rows = $this->statisticsConnection->fetchAllAssociative(
+                'SELECT id, address FROM payment_flow_address WHERE network = :network AND address IN (:addresses)',
+                [
+                    'network' => $network,
+                    'addresses' => $addressBatch,
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'addresses' => ArrayParameterType::STRING,
+                ]
+            );
+
+            foreach ($rows as $row) {
+                $address = (string) ($row['address'] ?? '');
+                $id = $this->toInt($row['id'] ?? null);
+                if ($address !== '' && $id !== null) {
+                    $this->addressIdCache[$network][$address] = $id;
+                }
+            }
+        }
+    }
+
+    /**
+     * @param list<string> $assetKeys
+     */
+    private function bulkUpsertAssets(int $network, array $assetKeys, string $nowString): void
+    {
+        foreach (array_chunk($assetKeys, self::UPSERT_BATCH_SIZE) as $assetKeyBatch) {
+            $rows = [];
+            foreach ($assetKeyBatch as $key) {
+                [$assetType, $assetCode, $assetIssuer] = $this->parseAssetKey($key);
+                $rows[] = [
+                    'network' => $network,
+                    'asset_type' => $assetType,
+                    'asset_code' => $assetCode,
+                    'asset_issuer' => $assetIssuer,
+                    'created_at' => $nowString,
+                ];
+            }
+
+            [$valuesSql, $params, $types] = $this->buildBulkValues(
+                $rows,
+                ['network', 'asset_type', 'asset_code', 'asset_issuer', 'created_at'],
+                ['network']
+            );
+
+            $sql = <<<SQL
+INSERT INTO payment_flow_asset (network, asset_type, asset_code, asset_issuer, created_at)
+VALUES {$valuesSql}
+SQL;
+
+            $platform = $this->statisticsConnection->getDatabasePlatform();
+            if ($platform instanceof AbstractMySQLPlatform) {
+                $sql .= "\nON DUPLICATE KEY UPDATE asset_type = VALUES(asset_type)";
+            } elseif ($platform instanceof PostgreSQLPlatform) {
+                $sql .= "\nON CONFLICT (network, asset_type, asset_code, asset_issuer) DO NOTHING";
+            } else {
+                throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+            }
+
+            $this->statisticsConnection->executeStatement($sql, $params, $types);
+        }
+    }
+
+    private function loadAllAssetIds(int $network): void
+    {
+        $rows = $this->statisticsConnection->fetchAllAssociative(
+            'SELECT id, asset_type, asset_code, asset_issuer FROM payment_flow_asset WHERE network = :network',
+            ['network' => $network],
+            ['network' => ParameterType::INTEGER]
+        );
+
+        foreach ($rows as $row) {
+            $assetType = (string) ($row['asset_type'] ?? 'native');
+            $assetCode = (string) ($row['asset_code'] ?? '');
+            $assetIssuer = (string) ($row['asset_issuer'] ?? '');
+            $id = $this->toInt($row['id'] ?? null);
+            if ($id !== null) {
+                $this->assetIdCache[$network][$this->buildAssetKey($assetType, $assetCode, $assetIssuer)] = $id;
+            }
+        }
+    }
+
+    /**
+     * @param array<string,array{ledger:mixed,closed_at:mixed,source_account_id:?int,memo_type:mixed,memo:mixed}> $transactions
+     */
+    private function bulkUpsertTransactions(int $network, array $transactions, string $nowString): void
+    {
+        foreach (array_chunk($transactions, self::UPSERT_BATCH_SIZE, true) as $transactionBatch) {
+            $rows = [];
+            foreach ($transactionBatch as $txHash => $transaction) {
+                $rows[] = [
                     'network' => $network,
                     'ledger' => $transaction['ledger'],
                     'closed_at' => $transaction['closed_at'],
@@ -612,95 +675,25 @@ SQL;
                     'memo' => $transaction['memo'],
                     'created_at' => $nowString,
                     'updated_at' => $nowString,
-                ],
-                [
-                    'network' => ParameterType::INTEGER,
-                    'ledger' => ParameterType::INTEGER,
-                    'source_account_id' => ParameterType::INTEGER,
-                ]
-            );
-        }
-
-        $rows = $this->statisticsConnection->fetchAllAssociative(
-            'SELECT id, tx_hash FROM payment_flow_transaction WHERE network = :network AND tx_hash IN (:tx_hashes)',
-            [
-                'network' => $network,
-                'tx_hashes' => array_keys($transactions),
-            ],
-            [
-                'network' => ParameterType::INTEGER,
-                'tx_hashes' => ArrayParameterType::STRING,
-            ]
-        );
-
-        $ids = [];
-        foreach ($rows as $row) {
-            $txHash = (string) ($row['tx_hash'] ?? '');
-            $id = $this->toInt($row['id'] ?? null);
-            if ($txHash !== '' && $id !== null) {
-                $ids[$txHash] = $id;
+                ];
             }
-        }
 
-        return $ids;
-    }
+            [$valuesSql, $params, $types] = $this->buildBulkValues(
+                $rows,
+                ['network', 'ledger', 'closed_at', 'tx_hash', 'source_account_id', 'memo_type', 'memo', 'created_at', 'updated_at'],
+                ['network', 'ledger', 'source_account_id']
+            );
 
-    private function buildAddressUpsertSql(): string
-    {
-        $platform = $this->statisticsConnection->getDatabasePlatform();
-
-        if ($platform instanceof AbstractMySQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_address (network, address, created_at)
-VALUES (:network, :address, :created_at)
-ON DUPLICATE KEY UPDATE address = VALUES(address)
-SQL;
-        }
-
-        if ($platform instanceof PostgreSQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_address (network, address, created_at)
-VALUES (:network, :address, :created_at)
-ON CONFLICT (network, address) DO NOTHING
-SQL;
-        }
-
-        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
-    }
-
-    private function buildAssetUpsertSql(): string
-    {
-        $platform = $this->statisticsConnection->getDatabasePlatform();
-
-        if ($platform instanceof AbstractMySQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_asset (network, asset_type, asset_code, asset_issuer, created_at)
-VALUES (:network, :asset_type, :asset_code, :asset_issuer, :created_at)
-ON DUPLICATE KEY UPDATE asset_type = VALUES(asset_type)
-SQL;
-        }
-
-        if ($platform instanceof PostgreSQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_asset (network, asset_type, asset_code, asset_issuer, created_at)
-VALUES (:network, :asset_type, :asset_code, :asset_issuer, :created_at)
-ON CONFLICT (network, asset_type, asset_code, asset_issuer) DO NOTHING
-SQL;
-        }
-
-        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
-    }
-
-    private function buildTransactionUpsertSql(): string
-    {
-        $platform = $this->statisticsConnection->getDatabasePlatform();
-
-        if ($platform instanceof AbstractMySQLPlatform) {
-            return <<<SQL
+            $sql = <<<SQL
 INSERT INTO payment_flow_transaction
     (network, ledger, closed_at, tx_hash, source_account_id, memo_type, memo, created_at, updated_at)
-VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :source_account_id, :memo_type, :memo, :created_at, :updated_at)
+VALUES {$valuesSql}
+SQL;
+
+            $platform = $this->statisticsConnection->getDatabasePlatform();
+            if ($platform instanceof AbstractMySQLPlatform) {
+                $sql .= <<<SQL
+
 ON DUPLICATE KEY UPDATE
     ledger = VALUES(ledger),
     closed_at = VALUES(closed_at),
@@ -709,14 +702,9 @@ ON DUPLICATE KEY UPDATE
     memo = VALUES(memo),
     updated_at = VALUES(updated_at)
 SQL;
-        }
+            } elseif ($platform instanceof PostgreSQLPlatform) {
+                $sql .= <<<SQL
 
-        if ($platform instanceof PostgreSQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_transaction
-    (network, ledger, closed_at, tx_hash, source_account_id, memo_type, memo, created_at, updated_at)
-VALUES
-    (:network, :ledger, :closed_at, :tx_hash, :source_account_id, :memo_type, :memo, :created_at, :updated_at)
 ON CONFLICT (network, tx_hash) DO UPDATE SET
     ledger = EXCLUDED.ledger,
     closed_at = EXCLUDED.closed_at,
@@ -725,21 +713,119 @@ ON CONFLICT (network, tx_hash) DO UPDATE SET
     memo = EXCLUDED.memo,
     updated_at = EXCLUDED.updated_at
 SQL;
-        }
+            } else {
+                throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+            }
 
-        throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
+            $this->statisticsConnection->executeStatement($sql, $params, $types);
+        }
     }
 
-    private function buildEventUpsertSql(): string
-    {
-        $platform = $this->statisticsConnection->getDatabasePlatform();
+    /**
+     * @param list<array<string,mixed>> $events
+     * @param array<string,int> $addressIds
+     * @param array<string,int> $assetIds
+     * @param array<string,int> $transactionIds
+     */
+    private function bulkUpsertPaymentEvents(
+        int $network,
+        array $events,
+        array $addressIds,
+        array $assetIds,
+        array $transactionIds,
+        string $nowString
+    ): int {
+        $rows = [];
+        $rowsWritten = 0;
 
-        if ($platform instanceof AbstractMySQLPlatform) {
-            return <<<SQL
+        foreach ($events as $event) {
+            $txId = $transactionIds[(string) $event['tx_hash']] ?? null;
+            if ($txId === null) {
+                continue;
+            }
+
+            $rows[] = [
+                'network' => $network,
+                'ledger' => $event['ledger'],
+                'tx_id' => $txId,
+                'operation_id' => $event['operation_id'],
+                'operation_index' => $event['operation_index'],
+                'operation_type' => $event['operation_type'],
+                'successful' => $event['successful'],
+                'source_account_id' => $this->resolveAddressId($addressIds, $event['source_account'] ?? null),
+                'from_address_id' => $this->resolveAddressId($addressIds, $event['from_address'] ?? null),
+                'to_address_id' => $this->resolveAddressId($addressIds, $event['to_address'] ?? null),
+                'source_asset_id' => $this->resolveAssetId($assetIds, $event, 'source'),
+                'source_amount_decimal' => $event['source_amount_decimal'],
+                'destination_asset_id' => $this->resolveAssetId($assetIds, $event, 'destination'),
+                'destination_amount_decimal' => $event['destination_amount_decimal'],
+                'created_at' => $nowString,
+                'updated_at' => $nowString,
+            ];
+
+            if (count($rows) >= self::UPSERT_BATCH_SIZE) {
+                $rowsWritten += $this->executePaymentEventBatch($rows);
+                $rows = [];
+            }
+        }
+
+        if ($rows !== []) {
+            $rowsWritten += $this->executePaymentEventBatch($rows);
+        }
+
+        return $rowsWritten;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     */
+    private function executePaymentEventBatch(array $rows): int
+    {
+        [$valuesSql, $params, $types] = $this->buildBulkValues(
+            $rows,
+            [
+                'network',
+                'ledger',
+                'tx_id',
+                'operation_id',
+                'operation_index',
+                'operation_type',
+                'successful',
+                'source_account_id',
+                'from_address_id',
+                'to_address_id',
+                'source_asset_id',
+                'source_amount_decimal',
+                'destination_asset_id',
+                'destination_amount_decimal',
+                'created_at',
+                'updated_at',
+            ],
+            [
+                'network',
+                'ledger',
+                'tx_id',
+                'operation_id',
+                'operation_index',
+                'source_account_id',
+                'from_address_id',
+                'to_address_id',
+                'source_asset_id',
+                'destination_asset_id',
+            ],
+            ['successful']
+        );
+
+        $sql = <<<SQL
 INSERT INTO payment_flow_event
     (network, ledger, tx_id, operation_id, operation_index, operation_type, successful, source_account_id, from_address_id, to_address_id, source_asset_id, source_amount_decimal, destination_asset_id, destination_amount_decimal, created_at, updated_at)
-VALUES
-    (:network, :ledger, :tx_id, :operation_id, :operation_index, :operation_type, :successful, :source_account_id, :from_address_id, :to_address_id, :source_asset_id, :source_amount_decimal, :destination_asset_id, :destination_amount_decimal, :created_at, :updated_at)
+VALUES {$valuesSql}
+SQL;
+
+        $platform = $this->statisticsConnection->getDatabasePlatform();
+        if ($platform instanceof AbstractMySQLPlatform) {
+            $sql .= <<<SQL
+
 ON DUPLICATE KEY UPDATE
     ledger = VALUES(ledger),
     tx_id = VALUES(tx_id),
@@ -755,14 +841,9 @@ ON DUPLICATE KEY UPDATE
     destination_amount_decimal = VALUES(destination_amount_decimal),
     updated_at = VALUES(updated_at)
 SQL;
-        }
+        } elseif ($platform instanceof PostgreSQLPlatform) {
+            $sql .= <<<SQL
 
-        if ($platform instanceof PostgreSQLPlatform) {
-            return <<<SQL
-INSERT INTO payment_flow_event
-    (network, ledger, tx_id, operation_id, operation_index, operation_type, successful, source_account_id, from_address_id, to_address_id, source_asset_id, source_amount_decimal, destination_asset_id, destination_amount_decimal, created_at, updated_at)
-VALUES
-    (:network, :ledger, :tx_id, :operation_id, :operation_index, :operation_type, :successful, :source_account_id, :from_address_id, :to_address_id, :source_asset_id, :source_amount_decimal, :destination_asset_id, :destination_amount_decimal, :created_at, :updated_at)
 ON CONFLICT (network, operation_id) DO UPDATE SET
     ledger = EXCLUDED.ledger,
     tx_id = EXCLUDED.tx_id,
@@ -778,12 +859,51 @@ ON CONFLICT (network, operation_id) DO UPDATE SET
     destination_amount_decimal = EXCLUDED.destination_amount_decimal,
     updated_at = EXCLUDED.updated_at
 SQL;
+        } else {
+            throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
         }
 
-        throw new \RuntimeException(sprintf(
-            'Unsupported statistics database platform: %s',
-            $platform::class
-        ));
+        $this->statisticsConnection->executeStatement($sql, $params, $types);
+
+        return count($rows);
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     * @param list<string> $columns
+     * @param list<string> $integerColumns
+     * @param list<string> $booleanColumns
+     * @return array{0:string,1:array<string,mixed>,2:array<string,ParameterType>}
+     */
+    private function buildBulkValues(
+        array $rows,
+        array $columns,
+        array $integerColumns = [],
+        array $booleanColumns = []
+    ): array {
+        $values = [];
+        $params = [];
+        $types = [];
+        $integerLookup = array_fill_keys($integerColumns, true);
+        $booleanLookup = array_fill_keys($booleanColumns, true);
+
+        foreach ($rows as $rowIndex => $row) {
+            $placeholders = [];
+            foreach ($columns as $column) {
+                $parameter = sprintf('%s_%d', $column, $rowIndex);
+                $placeholders[] = ':' . $parameter;
+                $params[$parameter] = $row[$column] ?? null;
+
+                if (($row[$column] ?? null) !== null && isset($integerLookup[$column])) {
+                    $types[$parameter] = ParameterType::INTEGER;
+                } elseif (($row[$column] ?? null) !== null && isset($booleanLookup[$column])) {
+                    $types[$parameter] = ParameterType::BOOLEAN;
+                }
+            }
+            $values[] = '(' . implode(', ', $placeholders) . ')';
+        }
+
+        return [implode(",\n", $values), $params, $types];
     }
 
     private function resolveHorizonConnection(string $network): Connection
