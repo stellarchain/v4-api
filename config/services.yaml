@@ -49,6 +49,8 @@ services:
 
     App\Service\Statistics\NetworkMetricSyncServiceInterface: '@App\Service\Statistics\NetworkMetricSyncService'
     App\Service\Statistics\NetworkStatisticsReadServiceInterface: '@App\Service\Statistics\NetworkStatisticsReadService'
+    App\Service\Trace\PaymentFlowAccountMetadataReadServiceInterface: '@App\Service\Trace\PaymentFlowAccountMetadataReadService'
+    App\Service\Trace\PaymentFlowInvestigationReadServiceInterface: '@App\Service\Trace\PaymentFlowInvestigationReadService'
 
     App\Service\Orders\OrderMonitorAccountResolver:
         arguments:
