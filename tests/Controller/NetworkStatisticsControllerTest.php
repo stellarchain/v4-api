@@ -20,9 +20,15 @@ final class NetworkStatisticsControllerTest extends TestCase
         $service = new class implements NetworkStatisticsReadServiceInterface {
             public array $calls = [];
 
-            public function read(string $network, string $range, int $bucketMinutes): array
+            public function read(
+                string $network,
+                string $range,
+                int $bucketMinutes,
+                ?\DateTimeImmutable $before = null,
+                int $limitBuckets = 288
+            ): array
             {
-                $this->calls[] = [$network, $range, $bucketMinutes];
+                $this->calls[] = [$network, $range, $bucketMinutes, $before, $limitBuckets];
 
                 return [
                     'network' => 'mainnet',
@@ -39,7 +45,7 @@ final class NetworkStatisticsControllerTest extends TestCase
         $response = $controller(Request::create('/v1/statistics/network'));
 
         self::assertSame(Response::HTTP_OK, $response->getStatusCode());
-        self::assertSame([['mainnet', '7d', 5]], $service->calls);
+        self::assertSame([['mainnet', '7d', 5, null, 288]], $service->calls);
         self::assertSame('mainnet', json_decode((string) $response->getContent(), true)['network']);
     }
 
@@ -70,10 +76,25 @@ final class NetworkStatisticsControllerTest extends TestCase
         self::assertSame('invalid_bucket_minutes', json_decode((string) $response->getContent(), true)['error']['type']);
     }
 
+    public function testItRejectsInvalidLimitBuckets(): void
+    {
+        $controller = new NetworkStatisticsController($this->unusedService());
+        $response = $controller(Request::create('/v1/statistics/network?limitBuckets=5000'));
+
+        self::assertSame(Response::HTTP_BAD_REQUEST, $response->getStatusCode());
+        self::assertSame('invalid_limit_buckets', json_decode((string) $response->getContent(), true)['error']['type']);
+    }
+
     public function testItMapsStatisticsUnavailableToServiceUnavailable(): void
     {
         $service = new class implements NetworkStatisticsReadServiceInterface {
-            public function read(string $network, string $range, int $bucketMinutes): array
+            public function read(
+                string $network,
+                string $range,
+                int $bucketMinutes,
+                ?\DateTimeImmutable $before = null,
+                int $limitBuckets = 288
+            ): array
             {
                 throw new StatisticsUnavailableException('No table.');
             }
@@ -89,7 +110,13 @@ final class NetworkStatisticsControllerTest extends TestCase
     private function unusedService(): NetworkStatisticsReadServiceInterface
     {
         return new class implements NetworkStatisticsReadServiceInterface {
-            public function read(string $network, string $range, int $bucketMinutes): array
+            public function read(
+                string $network,
+                string $range,
+                int $bucketMinutes,
+                ?\DateTimeImmutable $before = null,
+                int $limitBuckets = 288
+            ): array
             {
                 throw new \LogicException('The service should not be called.');
             }

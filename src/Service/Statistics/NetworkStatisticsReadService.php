@@ -68,11 +68,18 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
     ) {
     }
 
-    public function read(string $network, string $range, int $bucketMinutes): array
+    public function read(
+        string $network,
+        string $range,
+        int $bucketMinutes,
+        ?\DateTimeImmutable $before = null,
+        int $limitBuckets = 288
+    ): array
     {
         $normalizedNetwork = $this->networkResolver->normalizeNetwork($network, 'mainnet');
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
-        $sourceBucketMinutes = min($bucketMinutes, self::SOURCE_BUCKET_MINUTES);
+        $sourceBucketMinutes = self::SOURCE_BUCKET_MINUTES;
+        $limitBuckets = max(1, $limitBuckets);
 
         try {
             if (!$this->tableExists('network_metric_point')) {
@@ -81,16 +88,40 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
 
             $latest = $this->loadLatestBucket($networkCode, $sourceBucketMinutes);
             if ($latest === null) {
-                return $this->emptyPayload($normalizedNetwork, $range, $bucketMinutes);
+                return $this->emptyPayload($normalizedNetwork, $range, $bucketMinutes, $limitBuckets);
             }
 
-            $latestBucket = $latest['bucketStart'];
+            if ($before !== null) {
+                // Pagination cursor: anchor the upper bound just before this timestamp
+                // so consecutive pages do not overlap by a bucket.
+                $latestBucket = $this->floorToBucket($before, $bucketMinutes)
+                    ->modify(sprintf('-%d minutes', $bucketMinutes));
+            } else {
+                $latestBucket = $this->floorToBucket($latest['bucketStart'], $bucketMinutes);
+            }
+
             $requestedStart = $this->floorToBucket(
                 $latestBucket->modify(self::RANGE_MODIFIERS[$range]),
                 $bucketMinutes
             );
-            $sourceRows = $this->loadMetricRows($networkCode, $sourceBucketMinutes, $requestedStart, $latestBucket);
-            $rows = $this->aggregateRowsToBucketMinutes($sourceRows, $sourceBucketMinutes, $bucketMinutes);
+            $pageStart = $latestBucket->modify(sprintf('-%d minutes', ($limitBuckets - 1) * $bucketMinutes));
+            if ($pageStart > $requestedStart) {
+                $requestedStart = $pageStart;
+            }
+
+            $sourceRangeEnd = $latestBucket->modify(sprintf('+%d minutes', max($bucketMinutes - $sourceBucketMinutes, 0)));
+            if ($sourceRangeEnd > $latest['bucketStart']) {
+                $sourceRangeEnd = $latest['bucketStart'];
+            }
+
+            $rows = $this->loadMetricRows(
+                $networkCode,
+                $sourceBucketMinutes,
+                $bucketMinutes,
+                $requestedStart,
+                $sourceRangeEnd
+            );
+            $hasMore = $this->hasOlderRows($networkCode, $sourceBucketMinutes, $requestedStart);
         } catch (StatisticsUnavailableException $exception) {
             throw $exception;
         } catch (Exception $exception) {
@@ -98,11 +129,11 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         }
 
         if ($rows === []) {
-            return $this->emptyPayload($normalizedNetwork, $range, $bucketMinutes);
+            return $this->emptyPayload($normalizedNetwork, $range, $bucketMinutes, $limitBuckets);
         }
 
         $seriesByMetric = $this->buildSeriesByMetric($rows);
-        $coverage = $this->buildCoverage($rows, $requestedStart, $latestBucket, $latest['latestUpdate'], $bucketMinutes);
+        $coverage = $this->buildCoverage($rows, $requestedStart, $latestBucket, $latest['latestUpdate'], $bucketMinutes, $hasMore, $limitBuckets);
 
         return [
             'network' => $normalizedNetwork,
@@ -112,6 +143,29 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
             'sections' => $this->buildSections($seriesByMetric),
             'chart' => $this->buildChart($seriesByMetric),
         ];
+    }
+
+    private function hasOlderRows(int $networkCode, int $bucketMinutes, \DateTimeImmutable $requestedStart): bool
+    {
+        $result = $this->statisticsConnection->fetchOne(
+            'SELECT 1
+             FROM network_metric_point
+             WHERE network = :network
+               AND bucket_minutes = :bucket_minutes
+               AND bucket_start < :range_start
+             LIMIT 1',
+            [
+                'network' => $networkCode,
+                'bucket_minutes' => $bucketMinutes,
+                'range_start' => $requestedStart->format('Y-m-d H:i:s'),
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'bucket_minutes' => ParameterType::INTEGER,
+            ]
+        );
+
+        return $result !== false && $result !== null;
     }
 
     private function tableExists(string $table): bool
@@ -161,101 +215,87 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
      */
     private function loadMetricRows(
         int $networkCode,
-        int $bucketMinutes,
+        int $sourceBucketMinutes,
+        int $targetBucketMinutes,
         \DateTimeImmutable $rangeStart,
         \DateTimeImmutable $rangeEnd
     ): array {
+        if ($targetBucketMinutes === $sourceBucketMinutes) {
+            return $this->statisticsConnection->fetchAllAssociative(
+                'SELECT metric_key, bucket_start, bucket_end, value_decimal, updated_at
+                 FROM network_metric_point
+                 WHERE network = :network
+                   AND bucket_minutes = :bucket_minutes
+                   AND metric_key IN (:metric_keys)
+                   AND bucket_start >= :range_start
+                   AND bucket_start <= :range_end
+                 ORDER BY bucket_start ASC, metric_key ASC',
+                [
+                    'network' => $networkCode,
+                    'bucket_minutes' => $sourceBucketMinutes,
+                    'metric_keys' => array_keys(self::METRICS),
+                    'range_start' => $rangeStart->format('Y-m-d H:i:s'),
+                    'range_end' => $rangeEnd->format('Y-m-d H:i:s'),
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'bucket_minutes' => ParameterType::INTEGER,
+                    'metric_keys' => ArrayParameterType::STRING,
+                ]
+            );
+        }
+
+        $targetInterval = sprintf('%d minutes', $targetBucketMinutes);
+        $avgMetricKeys = [];
+        foreach (self::METRICS as $metricKey => $metricConfig) {
+            if (($metricConfig['aggregation'] ?? 'sum') === 'avg') {
+                $avgMetricKeys[] = $metricKey;
+            }
+        }
+
         return $this->statisticsConnection->fetchAllAssociative(
-            'SELECT metric_key, bucket_start, bucket_end, value_decimal, updated_at
-             FROM network_metric_point
-             WHERE network = :network
-               AND bucket_minutes = :bucket_minutes
-               AND metric_key IN (:metric_keys)
-               AND bucket_start >= :range_start
-               AND bucket_start <= :range_end
-             ORDER BY bucket_start ASC, metric_key ASC',
+            'WITH source_rows AS (
+                 SELECT
+                     metric_key,
+                     date_bin(CAST(:target_interval AS interval), bucket_start, TIMESTAMP \'1970-01-01 00:00:00\') AS grouped_bucket_start,
+                     value_decimal,
+                     updated_at
+                 FROM network_metric_point
+                 WHERE network = :network
+                   AND bucket_minutes = :source_bucket_minutes
+                   AND metric_key IN (:metric_keys)
+                   AND bucket_start >= :range_start
+                   AND bucket_start <= :range_end
+             )
+             SELECT
+                 metric_key,
+                 grouped_bucket_start AS bucket_start,
+                 grouped_bucket_start + CAST(:target_interval AS interval) AS bucket_end,
+                 CASE
+                     WHEN metric_key IN (:avg_metric_keys) THEN AVG(value_decimal)
+                     ELSE SUM(value_decimal)
+                 END AS value_decimal,
+                 MAX(updated_at) AS updated_at
+             FROM source_rows
+             GROUP BY grouped_bucket_start, metric_key
+             ORDER BY grouped_bucket_start ASC, metric_key ASC',
             [
                 'network' => $networkCode,
-                'bucket_minutes' => $bucketMinutes,
+                'source_bucket_minutes' => $sourceBucketMinutes,
+                'target_interval' => $targetInterval,
                 'metric_keys' => array_keys(self::METRICS),
+                'avg_metric_keys' => $avgMetricKeys,
                 'range_start' => $rangeStart->format('Y-m-d H:i:s'),
                 'range_end' => $rangeEnd->format('Y-m-d H:i:s'),
             ],
             [
                 'network' => ParameterType::INTEGER,
-                'bucket_minutes' => ParameterType::INTEGER,
+                'source_bucket_minutes' => ParameterType::INTEGER,
+                'target_interval' => ParameterType::STRING,
                 'metric_keys' => ArrayParameterType::STRING,
+                'avg_metric_keys' => ArrayParameterType::STRING,
             ]
         );
-    }
-
-    /**
-     * @param list<array<string,mixed>> $rows
-     * @return list<array<string,mixed>>
-     */
-    private function aggregateRowsToBucketMinutes(array $rows, int $sourceBucketMinutes, int $targetBucketMinutes): array
-    {
-        if ($targetBucketMinutes <= $sourceBucketMinutes || $rows === []) {
-            return $rows;
-        }
-
-        $buckets = [];
-        foreach ($rows as $row) {
-            $metricKey = (string) ($row['metric_key'] ?? '');
-            if (!isset(self::METRICS[$metricKey])) {
-                continue;
-            }
-
-            $bucketStart = $this->parseUtcDateTime($row['bucket_start'] ?? null);
-            if ($bucketStart === null) {
-                continue;
-            }
-
-            $targetStart = $this->floorToBucket($bucketStart, $targetBucketMinutes);
-            $targetEnd = $targetStart->modify(sprintf('+%d minutes', $targetBucketMinutes));
-            $aggregateKey = sprintf('%s|%s', $targetStart->format('Y-m-d H:i:s'), $metricKey);
-
-            if (!isset($buckets[$aggregateKey])) {
-                $buckets[$aggregateKey] = [
-                    'metric_key' => $metricKey,
-                    'bucket_start' => $targetStart->format('Y-m-d H:i:s'),
-                    'bucket_end' => $targetEnd->format('Y-m-d H:i:s'),
-                    'sum' => 0.0,
-                    'count' => 0,
-                    'updated_at' => null,
-                ];
-            }
-
-            $buckets[$aggregateKey]['sum'] += (float) (string) ($row['value_decimal'] ?? '0');
-            $buckets[$aggregateKey]['count']++;
-
-            $updatedAt = $this->parseUtcDateTime($row['updated_at'] ?? null);
-            $currentUpdatedAt = $this->parseUtcDateTime($buckets[$aggregateKey]['updated_at']);
-            if ($updatedAt !== null && ($currentUpdatedAt === null || $updatedAt > $currentUpdatedAt)) {
-                $buckets[$aggregateKey]['updated_at'] = $updatedAt->format('Y-m-d H:i:s');
-            }
-        }
-
-        ksort($buckets);
-
-        $aggregatedRows = [];
-        foreach ($buckets as $bucket) {
-            $metricKey = (string) $bucket['metric_key'];
-            $aggregation = (string) (self::METRICS[$metricKey]['aggregation'] ?? 'sum');
-            $value = $aggregation === 'avg'
-                ? ((float) $bucket['sum'] / max((int) $bucket['count'], 1))
-                : (float) $bucket['sum'];
-
-            $aggregatedRows[] = [
-                'metric_key' => $metricKey,
-                'bucket_start' => $bucket['bucket_start'],
-                'bucket_end' => $bucket['bucket_end'],
-                'value_decimal' => $this->normalizeNumber($value),
-                'updated_at' => $bucket['updated_at'],
-            ];
-        }
-
-        return $aggregatedRows;
     }
 
     /**
@@ -297,7 +337,9 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         \DateTimeImmutable $requestedStart,
         \DateTimeImmutable $latestBucket,
         ?\DateTimeImmutable $latestUpdate,
-        int $bucketMinutes
+        int $bucketMinutes,
+        bool $hasMore = false,
+        int $limitBuckets = 288
     ): array {
         $firstBucket = null;
         $lastBucket = null;
@@ -336,6 +378,8 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
             'latestUpdate' => $this->formatAtom($maxUpdatedAt),
             'isPartial' => $isPartial,
             'bucketCount' => count($bucketKeys),
+            'limitBuckets' => $limitBuckets,
+            'hasMore' => $hasMore,
         ];
     }
 
@@ -471,7 +515,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
     /**
      * @return array<string,mixed>
      */
-    private function emptyPayload(string $network, string $range, int $bucketMinutes): array
+    private function emptyPayload(string $network, string $range, int $bucketMinutes, int $limitBuckets = 288): array
     {
         return [
             'network' => $network,
@@ -485,6 +529,8 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 'latestUpdate' => null,
                 'isPartial' => true,
                 'bucketCount' => 0,
+                'limitBuckets' => $limitBuckets,
+                'hasMore' => false,
             ],
             'sections' => $this->buildSections([]),
             'chart' => [

@@ -9,5 +9,11 @@ interface NetworkStatisticsReadServiceInterface
     /**
      * @return array<string,mixed>
      */
-    public function read(string $network, string $range, int $bucketMinutes): array;
+    public function read(
+        string $network,
+        string $range,
+        int $bucketMinutes,
+        ?\DateTimeImmutable $before = null,
+        int $limitBuckets = 288
+    ): array;
 }
