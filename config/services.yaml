@@ -34,6 +34,7 @@ parameters:
     app.order_monitor_account_mainnet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_MAINNET)%'
     app.order_monitor_account_testnet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_TESTNET)%'
     app.order_monitor_account_futurenet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_FUTURENET)%'
+    app.scam_report_api_token: '%env(default:app.empty_string:SCAM_REPORT_API_TOKEN)%'
 
 services:
     # default configuration for services in *this* file
@@ -59,6 +60,10 @@ services:
             $fromAddress: '%app.order_mailer_from%'
             $fromName: '%app.order_mailer_from_name%'
             $verificationAdminEmail: '%app.order_verification_admin_email%'
+
+    App\Controller\ScamReportController:
+        arguments:
+            $apiToken: '%app.scam_report_api_token%'
 
     Aws\S3\S3Client:
         arguments:
