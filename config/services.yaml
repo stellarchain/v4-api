@@ -35,6 +35,7 @@ parameters:
     app.order_monitor_account_testnet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_TESTNET)%'
     app.order_monitor_account_futurenet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_FUTURENET)%'
     app.scam_report_api_token: '%env(default:app.empty_string:SCAM_REPORT_API_TOKEN)%'
+    app.scam_report_audit_log_file: '%kernel.logs_dir%/scam_reports.log'
 
 services:
     # default configuration for services in *this* file
@@ -64,6 +65,10 @@ services:
     App\Controller\ScamReportController:
         arguments:
             $apiToken: '%app.scam_report_api_token%'
+
+    App\Service\ScamReportAuditLogger:
+        arguments:
+            $logFile: '%app.scam_report_audit_log_file%'
 
     Aws\S3\S3Client:
         arguments:

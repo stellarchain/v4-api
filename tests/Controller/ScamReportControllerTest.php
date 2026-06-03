@@ -7,6 +7,7 @@ namespace App\Tests\Controller;
 use App\Controller\ScamReportController;
 use App\Entity\Account;
 use App\Repository\AccountRepository;
+use App\Service\ScamReportAuditLogger;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\ORM\EntityManagerInterface;
 use PHPUnit\Framework\TestCase;
@@ -314,6 +315,56 @@ final class ScamReportControllerTest extends TestCase
         self::assertStringContainsString($address, $html);
         self::assertStringContainsString('href="/v1/scam-reports/form?token=secret-token"', $html);
         self::assertStringContainsString('Report more addresses', $html);
+    }
+
+    public function testSignedFormSubmissionLogsClientIpAndSubmittedAddresses(): void
+    {
+        $address = 'GDFAPQOSUUISQU4CN2G2QYPJK4G532N3337PHVMIDTHTNEAVFWUMGUSD';
+        $rawSubmission = strtolower($address);
+
+        $accountRepository = $this->createMock(AccountRepository::class);
+        $accountRepository->expects(self::once())
+            ->method('findOneByAddressAndNetwork')
+            ->with($address, 1)
+            ->willReturn(null);
+
+        $entityManager = $this->createMock(EntityManagerInterface::class);
+        $entityManager->expects(self::once())->method('persist');
+        $entityManager->expects(self::once())->method('flush');
+
+        $auditLogger = $this->createMock(ScamReportAuditLogger::class);
+        $auditLogger->expects(self::once())
+            ->method('logFormSubmission')
+            ->with(
+                self::callback(static fn (Request $request): bool => $request->getClientIp() === '203.0.113.9'),
+                'accepted',
+                $rawSubmission,
+                [$address],
+                [],
+                self::callback(static fn (array $results): bool => ($results[0]['address'] ?? null) === $address
+                    && ($results[0]['network'] ?? null) === 'mainnet'
+                    && ($results[0]['label'] ?? null) === 'Scam')
+            );
+
+        $controller = new ScamReportController(
+            $entityManager,
+            $accountRepository,
+            new StellarNetworkResolver(),
+            'secret-token',
+            $auditLogger
+        );
+
+        $request = Request::create('/v1/scam-reports/form?token=secret-token', 'POST', [
+            'addresses' => $rawSubmission,
+            'token' => 'secret-token',
+        ], [], [], [
+            'REMOTE_ADDR' => '203.0.113.9',
+            'HTTP_USER_AGENT' => 'SDF Scam Reporter',
+        ]);
+
+        $response = $controller->submitForm($request);
+
+        self::assertSame(Response::HTTP_OK, $response->getStatusCode());
     }
 
     public function testSignedFormRejectsInvalidSignature(): void

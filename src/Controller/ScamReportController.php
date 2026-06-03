@@ -4,6 +4,7 @@ namespace App\Controller;
 
 use App\Entity\Account;
 use App\Repository\AccountRepository;
+use App\Service\ScamReportAuditLogger;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\ORM\EntityManagerInterface;
 use Soneso\StellarSDK\Crypto\StrKey;
@@ -22,6 +23,7 @@ final class ScamReportController
         private readonly AccountRepository $accountRepository,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly string $apiToken,
+        private readonly ?ScamReportAuditLogger $auditLogger = null,
     ) {
     }
 
@@ -147,9 +149,12 @@ final class ScamReportController
 
         $network = 'mainnet';
         $networkCode = 1;
-        $addresses = $this->extractAddressesFromText((string) $request->request->get('addresses', ''));
+        $rawSubmission = (string) $request->request->get('addresses', '');
+        $addresses = $this->extractAddressesFromText($rawSubmission);
 
         if ($addresses === []) {
+            $this->logFormSubmission($request, 'rejected_empty', $rawSubmission, [], [], []);
+
             return $this->htmlForm(
                 $this->extractRequestValue($request, 'token'),
                 'Enter at least one Stellar account address.',
@@ -158,6 +163,8 @@ final class ScamReportController
         }
 
         if (count($addresses) > self::MAX_ADDRESSES_PER_REQUEST) {
+            $this->logFormSubmission($request, 'rejected_too_many', $rawSubmission, $addresses, [], []);
+
             return $this->htmlForm(
                 $this->extractRequestValue($request, 'token'),
                 sprintf('Enter at most %d addresses.', self::MAX_ADDRESSES_PER_REQUEST),
@@ -170,6 +177,8 @@ final class ScamReportController
             static fn (string $address): bool => !StrKey::isValidAccountId($address)
         ));
         if ($invalidAddresses !== []) {
+            $this->logFormSubmission($request, 'rejected_invalid_address', $rawSubmission, $addresses, $invalidAddresses, []);
+
             return $this->htmlForm(
                 $this->extractRequestValue($request, 'token'),
                 'Invalid Stellar account address: '.implode(', ', $invalidAddresses),
@@ -178,6 +187,7 @@ final class ScamReportController
         }
 
         $results = $this->applyScamLabels($addresses, $network, $networkCode);
+        $this->logFormSubmission($request, 'accepted', $rawSubmission, $addresses, [], $results);
 
         return $this->htmlResults($results, $this->extractRequestValue($request, 'token'));
     }
@@ -318,6 +328,30 @@ final class ScamReportController
         $value = $request->request->get($key, $request->query->get($key, ''));
 
         return is_scalar($value) ? trim((string) $value) : '';
+    }
+
+    /**
+     * @param list<string> $addresses
+     * @param list<string> $invalidAddresses
+     * @param list<array{address:string,network:string,label:string,action:string}> $results
+     */
+    private function logFormSubmission(
+        Request $request,
+        string $status,
+        string $rawSubmission,
+        array $addresses,
+        array $invalidAddresses,
+        array $results,
+    ): void {
+        if ($this->auditLogger === null) {
+            return;
+        }
+
+        try {
+            $this->auditLogger->logFormSubmission($request, $status, $rawSubmission, $addresses, $invalidAddresses, $results);
+        } catch (\Throwable $exception) {
+            error_log('Unable to write scam report audit log: '.$exception->getMessage());
+        }
     }
 
     private function htmlForm(string $token, ?string $error = null, int $status = Response::HTTP_OK): Response
