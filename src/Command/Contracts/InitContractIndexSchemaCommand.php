@@ -233,6 +233,16 @@ SQL,
             'CREATE INDEX IF NOT EXISTS idx_chb_contract_network_balance ON contract_holder_balances (contract_id, network, balance_raw)',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_chb_contract_holder ON contract_holder_balances (contract_id, holder_address)',
             <<<'SQL'
+CREATE TABLE IF NOT EXISTS contract_index_maintenance_queue (
+    contract_id BIGINT PRIMARY KEY,
+    network INT NOT NULL,
+    needs_derived BOOLEAN NOT NULL DEFAULT TRUE,
+    needs_metrics BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
+            'CREATE INDEX IF NOT EXISTS idx_contract_index_maintenance_network ON contract_index_maintenance_queue (network, updated_at)',
+            <<<'SQL'
 CREATE TABLE IF NOT EXISTS contract_ingest_checkpoints (
     id BIGSERIAL PRIMARY KEY,
     source_name VARCHAR(128) NOT NULL,

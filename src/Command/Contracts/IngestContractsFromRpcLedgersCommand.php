@@ -6,8 +6,10 @@ namespace App\Command\Contracts;
 
 use App\Command\Support\NetworkOptionTrait;
 use App\Service\ContractMetricsRefreshService;
+use App\Service\ContractTxUpsertService;
 use App\Service\Stellar\Soroban\LedgerJsonContractExtractor;
 use App\Service\Stellar\StellarNetworkResolver;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
 use Soneso\StellarSDK\Crypto\StrKey;
@@ -40,6 +42,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
         private readonly HttpClientInterface $httpClient,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly LedgerJsonContractExtractor $extractor,
+        private readonly ContractTxUpsertService $contractTxUpsertService,
         private readonly ?ContractMetricsRefreshService $contractMetricsRefreshService = null,
     ) {
         parent::__construct();
@@ -57,6 +60,10 @@ final class IngestContractsFromRpcLedgersCommand extends Command
             ->addOption('checkpoint-source', null, InputOption::VALUE_REQUIRED, 'Checkpoint source name.', 'rpc_getLedgers_json')
             ->addOption('skip-diagnostic-events', null, InputOption::VALUE_NONE, 'Skip diagnostic contract events.')
             ->addOption('refresh-metrics', null, InputOption::VALUE_NONE, 'Refresh contract aggregate counters during ingest. For full backfills, run app:contracts:refresh-metrics after ingest instead.')
+            ->addOption('auto-maintenance', null, InputOption::VALUE_NONE, 'After successful ingest, rebuild queued derived indexes and refresh queued metrics automatically.')
+            ->addOption('maintenance-batch-size', null, InputOption::VALUE_REQUIRED, 'Contracts per automatic maintenance batch.', '500')
+            ->addOption('derived-index-batch-size', null, InputOption::VALUE_REQUIRED, 'Transaction batch size per contract for derived argument index rebuild.', '5000')
+            ->addOption('maintenance-max-contracts', null, InputOption::VALUE_REQUIRED, 'Max queued contracts to maintain after this run, 0 for all.', '0')
             ->addOption('dry-run', null, InputOption::VALUE_NONE, 'Parse ledgers without database writes.')
             ->addOption('timeout', null, InputOption::VALUE_REQUIRED, 'RPC request timeout in seconds.', '120');
     }
@@ -75,6 +82,10 @@ final class IngestContractsFromRpcLedgersCommand extends Command
         $sourceName = trim((string) $input->getOption('checkpoint-source')) ?: 'rpc_getLedgers_json';
         $includeDiagnosticEvents = !(bool) $input->getOption('skip-diagnostic-events');
         $refreshMetrics = (bool) $input->getOption('refresh-metrics');
+        $autoMaintenance = (bool) $input->getOption('auto-maintenance');
+        $maintenanceBatchSize = max(1, $this->parsePositiveInt($input->getOption('maintenance-batch-size')) ?? 500);
+        $derivedIndexBatchSize = max(1, $this->parsePositiveInt($input->getOption('derived-index-batch-size')) ?? 5000);
+        $maintenanceMaxContracts = max(0, (int) ($input->getOption('maintenance-max-contracts') ?? 0));
         $dryRun = (bool) $input->getOption('dry-run');
         $timeout = max(5, (int) ($input->getOption('timeout') ?? 120));
 
@@ -114,6 +125,8 @@ final class IngestContractsFromRpcLedgersCommand extends Command
             'contracts' => 0,
             'events' => 0,
             'storage_entries' => 0,
+            'maintenance_contracts' => 0,
+            'maintenance_metrics_refreshed' => 0,
             'errors' => 0,
         ];
         /** @var array<int,bool> $affectedContractDbIds */
@@ -216,7 +229,25 @@ final class IngestContractsFromRpcLedgersCommand extends Command
             $this->contractMetricsRefreshService?->refreshForContractIds(array_keys($affectedContractDbIds));
         }
         if (!$dryRun) {
+            $this->upsertCheckpoint($sourceName, $networkCode, $startLedger, $endLedger, $endLedger, $autoMaintenance ? 'maintenance' : 'completed', null, $metrics);
+        }
+
+        if ($autoMaintenance && !$dryRun) {
+            $io->writeln('Automatic contract index maintenance started.');
+            $maintenance = $this->processQueuedMaintenance(
+                $networkCode,
+                $maintenanceBatchSize,
+                $derivedIndexBatchSize,
+                $maintenanceMaxContracts
+            );
+            $metrics['maintenance_contracts'] = $maintenance['contracts'];
+            $metrics['maintenance_metrics_refreshed'] = $maintenance['metrics_refreshed'];
             $this->upsertCheckpoint($sourceName, $networkCode, $startLedger, $endLedger, $endLedger, 'completed', null, $metrics);
+            $io->writeln(sprintf(
+                'Automatic maintenance completed | contracts=%d metrics_refreshed=%d',
+                $maintenance['contracts'],
+                $maintenance['metrics_refreshed']
+            ));
         }
 
         $io->table(
@@ -230,6 +261,8 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                 ['contract_touches', (string) $metrics['contracts']],
                 ['events_indexed', (string) $metrics['events']],
                 ['storage_entries_indexed', (string) $metrics['storage_entries']],
+                ['maintenance_contracts', (string) $metrics['maintenance_contracts']],
+                ['maintenance_metrics_refreshed', (string) $metrics['maintenance_metrics_refreshed']],
                 ['errors', (string) $metrics['errors']],
             ]
         );
@@ -312,6 +345,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                 }
 
                 $this->upsertTransaction($contractDbId, $tx);
+                $this->markMaintenanceNeeded($contractDbId, $networkCode);
 
                 $events = is_array(($tx['eventsByContract'] ?? [])[$contractId] ?? null)
                     ? ($tx['eventsByContract'] ?? [])[$contractId]
@@ -648,6 +682,16 @@ SQL,
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE',
             'ALTER TABLE contract_storage_entries ADD COLUMN IF NOT EXISTS entry_raw JSONB DEFAULT NULL',
             <<<'SQL'
+CREATE TABLE IF NOT EXISTS contract_index_maintenance_queue (
+    contract_id BIGINT PRIMARY KEY,
+    network INT NOT NULL,
+    needs_derived BOOLEAN NOT NULL DEFAULT TRUE,
+    needs_metrics BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
+            'CREATE INDEX IF NOT EXISTS idx_contract_index_maintenance_network ON contract_index_maintenance_queue (network, updated_at)',
+            <<<'SQL'
 CREATE TABLE IF NOT EXISTS contract_ingest_checkpoints (
     id BIGSERIAL PRIMARY KEY,
     source_name VARCHAR(128) NOT NULL,
@@ -667,6 +711,135 @@ SQL,
         ] as $sql) {
             $this->contractsConnection->executeStatement($sql);
         }
+    }
+
+    private function markMaintenanceNeeded(int $contractDbId, int $networkCode): void
+    {
+        $now = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        $this->contractsConnection->executeStatement(
+            <<<'SQL'
+INSERT INTO contract_index_maintenance_queue (
+    contract_id,
+    network,
+    needs_derived,
+    needs_metrics,
+    updated_at
+) VALUES (
+    :contract_id,
+    :network,
+    TRUE,
+    TRUE,
+    :updated_at
+)
+ON CONFLICT (contract_id) DO UPDATE SET
+    network = EXCLUDED.network,
+    needs_derived = TRUE,
+    needs_metrics = TRUE,
+    updated_at = EXCLUDED.updated_at
+SQL,
+            [
+                'contract_id' => $contractDbId,
+                'network' => $networkCode,
+                'updated_at' => $now,
+            ],
+            [
+                'contract_id' => ParameterType::INTEGER,
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+    }
+
+    /**
+     * @return array{contracts:int,metrics_refreshed:int}
+     */
+    private function processQueuedMaintenance(
+        int $networkCode,
+        int $batchSize,
+        int $derivedIndexBatchSize,
+        int $maxContracts
+    ): array {
+        $processed = 0;
+        $metricsRefreshed = 0;
+
+        while ($maxContracts === 0 || $processed < $maxContracts) {
+            $limit = $maxContracts === 0 ? $batchSize : min($batchSize, $maxContracts - $processed);
+            if ($limit <= 0) {
+                break;
+            }
+
+            $rows = $this->contractsConnection->fetchAllAssociative(
+                'SELECT contract_id, needs_derived, needs_metrics
+                 FROM contract_index_maintenance_queue
+                 WHERE network = :network
+                 ORDER BY updated_at ASC, contract_id ASC
+                 LIMIT :limit_rows',
+                [
+                    'network' => $networkCode,
+                    'limit_rows' => $limit,
+                ],
+                [
+                    'network' => ParameterType::INTEGER,
+                    'limit_rows' => ParameterType::INTEGER,
+                ]
+            );
+            if ($rows === []) {
+                break;
+            }
+
+            $metricIds = [];
+            $processedIds = [];
+            foreach ($rows as $row) {
+                $contractId = isset($row['contract_id']) ? (int) $row['contract_id'] : 0;
+                if ($contractId <= 0) {
+                    continue;
+                }
+
+                $needsDerived = $this->toBool($row['needs_derived'] ?? true);
+                $needsMetrics = $this->toBool($row['needs_metrics'] ?? true);
+                if ($needsDerived) {
+                    $this->contractTxUpsertService->rebuildArgumentUsageIndexForContract($contractId, $derivedIndexBatchSize);
+                    $this->contractTxUpsertService->rebuildHolderBalancesForContract($contractId);
+                }
+                if ($needsMetrics) {
+                    $metricIds[] = $contractId;
+                }
+                $processedIds[] = $contractId;
+            }
+
+            if ($metricIds !== [] && $this->contractMetricsRefreshService !== null) {
+                $metricsRefreshed += $this->contractMetricsRefreshService->refreshForContractIds($metricIds);
+            }
+
+            if ($processedIds !== []) {
+                $this->contractsConnection->executeStatement(
+                    'DELETE FROM contract_index_maintenance_queue WHERE contract_id IN (:ids)',
+                    ['ids' => $processedIds],
+                    ['ids' => ArrayParameterType::INTEGER]
+                );
+            }
+
+            $processed += count($processedIds);
+            if (count($rows) < $limit || $processedIds === []) {
+                break;
+            }
+        }
+
+        return ['contracts' => $processed, 'metrics_refreshed' => $metricsRefreshed];
+    }
+
+    private function toBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return in_array(strtolower(trim($value)), ['1', 'true', 't', 'yes', 'y'], true);
+        }
+
+        return (bool) $value;
     }
 
     /**
