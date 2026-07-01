@@ -75,7 +75,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
                             'v4' => [
                                 'operations' => [[
                                     'changes' => [[
-                                        'updated' => [
+                                        'created' => [
                                             'last_modified_ledger_seq' => 3382589,
                                             'data' => [
                                                 'contract_data' => [
@@ -140,5 +140,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
 
         self::assertCount(1, $tx['storageByContract'][$contractId]);
         self::assertSame('c1ad7ecc090b527f5d25198569f6065288e2f8fb35ae9bc511cc8d01d93993be', $tx['contractMetaByContract'][$contractId]['wasmId']);
+        self::assertTrue($tx['contractMetaByContract'][$contractId]['deployed']);
+        self::assertSame('contract_instance_created', $tx['contractMetaByContract'][$contractId]['deploymentKind']);
     }
 }

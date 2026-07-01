@@ -417,6 +417,15 @@ final class LedgerJsonContractExtractor
                 $meta[$contractId]['wasmId'] = strtolower($wasmId);
                 $meta[$contractId]['executableType'] = 1;
             }
+
+            if (
+                ($entry['changeType'] ?? null) === 'created'
+                && ($contractData['key'] ?? null) === 'ledger_key_contract_instance'
+                && is_array($contractData['val']['contract_instance'] ?? null)
+            ) {
+                $meta[$contractId]['deployed'] = true;
+                $meta[$contractId]['deploymentKind'] = 'contract_instance_created';
+            }
         }
 
         return $meta;

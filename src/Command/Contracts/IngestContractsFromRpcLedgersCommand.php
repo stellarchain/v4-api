@@ -333,6 +333,11 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                     $tx['createdAt'] ?? null,
                     $meta['wasmId'] ?? null,
                     isset($meta['executableType']) ? (int) $meta['executableType'] : null,
+                    ($meta['deployed'] ?? false) === true,
+                    isset($tx['ledger']) ? (int) $tx['ledger'] : null,
+                    isset($tx['txHash']) && is_string($tx['txHash']) ? $tx['txHash'] : null,
+                    isset($tx['sourceAccount']) && is_string($tx['sourceAccount']) ? $tx['sourceAccount'] : null,
+                    isset($meta['deploymentKind']) && is_string($meta['deploymentKind']) ? $meta['deploymentKind'] : null,
                     $dryRun
                 );
                 if ($contractDbId === null) {
@@ -584,6 +589,11 @@ SQL,
         mixed $createdAt,
         mixed $wasmId,
         ?int $executableType,
+        bool $isDeployment,
+        ?int $deployedLedger,
+        ?string $deployTxHash,
+        ?string $deploySourceAccount,
+        ?string $deploymentKind,
         bool $dryRun
     ): ?int {
         $contractId = strtoupper(trim($contractId));
@@ -601,6 +611,11 @@ SQL,
 
         $createdAt = $this->normalizeDateTime($createdAt)
             ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        $deployedAt = $isDeployment ? $createdAt : null;
+        $deployedLedger = $isDeployment && $deployedLedger !== null && $deployedLedger > 0 ? $deployedLedger : null;
+        $deployTxHash = $isDeployment && $deployTxHash !== null && $deployTxHash !== '' ? $deployTxHash : null;
+        $deploySourceAccount = $isDeployment && $deploySourceAccount !== null && $deploySourceAccount !== '' ? $deploySourceAccount : null;
+        $deploymentKind = $isDeployment && $deploymentKind !== null && $deploymentKind !== '' ? $deploymentKind : null;
         $wasmId = is_string($wasmId) && preg_match('/^[0-9a-fA-F]{64}$/', $wasmId) === 1 ? strtolower($wasmId) : null;
 
         $id = $this->contractsConnection->fetchOne(
@@ -610,6 +625,11 @@ INSERT INTO contracts (
     contract_id_hex,
     network,
     created_at,
+    deployed_at,
+    deployed_ledger,
+    deploy_tx_hash,
+    deploy_source_account,
+    deployment_kind,
     wasm_id,
     executable_type
 ) VALUES (
@@ -617,11 +637,21 @@ INSERT INTO contracts (
     :contract_id_hex,
     :network,
     :created_at,
+    :deployed_at,
+    :deployed_ledger,
+    :deploy_tx_hash,
+    :deploy_source_account,
+    :deployment_kind,
     :wasm_id,
     :executable_type
 )
 ON CONFLICT (contract_id, network) DO UPDATE SET
     created_at = COALESCE(contracts.created_at, EXCLUDED.created_at),
+    deployed_at = COALESCE(contracts.deployed_at, EXCLUDED.deployed_at),
+    deployed_ledger = COALESCE(contracts.deployed_ledger, EXCLUDED.deployed_ledger),
+    deploy_tx_hash = COALESCE(contracts.deploy_tx_hash, EXCLUDED.deploy_tx_hash),
+    deploy_source_account = COALESCE(contracts.deploy_source_account, EXCLUDED.deploy_source_account),
+    deployment_kind = COALESCE(contracts.deployment_kind, EXCLUDED.deployment_kind),
     wasm_id = COALESCE(contracts.wasm_id, EXCLUDED.wasm_id),
     executable_type = COALESCE(contracts.executable_type, EXCLUDED.executable_type)
 RETURNING id
@@ -631,11 +661,21 @@ SQL,
                 'contract_id_hex' => $this->decodeContractIdHexOrNull($contractId),
                 'network' => $networkCode,
                 'created_at' => $createdAt,
+                'deployed_at' => $deployedAt,
+                'deployed_ledger' => $deployedLedger,
+                'deploy_tx_hash' => $deployTxHash,
+                'deploy_source_account' => $deploySourceAccount,
+                'deployment_kind' => $deploymentKind,
                 'wasm_id' => $wasmId,
                 'executable_type' => $executableType,
             ],
             [
                 'network' => ParameterType::INTEGER,
+                'deployed_at' => $deployedAt !== null ? ParameterType::STRING : ParameterType::NULL,
+                'deployed_ledger' => $deployedLedger !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                'deploy_tx_hash' => $deployTxHash !== null ? ParameterType::STRING : ParameterType::NULL,
+                'deploy_source_account' => $deploySourceAccount !== null ? ParameterType::STRING : ParameterType::NULL,
+                'deployment_kind' => $deploymentKind !== null ? ParameterType::STRING : ParameterType::NULL,
                 'wasm_id' => $wasmId !== null ? ParameterType::STRING : ParameterType::NULL,
                 'executable_type' => $executableType !== null ? ParameterType::INTEGER : ParameterType::NULL,
             ]
@@ -678,6 +718,12 @@ SQL,
             'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS meta_decoded JSONB DEFAULT NULL',
             'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS return_value_decoded JSONB DEFAULT NULL',
             'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS resource_fee_charged BIGINT DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployed_ledger INT DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_tx_hash VARCHAR(300) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_source_account VARCHAR(300) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployment_kind VARCHAR(64) DEFAULT NULL',
+            'CREATE INDEX IF NOT EXISTS idx_contract_network_deployed ON contracts (network, deployed_at, id)',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_raw JSONB DEFAULT NULL',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE',
             'ALTER TABLE contract_storage_entries ADD COLUMN IF NOT EXISTS entry_raw JSONB DEFAULT NULL',

@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS contracts (
     asset_address VARCHAR(255) DEFAULT NULL,
     asset_issuer VARCHAR(255) DEFAULT NULL,
     created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
+    deployed_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
+    deployed_ledger INT DEFAULT NULL,
+    deploy_tx_hash VARCHAR(300) DEFAULT NULL,
+    deploy_source_account VARCHAR(300) DEFAULT NULL,
+    deployment_kind VARCHAR(64) DEFAULT NULL,
     contract_code TEXT DEFAULT NULL,
     source_code_verified BOOLEAN NOT NULL DEFAULT FALSE,
     sep55_verified BOOLEAN NOT NULL DEFAULT FALSE,
@@ -98,11 +103,17 @@ CREATE TABLE IF NOT EXISTS contracts (
     total_invokes INT NOT NULL DEFAULT 0
 )
 SQL,
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployed_ledger INT DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_tx_hash VARCHAR(300) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_source_account VARCHAR(300) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployment_kind VARCHAR(64) DEFAULT NULL',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_id_network ON contracts (contract_id, network)',
             'CREATE INDEX IF NOT EXISTS idx_contracts_wasm_id ON contracts (wasm_id)',
             'CREATE INDEX IF NOT EXISTS idx_contract_network_total_invokes ON contracts (network, total_invokes, id)',
             'CREATE INDEX IF NOT EXISTS idx_contract_network_total_transactions ON contracts (network, total_transactions, id)',
             'CREATE INDEX IF NOT EXISTS idx_contract_network_created ON contracts (network, created_at, id)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_network_deployed ON contracts (network, deployed_at, id)',
             <<<'SQL'
 CREATE TABLE IF NOT EXISTS contract_transactions (
     id BIGSERIAL PRIMARY KEY,
