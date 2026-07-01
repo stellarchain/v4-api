@@ -117,9 +117,17 @@ CREATE TABLE IF NOT EXISTS contract_transactions (
     created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
     enrichment_checked_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
     enrichment_status VARCHAR(16) DEFAULT NULL,
-    enrichment_attempts INT NOT NULL DEFAULT 0
+    enrichment_attempts INT NOT NULL DEFAULT 0,
+    envelope_decoded JSONB DEFAULT NULL,
+    meta_decoded JSONB DEFAULT NULL,
+    return_value_decoded JSONB DEFAULT NULL,
+    resource_fee_charged BIGINT DEFAULT NULL
 )
 SQL,
+            'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS envelope_decoded JSONB DEFAULT NULL',
+            'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS meta_decoded JSONB DEFAULT NULL',
+            'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS return_value_decoded JSONB DEFAULT NULL',
+            'ALTER TABLE contract_transactions ADD COLUMN IF NOT EXISTS resource_fee_charged BIGINT DEFAULT NULL',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_tx_hash ON contract_transactions (contract_id, tx_hash)',
             'CREATE INDEX IF NOT EXISTS idx_contract_tx_contract_ledger ON contract_transactions (contract_id, ledger)',
             'CREATE INDEX IF NOT EXISTS idx_contract_tx_enrichment_scan ON contract_transactions (contract_id, enrichment_checked_at, id)',
@@ -137,9 +145,13 @@ CREATE TABLE IF NOT EXISTS contract_events (
     value_decoded JSONB DEFAULT NULL,
     addresses JSONB DEFAULT NULL,
     amount_raw VARCHAR(100) DEFAULT NULL,
-    created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
+    event_raw JSONB DEFAULT NULL,
+    is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE
 )
 SQL,
+            'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_raw JSONB DEFAULT NULL',
+            'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_event_idx ON contract_events (contract_id, tx_hash, event_idx)',
             'CREATE INDEX IF NOT EXISTS idx_contract_events_contract_ledger ON contract_events (contract_id, ledger)',
             'CREATE INDEX IF NOT EXISTS idx_contract_events_contract_tx ON contract_events (contract_id, tx_hash)',
@@ -153,11 +165,13 @@ CREATE TABLE IF NOT EXISTS contract_storage_entries (
     storage_key VARCHAR(512) NOT NULL,
     entry_xdr TEXT DEFAULT NULL,
     entry_decoded JSONB DEFAULT NULL,
+    entry_raw JSONB DEFAULT NULL,
     last_modified_ledger_seq INT DEFAULT NULL,
     live_until_ledger_seq INT DEFAULT NULL,
     updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
 )
 SQL,
+            'ALTER TABLE contract_storage_entries ADD COLUMN IF NOT EXISTS entry_raw JSONB DEFAULT NULL',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_storage_key ON contract_storage_entries (contract_id, storage_key)',
             'CREATE INDEX IF NOT EXISTS idx_contract_storage_contract_ledger ON contract_storage_entries (contract_id, last_modified_ledger_seq)',
             <<<'SQL'
@@ -218,6 +232,23 @@ SQL,
             'CREATE INDEX IF NOT EXISTS idx_chb_holder_network_balance ON contract_holder_balances (holder_address, network, balance_raw)',
             'CREATE INDEX IF NOT EXISTS idx_chb_contract_network_balance ON contract_holder_balances (contract_id, network, balance_raw)',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_chb_contract_holder ON contract_holder_balances (contract_id, holder_address)',
+            <<<'SQL'
+CREATE TABLE IF NOT EXISTS contract_ingest_checkpoints (
+    id BIGSERIAL PRIMARY KEY,
+    source_name VARCHAR(128) NOT NULL,
+    network INT NOT NULL,
+    start_ledger INT NOT NULL,
+    end_ledger INT DEFAULT NULL,
+    last_processed_ledger INT NOT NULL DEFAULT 0,
+    status VARCHAR(32) NOT NULL DEFAULT 'running',
+    last_error TEXT DEFAULT NULL,
+    stats JSONB DEFAULT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL,
+    updated_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL
+)
+SQL,
+            'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_ingest_checkpoint_source_network ON contract_ingest_checkpoints (source_name, network)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_ingest_checkpoints_status ON contract_ingest_checkpoints (status, updated_at)',
         ];
     }
 }
