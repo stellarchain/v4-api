@@ -26,6 +26,7 @@ final class ContractEventsScanner
      *     contractId?:string,
      *     latestLedger?:int,
      *     startLedger?:int,
+     *     endLedger?:int,
      *     eventsCollected?:int,
      *     transactionsCollected?:int,
      *     events?:array<int,array<string,mixed>>,
@@ -48,7 +49,7 @@ final class ContractEventsScanner
         }
 
         $scanStartLedger = $startLedger ?? 1;
-        $scanEndLedger = $endLedger ?? $latestSequence;
+        $scanEndLedger = min($endLedger ?? $latestSequence, $latestSequence);
         $currentEndLedger = $scanEndLedger;
         $windowSize = self::DEFAULT_WINDOW_SIZE_LEDGERS;
         $pageSize = self::EVENTS_PAGE_SIZE;
@@ -155,6 +156,8 @@ final class ContractEventsScanner
                         'eventType' => $eventType,
                         'topicDecoded' => $topicDecoded,
                         'valueDecoded' => $valueDecoded,
+                        'topicRaw' => is_array($event['topic'] ?? null) ? array_values($event['topic']) : [],
+                        'valueRaw' => is_string($event['value'] ?? null) ? $event['value'] : null,
                         'addresses' => $addresses,
                         'amountRaw' => $amountRaw,
                     ];
@@ -264,6 +267,7 @@ final class ContractEventsScanner
             'contractId' => $normalizedContractId,
             'latestLedger' => $latestSequence,
             'startLedger' => $scanStartLedger,
+            'endLedger' => $scanEndLedger,
             'eventsCollected' => $eventsCollected,
             'transactionsCollected' => $transactionsCollected,
             'events' => $streamChunks ? [] : $allEventRows,

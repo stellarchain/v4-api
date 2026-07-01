@@ -26,7 +26,7 @@ final class SyncContractTransactionsCommand extends Command
     private const RECHECK_FAILED_AFTER_MINUTES = 30;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly ContractTxEnrichmentService $txEnrichmentService,
         private readonly StellarNetworkResolver $stellarNetworkResolver,

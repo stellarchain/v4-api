@@ -21,7 +21,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class RefreshContractMetricsCommand extends Command
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly ContractMetricsRefreshService $contractMetricsRefreshService,

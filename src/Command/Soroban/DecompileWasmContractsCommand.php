@@ -30,7 +30,7 @@ final class DecompileWasmContractsCommand extends Command
         private readonly SorobanRpcService $sorobanRpcService,
         private readonly Sep55ContractVerificationService $sep55ContractVerificationService,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
     ) {
         parent::__construct();

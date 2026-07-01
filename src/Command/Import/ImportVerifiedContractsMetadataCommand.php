@@ -7,6 +7,7 @@ namespace App\Command\Import;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -22,7 +23,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class ImportVerifiedContractsMetadataCommand extends Command
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
     ) {
@@ -161,26 +162,7 @@ final class ImportVerifiedContractsMetadataCommand extends Command
                 if ($metadataChanged) {
                     $now = (new \DateTimeImmutable())->format('Y-m-d H:i:s');
                     $this->connection->executeStatement(
-                        'INSERT INTO contract_verified_metadata (
-                            contract_id, display_name, metadata_type, is_sep41, symbol, decimals, is_verified,
-                            website, description, icon_url, added_at, source_name, created_at, updated_at
-                         ) VALUES (
-                            :contract_id, :display_name, :metadata_type, :is_sep41, :symbol, :decimals, :is_verified,
-                            :website, :description, :icon_url, :added_at, :source_name, :created_at, :updated_at
-                         )
-                         ON DUPLICATE KEY UPDATE
-                            display_name = VALUES(display_name),
-                            metadata_type = VALUES(metadata_type),
-                            is_sep41 = VALUES(is_sep41),
-                            symbol = VALUES(symbol),
-                            decimals = VALUES(decimals),
-                            is_verified = VALUES(is_verified),
-                            website = VALUES(website),
-                            description = VALUES(description),
-                            icon_url = VALUES(icon_url),
-                            added_at = VALUES(added_at),
-                            source_name = VALUES(source_name),
-                            updated_at = VALUES(updated_at)',
+                        $this->buildMetadataUpsertSql(),
                         [
                             'contract_id' => (int) $local['id'],
                             'display_name' => $metadataRecord['display_name'],
@@ -199,9 +181,9 @@ final class ImportVerifiedContractsMetadataCommand extends Command
                         ],
                         [
                             'contract_id' => ParameterType::INTEGER,
-                            'is_sep41' => $metadataRecord['is_sep41'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                            'is_sep41' => $metadataRecord['is_sep41'] !== null ? ParameterType::BOOLEAN : ParameterType::NULL,
                             'decimals' => $metadataRecord['decimals'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
-                            'is_verified' => $metadataRecord['is_verified'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                            'is_verified' => $metadataRecord['is_verified'] !== null ? ParameterType::BOOLEAN : ParameterType::NULL,
                             'added_at' => $metadataRecord['added_at'] !== null ? ParameterType::STRING : ParameterType::NULL,
                         ]
                     );
@@ -235,6 +217,53 @@ final class ImportVerifiedContractsMetadataCommand extends Command
         $io->success($dryRun ? 'Dry-run completed.' : 'Verified metadata import completed.');
 
         return Command::SUCCESS;
+    }
+
+    private function buildMetadataUpsertSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contract_verified_metadata (
+                        contract_id, display_name, metadata_type, is_sep41, symbol, decimals, is_verified,
+                        website, description, icon_url, added_at, source_name, created_at, updated_at
+                     ) VALUES (
+                        :contract_id, :display_name, :metadata_type, :is_sep41, :symbol, :decimals, :is_verified,
+                        :website, :description, :icon_url, :added_at, :source_name, :created_at, :updated_at
+                     )
+                     ON CONFLICT (contract_id) DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        metadata_type = EXCLUDED.metadata_type,
+                        is_sep41 = EXCLUDED.is_sep41,
+                        symbol = EXCLUDED.symbol,
+                        decimals = EXCLUDED.decimals,
+                        is_verified = EXCLUDED.is_verified,
+                        website = EXCLUDED.website,
+                        description = EXCLUDED.description,
+                        icon_url = EXCLUDED.icon_url,
+                        added_at = EXCLUDED.added_at,
+                        source_name = EXCLUDED.source_name,
+                        updated_at = EXCLUDED.updated_at';
+        }
+
+        return 'INSERT INTO contract_verified_metadata (
+                    contract_id, display_name, metadata_type, is_sep41, symbol, decimals, is_verified,
+                    website, description, icon_url, added_at, source_name, created_at, updated_at
+                 ) VALUES (
+                    :contract_id, :display_name, :metadata_type, :is_sep41, :symbol, :decimals, :is_verified,
+                    :website, :description, :icon_url, :added_at, :source_name, :created_at, :updated_at
+                 )
+                 ON DUPLICATE KEY UPDATE
+                    display_name = VALUES(display_name),
+                    metadata_type = VALUES(metadata_type),
+                    is_sep41 = VALUES(is_sep41),
+                    symbol = VALUES(symbol),
+                    decimals = VALUES(decimals),
+                    is_verified = VALUES(is_verified),
+                    website = VALUES(website),
+                    description = VALUES(description),
+                    icon_url = VALUES(icon_url),
+                    added_at = VALUES(added_at),
+                    source_name = VALUES(source_name),
+                    updated_at = VALUES(updated_at)';
     }
 
     /**

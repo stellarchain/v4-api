@@ -19,6 +19,8 @@ final class ContractEventPayloadFallbackResolver
      * @return array{
      *   topicDecoded:array<int,mixed>,
      *   valueDecoded:mixed,
+     *   topicRaw:array<int,string>,
+     *   valueRaw:?string,
      *   addresses:array<int,string>,
      *   amountRaw:?string,
      *   eventType:?string
@@ -68,6 +70,8 @@ final class ContractEventPayloadFallbackResolver
             return [
                 'topicDecoded' => is_array($event['topicDecoded'] ?? null) ? $event['topicDecoded'] : [],
                 'valueDecoded' => $event['valueDecoded'] ?? null,
+                'topicRaw' => is_array($event['topicRaw'] ?? null) ? $event['topicRaw'] : [],
+                'valueRaw' => isset($event['valueRaw']) && is_string($event['valueRaw']) ? $event['valueRaw'] : null,
                 'addresses' => is_array($event['addresses'] ?? null) ? $event['addresses'] : [],
                 'amountRaw' => isset($event['amountRaw']) && is_string($event['amountRaw']) ? $event['amountRaw'] : null,
                 'eventType' => isset($event['eventType']) && is_string($event['eventType']) ? $event['eventType'] : null,
@@ -77,4 +81,3 @@ final class ContractEventPayloadFallbackResolver
         return null;
     }
 }
-

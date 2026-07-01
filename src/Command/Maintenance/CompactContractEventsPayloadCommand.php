@@ -7,6 +7,7 @@ namespace App\Command\Maintenance;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -22,7 +23,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class CompactContractEventsPayloadCommand extends Command
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
     ) {
@@ -221,6 +222,10 @@ final class CompactContractEventsPayloadCommand extends Command
 
     private function compactOneBatch(int $cutId, int $networkCode, int $batchSize): int
     {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return $this->compactOneBatchPostgres($cutId, $networkCode, $batchSize);
+        }
+
         if ($networkCode === 0) {
             return $this->connection->executeStatement(
                 'UPDATE contract_events ce
@@ -251,6 +256,63 @@ final class CompactContractEventsPayloadCommand extends Command
                AND (ce.topic_decoded IS NOT NULL OR ce.value_decoded IS NOT NULL)
              ORDER BY ce.id ASC
              LIMIT :limit_rows',
+            [
+                'network' => $networkCode,
+                'cut_id' => $cutId,
+                'limit_rows' => $batchSize,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'cut_id' => ParameterType::INTEGER,
+                'limit_rows' => ParameterType::INTEGER,
+            ]
+        );
+    }
+
+    private function compactOneBatchPostgres(int $cutId, int $networkCode, int $batchSize): int
+    {
+        if ($networkCode === 0) {
+            return $this->connection->executeStatement(
+                'WITH selected AS (
+                    SELECT ce.id
+                    FROM contract_events ce
+                    WHERE ce.id < :cut_id
+                      AND (ce.topic_decoded IS NOT NULL OR ce.value_decoded IS NOT NULL)
+                    ORDER BY ce.id ASC
+                    LIMIT :limit_rows
+                 )
+                 UPDATE contract_events ce
+                 SET topic_decoded = NULL,
+                     value_decoded = NULL
+                 FROM selected
+                 WHERE ce.id = selected.id',
+                [
+                    'cut_id' => $cutId,
+                    'limit_rows' => $batchSize,
+                ],
+                [
+                    'cut_id' => ParameterType::INTEGER,
+                    'limit_rows' => ParameterType::INTEGER,
+                ]
+            );
+        }
+
+        return $this->connection->executeStatement(
+            'WITH selected AS (
+                SELECT ce.id
+                FROM contract_events ce
+                INNER JOIN contracts c ON c.id = ce.contract_id
+                WHERE c.network = :network
+                  AND ce.id < :cut_id
+                  AND (ce.topic_decoded IS NOT NULL OR ce.value_decoded IS NOT NULL)
+                ORDER BY ce.id ASC
+                LIMIT :limit_rows
+             )
+             UPDATE contract_events ce
+             SET topic_decoded = NULL,
+                 value_decoded = NULL
+             FROM selected
+             WHERE ce.id = selected.id',
             [
                 'network' => $networkCode,
                 'cut_id' => $cutId,

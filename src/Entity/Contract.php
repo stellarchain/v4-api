@@ -668,6 +668,50 @@ class Contract
         return $this;
     }
 
+    #[SerializedName('wasmHash')]
+    public function getWasmHash(): ?string
+    {
+        return $this->getWasmId();
+    }
+
+    public function getVerificationStatus(): string
+    {
+        if ($this->sep55Verified) {
+            return 'verified';
+        }
+
+        if ($this->sourceCodeVerified) {
+            return 'source_available';
+        }
+
+        if ($this->sep55Error !== null) {
+            return 'failed';
+        }
+
+        if ($this->wasmId !== null || $this->sep55LastCheckedAt !== null) {
+            return 'unverified';
+        }
+
+        return 'unknown';
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    #[SerializedName('source')]
+    public function getSourceMetadata(): array
+    {
+        return [
+            'type' => $this->sep55Verified ? 'sep55' : ($this->sourceCodeVerified ? 'decompiled' : null),
+            'githubAddress' => $this->githubAddress,
+            'commitHash' => $this->sep55CommitHash,
+            'attestationUrl' => $this->sep55AttestationUrl,
+            'lastCheckedAt' => $this->sep55LastCheckedAt?->format(\DateTimeInterface::ATOM),
+            'sourceCodeAvailable' => $this->sourceCodeVerified || $this->getSourceCode() !== null,
+            'error' => $this->sep55Error,
+        ];
+    }
+
     public function getSourceCode(): ?string
     {
         if (is_string($this->resolvedSourceCode) && $this->resolvedSourceCode !== '') {

@@ -26,7 +26,7 @@ final class RebuildContractDerivedIndexesCommand extends Command
     use NetworkOptionTrait;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly ContractTxUpsertService $contractTxUpsertService,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
@@ -149,4 +149,3 @@ final class RebuildContractDerivedIndexesCommand extends Command
         return null;
     }
 }
-

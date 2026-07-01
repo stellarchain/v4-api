@@ -13,6 +13,7 @@ use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\Persistence\ManagerRegistry;
 use Soneso\StellarSDK\Crypto\StrKey;
 use Soneso\StellarSDK\Xdr\XdrSCVal;
@@ -43,7 +44,7 @@ final class ScanContractRangeFromHorizonDbCommand extends Command
 
     public function __construct(
         private readonly ManagerRegistry $doctrine,
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly SorobanContractInspector $sorobanContractInspector,
@@ -430,9 +431,13 @@ final class ScanContractRangeFromHorizonDbCommand extends Command
         $createdAt = $createdAt ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
         $this->connection->executeStatement(
-            'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
-             VALUES (:contract_id, :contract_id_hex, :network, :created_at)
-             ON DUPLICATE KEY UPDATE contract_id = contract_id',
+            $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform
+                ? 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                   VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                   ON CONFLICT (contract_id, network) DO NOTHING'
+                : 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                   VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                   ON DUPLICATE KEY UPDATE contract_id = contract_id',
             [
                 'contract_id' => $contractId,
                 'contract_id_hex' => $contractHex,
@@ -662,4 +667,3 @@ final class ScanContractRangeFromHorizonDbCommand extends Command
         }
     }
 }
-

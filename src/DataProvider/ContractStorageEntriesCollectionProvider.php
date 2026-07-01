@@ -7,7 +7,7 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
-use App\Entity\ContractTransaction;
+use App\Entity\ContractStorageEntry;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
@@ -17,7 +17,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\HttpFoundation\RequestStack;
 
 #[AsTaggedItem('api_platform.state.provider')]
-final class ContractTransactionsCollectionProvider implements ProviderInterface
+final class ContractStorageEntriesCollectionProvider implements ProviderInterface
 {
     private const DEFAULT_ITEMS_PER_PAGE = 30;
     private const MAX_ITEMS_PER_PAGE = 200;
@@ -58,6 +58,7 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         if ($itemsPerPage > self::MAX_ITEMS_PER_PAGE) {
             $itemsPerPage = self::MAX_ITEMS_PER_PAGE;
         }
+
         $offset = ($page - 1) * $itemsPerPage;
         $cursor = $request?->query->get('cursor', $filters['cursor'] ?? null);
         $beforeId = $this->normalizePositiveInt($request?->query->get('beforeId', $filters['beforeId'] ?? $filters['before_id'] ?? null))
@@ -67,8 +68,6 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         if ($ledgerStart !== null && $ledgerEnd !== null && $ledgerStart > $ledgerEnd) {
             [$ledgerStart, $ledgerEnd] = [$ledgerEnd, $ledgerStart];
         }
-        $invocationsOnly = $this->parseNullableBool($request?->query->get('invocationsOnly', $filters['invocationsOnly'] ?? $filters['invocations_only'] ?? null)) === true;
-        $limitForFetch = $itemsPerPage + 1;
 
         $contractDbId = $this->connection->fetchOne(
             'SELECT id
@@ -88,73 +87,75 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
             return [];
         }
 
-        $whereSql = ' WHERE ct.contract_id = :contract_id';
+        $limitForFetch = $itemsPerPage + 1;
+        $whereSql = ' WHERE cse.contract_id = :contract_id';
         $params = ['contract_id' => (int) $contractDbId, 'limit' => $limitForFetch];
         $types = ['contract_id' => ParameterType::INTEGER, 'limit' => ParameterType::INTEGER];
 
         if ($ledgerStart !== null) {
-            $whereSql .= ' AND ct.ledger >= :ledger_start';
+            $whereSql .= ' AND cse.last_modified_ledger_seq >= :ledger_start';
             $params['ledger_start'] = $ledgerStart;
             $types['ledger_start'] = ParameterType::INTEGER;
         }
         if ($ledgerEnd !== null) {
-            $whereSql .= ' AND ct.ledger <= :ledger_end';
+            $whereSql .= ' AND cse.last_modified_ledger_seq <= :ledger_end';
             $params['ledger_end'] = $ledgerEnd;
             $types['ledger_end'] = ParameterType::INTEGER;
         }
         if ($beforeId !== null) {
-            $whereSql .= ' AND ct.id < :before_id';
+            $whereSql .= ' AND cse.id < :before_id';
             $params['before_id'] = $beforeId;
             $types['before_id'] = ParameterType::INTEGER;
         }
-        if ($invocationsOnly) {
-            $whereSql .= ' AND ct.host_functions IS NOT NULL'
-                .' AND ct.host_functions <> :empty_host_functions'
-                .' AND ct.host_functions LIKE :invoke_contracts_any'
-                .' AND ct.host_functions NOT LIKE :invoke_contracts_empty';
-            $params['empty_host_functions'] = '';
-            $params['invoke_contracts_any'] = '%"invokeContracts":[%';
-            $params['invoke_contracts_empty'] = '%"invokeContracts":[]%';
-        }
 
-        $paginationSql = ' ORDER BY ct.id DESC LIMIT :limit';
+        $paginationSql = ' ORDER BY cse.id DESC LIMIT :limit';
         if ($beforeId === null) {
             $paginationSql .= ' OFFSET :offset';
             $params['offset'] = $offset;
             $types['offset'] = ParameterType::INTEGER;
         }
 
-        $txIds = $this->connection->fetchFirstColumn(
-            'SELECT ct.id FROM contract_transactions ct'.$whereSql.$paginationSql,
+        $entryIds = $this->connection->fetchFirstColumn(
+            'SELECT cse.id FROM contract_storage_entries cse'.$whereSql.$paginationSql,
             $params,
-            $types
+            $types,
         );
-        if ($txIds === []) {
-            $request?->attributes->set('_cursor_meta', [
-                'page' => $page,
-                'itemsPerPage' => $itemsPerPage,
-                'limit' => $itemsPerPage,
-                'cursor' => is_string($cursor) && trim($cursor) !== '' ? trim($cursor) : null,
-                'beforeId' => $beforeId,
-                'ledgerStart' => $ledgerStart,
-                'ledgerEnd' => $ledgerEnd,
-                'nextCursor' => null,
-                'nextBeforeId' => null,
-                'hasMore' => false,
-                'mode' => $beforeId !== null ? 'keyset' : 'offset',
-            ]);
+        if ($entryIds === []) {
+            $this->setMeta($page, $itemsPerPage, $cursor, $beforeId, $ledgerStart, $ledgerEnd, null, false);
+
             return [];
         }
 
-        $txIds = array_map(static fn (mixed $id): int => (int) $id, $txIds);
-        $hasMore = count($txIds) > $itemsPerPage;
+        $entryIds = array_map(static fn (mixed $id): int => (int) $id, $entryIds);
+        $hasMore = count($entryIds) > $itemsPerPage;
         if ($hasMore) {
-            $txIds = array_slice($txIds, 0, $itemsPerPage);
+            $entryIds = array_slice($entryIds, 0, $itemsPerPage);
         }
-        $nextBeforeId = $txIds !== [] ? end($txIds) : null;
+        $nextBeforeId = $entryIds !== [] ? end($entryIds) : null;
         $nextBeforeId = is_int($nextBeforeId) ? $nextBeforeId : null;
 
-        $request?->attributes->set('_cursor_meta', [
+        $this->setMeta($page, $itemsPerPage, $cursor, $beforeId, $ledgerStart, $ledgerEnd, $hasMore ? $nextBeforeId : null, $hasMore);
+
+        return $this->entityManager->getRepository(ContractStorageEntry::class)
+            ->createQueryBuilder('cse')
+            ->andWhere('cse.id IN (:ids)')
+            ->setParameter('ids', $entryIds)
+            ->orderBy('cse.id', 'DESC')
+            ->getQuery()
+            ->getResult();
+    }
+
+    private function setMeta(
+        int $page,
+        int $itemsPerPage,
+        mixed $cursor,
+        ?int $beforeId,
+        ?int $ledgerStart,
+        ?int $ledgerEnd,
+        ?int $nextBeforeId,
+        bool $hasMore,
+    ): void {
+        $this->requestStack->getCurrentRequest()?->attributes->set('_cursor_meta', [
             'page' => $page,
             'itemsPerPage' => $itemsPerPage,
             'limit' => $itemsPerPage,
@@ -163,18 +164,10 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
             'ledgerStart' => $ledgerStart,
             'ledgerEnd' => $ledgerEnd,
             'nextCursor' => $hasMore && $nextBeforeId !== null ? $this->cursorCodec->encodeId($nextBeforeId) : null,
-            'nextBeforeId' => $hasMore ? $nextBeforeId : null,
+            'nextBeforeId' => $nextBeforeId,
             'hasMore' => $hasMore,
             'mode' => $beforeId !== null ? 'keyset' : 'offset',
         ]);
-
-        return $this->entityManager->getRepository(ContractTransaction::class)
-            ->createQueryBuilder('ct')
-            ->andWhere('ct.id IN (:ids)')
-            ->setParameter('ids', $txIds)
-            ->orderBy('ct.id', 'DESC')
-            ->getQuery()
-            ->getResult();
     }
 
     private function normalizePositiveInt(mixed $value): ?int
@@ -184,25 +177,10 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         }
         if (is_string($value) && ctype_digit($value)) {
             $parsed = (int) $value;
+
             return $parsed > 0 ? $parsed : null;
         }
 
         return null;
-    }
-
-    private function parseNullableBool(mixed $value): ?bool
-    {
-        if (is_bool($value)) {
-            return $value;
-        }
-        if (!is_string($value)) {
-            return null;
-        }
-
-        return match (strtolower(trim($value))) {
-            '1', 'true', 'yes', 'on' => true,
-            '0', 'false', 'no', 'off' => false,
-            default => null,
-        };
     }
 }

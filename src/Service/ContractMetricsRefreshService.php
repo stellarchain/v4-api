@@ -5,12 +5,13 @@ namespace App\Service;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class ContractMetricsRefreshService
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
     ) {
     }
@@ -128,7 +129,33 @@ final class ContractMetricsRefreshService
     private function fetchTxAggregateMap(array $ids): array
     {
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT
+            $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform
+                ? 'SELECT
+                contract_id,
+                COALESCE(SUM(COALESCE(total_operations, 0)), 0) AS operations,
+                COALESCE(SUM(
+                    CASE
+                        WHEN host_functions IS NOT NULL
+                             AND host_functions <> \'\'
+                             AND host_functions LIKE \'%"invokeContracts":[%\'
+                             AND host_functions NOT LIKE \'%"invokeContracts":[]%\'
+                        THEN 1
+                        ELSE 0
+                    END
+                ), 0) AS invokes,
+                COALESCE(SUM(
+                    CASE
+                        WHEN host_functions IS NOT NULL
+                             AND host_functions <> \'\'
+                             AND host_functions LIKE \'%"effectsCount":%\'
+                        THEN COALESCE(NULLIF(host_functions::jsonb ->> \'effectsCount\', \'\')::INT, 0)
+                        ELSE 0
+                    END
+                ), 0) AS effects
+             FROM contract_transactions
+             WHERE contract_id IN (:ids)
+             GROUP BY contract_id'
+                : 'SELECT
                 contract_id,
                 COALESCE(SUM(COALESCE(total_operations, 0)), 0) AS operations,
                 COALESCE(SUM(

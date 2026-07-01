@@ -45,6 +45,27 @@ use Doctrine\ORM\Mapping as ORM;
                         required: false,
                         schema: ['type' => 'integer', 'minimum' => 1]
                     ),
+                    new OpenApiParameter(
+                        name: 'cursor',
+                        in: 'query',
+                        description: 'Opaque cursor returned in meta.nextCursor.',
+                        required: false,
+                        schema: ['type' => 'string']
+                    ),
+                    new OpenApiParameter(
+                        name: 'ledgerStart',
+                        in: 'query',
+                        description: 'Inclusive minimum ledger filter.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
+                    new OpenApiParameter(
+                        name: 'ledgerEnd',
+                        in: 'query',
+                        description: 'Inclusive maximum ledger filter.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
                 ]
             ),
             paginationEnabled: false

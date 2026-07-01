@@ -8,6 +8,7 @@ use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
 use App\Entity\ContractEvent;
+use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -27,6 +28,7 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
+        private readonly ContractTransparencyCursor $cursorCodec,
     ) {
     }
 
@@ -57,7 +59,15 @@ final class ContractEventsCollectionProvider implements ProviderInterface
             $itemsPerPage = self::MAX_ITEMS_PER_PAGE;
         }
         $offset = ($page - 1) * $itemsPerPage;
-        $beforeId = $this->normalizePositiveInt($request?->query->get('beforeId', $filters['beforeId'] ?? $filters['before_id'] ?? null));
+        $cursor = $request?->query->get('cursor', $filters['cursor'] ?? null);
+        $beforeId = $this->normalizePositiveInt($request?->query->get('beforeId', $filters['beforeId'] ?? $filters['before_id'] ?? null))
+            ?? $this->cursorCodec->decodeId($cursor);
+        $ledgerStart = $this->normalizePositiveInt($request?->query->get('ledgerStart', $filters['ledgerStart'] ?? $filters['ledger_start'] ?? $filters['startLedger'] ?? null));
+        $ledgerEnd = $this->normalizePositiveInt($request?->query->get('ledgerEnd', $filters['ledgerEnd'] ?? $filters['ledger_end'] ?? $filters['endLedger'] ?? null));
+        if ($ledgerStart !== null && $ledgerEnd !== null && $ledgerStart > $ledgerEnd) {
+            [$ledgerStart, $ledgerEnd] = [$ledgerEnd, $ledgerStart];
+        }
+        $txHash = $this->normalizeNullableString($request?->query->get('txHash', $filters['txHash'] ?? $filters['tx_hash'] ?? null));
 
         $contractDbId = $this->connection->fetchOne(
             'SELECT id
@@ -78,50 +88,54 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         }
 
         $limitForFetch = $itemsPerPage + 1;
+        $whereSql = ' WHERE ce.contract_id = :contract_id';
+        $params = ['contract_id' => (int) $contractDbId, 'limit' => $limitForFetch];
+        $types = ['contract_id' => ParameterType::INTEGER, 'limit' => ParameterType::INTEGER];
 
-        if ($beforeId !== null) {
-            $eventIds = $this->connection->fetchFirstColumn(
-                'SELECT ce.id
-                 FROM contract_events ce
-                 WHERE ce.contract_id = :contract_id
-                   AND ce.id < :before_id
-                 ORDER BY ce.id DESC
-                 LIMIT :limit',
-                [
-                    'contract_id' => (int) $contractDbId,
-                    'before_id' => $beforeId,
-                    'limit' => $limitForFetch,
-                ],
-                [
-                    'contract_id' => ParameterType::INTEGER,
-                    'before_id' => ParameterType::INTEGER,
-                    'limit' => ParameterType::INTEGER,
-                ]
-            );
-        } else {
-            $eventIds = $this->connection->fetchFirstColumn(
-                'SELECT ce.id
-                 FROM contract_events ce
-                 WHERE ce.contract_id = :contract_id
-                 ORDER BY ce.id DESC
-                 LIMIT :limit OFFSET :offset',
-                [
-                    'contract_id' => (int) $contractDbId,
-                    'limit' => $limitForFetch,
-                    'offset' => $offset,
-                ],
-                [
-                    'contract_id' => ParameterType::INTEGER,
-                    'limit' => ParameterType::INTEGER,
-                    'offset' => ParameterType::INTEGER,
-                ]
-            );
+        if ($ledgerStart !== null) {
+            $whereSql .= ' AND ce.ledger >= :ledger_start';
+            $params['ledger_start'] = $ledgerStart;
+            $types['ledger_start'] = ParameterType::INTEGER;
         }
+        if ($ledgerEnd !== null) {
+            $whereSql .= ' AND ce.ledger <= :ledger_end';
+            $params['ledger_end'] = $ledgerEnd;
+            $types['ledger_end'] = ParameterType::INTEGER;
+        }
+        if ($txHash !== null) {
+            $whereSql .= ' AND ce.tx_hash = :tx_hash';
+            $params['tx_hash'] = $txHash;
+            $types['tx_hash'] = ParameterType::STRING;
+        }
+        if ($beforeId !== null) {
+            $whereSql .= ' AND ce.id < :before_id';
+            $params['before_id'] = $beforeId;
+            $types['before_id'] = ParameterType::INTEGER;
+        }
+
+        $paginationSql = ' ORDER BY ce.id DESC LIMIT :limit';
+        if ($beforeId === null) {
+            $paginationSql .= ' OFFSET :offset';
+            $params['offset'] = $offset;
+            $types['offset'] = ParameterType::INTEGER;
+        }
+
+        $eventIds = $this->connection->fetchFirstColumn(
+            'SELECT ce.id FROM contract_events ce'.$whereSql.$paginationSql,
+            $params,
+            $types,
+        );
         if ($eventIds === []) {
             $request?->attributes->set('_cursor_meta', [
                 'page' => $page,
                 'itemsPerPage' => $itemsPerPage,
+                'limit' => $itemsPerPage,
+                'cursor' => is_string($cursor) && trim($cursor) !== '' ? trim($cursor) : null,
                 'beforeId' => $beforeId,
+                'ledgerStart' => $ledgerStart,
+                'ledgerEnd' => $ledgerEnd,
+                'txHash' => $txHash,
+                'nextCursor' => null,
                 'nextBeforeId' => null,
                 'hasMore' => false,
                 'mode' => $beforeId !== null ? 'keyset' : 'offset',
@@ -140,7 +154,13 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         $request?->attributes->set('_cursor_meta', [
             'page' => $page,
             'itemsPerPage' => $itemsPerPage,
+            'limit' => $itemsPerPage,
+            'cursor' => is_string($cursor) && trim($cursor) !== '' ? trim($cursor) : null,
             'beforeId' => $beforeId,
+            'ledgerStart' => $ledgerStart,
+            'ledgerEnd' => $ledgerEnd,
+            'txHash' => $txHash,
+            'nextCursor' => $hasMore && $nextBeforeId !== null ? $this->cursorCodec->encodeId($nextBeforeId) : null,
             'nextBeforeId' => $hasMore ? $nextBeforeId : null,
             'hasMore' => $hasMore,
             'mode' => $beforeId !== null ? 'keyset' : 'offset',
@@ -166,5 +186,16 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         }
 
         return null;
+    }
+
+    private function normalizeNullableString(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $trimmed = trim($value);
+
+        return $trimmed !== '' ? $trimmed : null;
     }
 }

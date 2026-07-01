@@ -14,6 +14,7 @@ use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\Persistence\ManagerRegistry;
 use Psr\Cache\CacheItemPoolInterface;
 use Soneso\StellarSDK\Crypto\StrKey;
@@ -51,7 +52,7 @@ final class RunSorobanContractsCronCommand extends Command
         private readonly ContractTxEnrichmentService $contractTxEnrichmentService,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly ManagerRegistry $doctrine,
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         #[Autowire(service: 'cache.app')]
         private readonly CacheItemPoolInterface $cache,
@@ -677,7 +678,7 @@ final class RunSorobanContractsCronCommand extends Command
             [
                 'id' => $contractDbId,
                 'executable_type' => $newExecutableType,
-                'is_sac' => $newIsSac ? 1 : 0,
+                'is_sac' => $newIsSac,
                 'asset_code' => $newAssetCode,
                 'asset_issuer' => $newAssetIssuer,
                 'asset_address' => $newAssetAddress,
@@ -685,7 +686,7 @@ final class RunSorobanContractsCronCommand extends Command
             [
                 'id' => ParameterType::INTEGER,
                 'executable_type' => $newExecutableType !== null ? ParameterType::INTEGER : ParameterType::NULL,
-                'is_sac' => ParameterType::INTEGER,
+                'is_sac' => ParameterType::BOOLEAN,
                 'asset_code' => $newAssetCode !== null ? ParameterType::STRING : ParameterType::NULL,
                 'asset_issuer' => $newAssetIssuer !== null ? ParameterType::STRING : ParameterType::NULL,
                 'asset_address' => $newAssetAddress !== null ? ParameterType::STRING : ParameterType::NULL,
@@ -994,9 +995,7 @@ final class RunSorobanContractsCronCommand extends Command
 
                 $contractHex = $this->decodeContractIdHexOrNull($candidateId);
                 $this->connection->executeStatement(
-                    'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
-                     VALUES (:contract_id, :contract_id_hex, :network, :created_at)
-                     ON DUPLICATE KEY UPDATE contract_id = contract_id',
+                    $this->buildInsertContractIgnoreSql(),
                     [
                         'contract_id' => $candidateId,
                         'contract_id_hex' => $contractHex,
@@ -1016,6 +1015,19 @@ final class RunSorobanContractsCronCommand extends Command
         }
 
         return $inserted;
+    }
+
+    private function buildInsertContractIgnoreSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                    VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                    ON CONFLICT (contract_id, network) DO NOTHING';
+        }
+
+        return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                ON DUPLICATE KEY UPDATE contract_id = contract_id';
     }
 
     /**

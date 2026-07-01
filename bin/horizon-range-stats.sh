@@ -22,6 +22,7 @@ APP_ENV_PASSTHROUGH_VARS=(
     APP_DEBUG
     DATABASE_URL
     DATABASE_STATISTICS_URL
+    DATABASE_CONTRACTS_URL
     DATABASE_HORIZON_URL
     DATABASE_HORIZON_URL_TESTNET
     DATABASE_HORIZON_URL_MAINNET
@@ -62,6 +63,7 @@ Environment:
   HORIZON_NETWORK=pubnet|testnet|futurenet|passphrase
   HORIZON_MODE=reingest-range|ingest-range
   HORIZON_WORKERS=4
+  DATABASE_CONTRACTS_URL=postgresql://.../horizon_contracts
   APP_MODE=docker|host
   CONSOLE_BIN=bin/console-no-debug
   RUN_CONTRACT_SCAN=1

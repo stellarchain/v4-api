@@ -10,6 +10,7 @@ use App\Service\Stellar\Soroban\SorobanScValMapper;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Soneso\StellarSDK\Crypto\StrKey;
 use Soneso\StellarSDK\Xdr\XdrSCVal;
 use Symfony\Component\Console\Attribute\AsCommand;
@@ -41,7 +42,7 @@ final class ScanContractRangeFromHorizonCommand extends Command
     private array $eventIndexCounters = [];
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly HttpClientInterface $httpClient,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
@@ -463,9 +464,13 @@ final class ScanContractRangeFromHorizonCommand extends Command
         $createdAt = $createdAt ?? (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
         $this->connection->executeStatement(
-            'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
-             VALUES (:contract_id, :contract_id_hex, :network, :created_at)
-             ON DUPLICATE KEY UPDATE contract_id = contract_id',
+            $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform
+                ? 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                   VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                   ON CONFLICT (contract_id, network) DO NOTHING'
+                : 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                   VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                   ON DUPLICATE KEY UPDATE contract_id = contract_id',
             [
                 'contract_id' => $contractId,
                 'contract_id_hex' => $contractHex,

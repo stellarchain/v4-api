@@ -17,7 +17,7 @@ use Symfony\Component\Routing\Attribute\Route;
 final class ContractEventDetailsController
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly ContractEventPayloadFallbackResolver $payloadFallbackResolver,
@@ -71,6 +71,8 @@ final class ContractEventDetailsController
 
         $topicDecoded = $this->decodeJsonValue($row['topic_decoded'] ?? null);
         $valueDecoded = $this->decodeJsonValue($row['value_decoded'] ?? null);
+        $topicRaw = null;
+        $valueRaw = null;
         $addresses = $this->decodeJsonValue($row['addresses'] ?? null);
         $amountRaw = $row['amount_raw'] !== null ? (string) $row['amount_raw'] : null;
         $eventType = (string) ($row['event_type'] ?? 'unknown');
@@ -86,6 +88,10 @@ final class ContractEventDetailsController
             if (is_array($fallback)) {
                 $topicDecoded = $fallback['topicDecoded'] ?? $topicDecoded;
                 $valueDecoded = $fallback['valueDecoded'] ?? $valueDecoded;
+                $topicRaw = $fallback['topicRaw'] ?? $topicRaw;
+                $valueRaw = (is_string($fallback['valueRaw'] ?? null) && $fallback['valueRaw'] !== '')
+                    ? $fallback['valueRaw']
+                    : $valueRaw;
                 $addresses = $fallback['addresses'] ?? $addresses;
                 $amountRaw = (is_string($fallback['amountRaw'] ?? null) && $fallback['amountRaw'] !== '')
                     ? $fallback['amountRaw']
@@ -109,6 +115,10 @@ final class ContractEventDetailsController
             'eventType' => $eventType,
             'topicDecoded' => $topicDecoded,
             'valueDecoded' => $valueDecoded,
+            'raw' => [
+                'topic' => $topicRaw,
+                'value' => $valueRaw,
+            ],
             'addresses' => $addresses,
             'amountRaw' => $amountRaw,
             'createdAt' => $this->toAtom($row['created_at'] ?? null),
