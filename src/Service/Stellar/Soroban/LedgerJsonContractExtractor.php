@@ -368,48 +368,83 @@ final class LedgerJsonContractExtractor
     private function extractStorageEntries(array $txProcessing, int $ledger): array
     {
         $entries = [];
-        $this->collectStorageEntries($txProcessing, $entries, $ledger);
+        $seen = [];
+        $this->collectStorageEntries($txProcessing, $entries, $ledger, null, null, $seen);
 
         return $entries;
     }
 
     /**
      * @param list<array<string,mixed>> $entries
+     * @param array<string,bool> $seen
      */
-    private function collectStorageEntries(mixed $node, array &$entries, int $ledger): void
+    private function collectStorageEntries(
+        mixed $node,
+        array &$entries,
+        int $ledger,
+        ?string $changeType,
+        ?int $lastModifiedLedgerSeq,
+        array &$seen
+    ): void
     {
         if (!is_array($node)) {
             return;
         }
 
-        foreach (['created', 'updated', 'state'] as $changeType) {
-            $change = $node[$changeType] ?? null;
-            if (!is_array($change)) {
-                continue;
-            }
+        $currentLastModifiedLedgerSeq = isset($node['last_modified_ledger_seq'])
+            ? (int) $node['last_modified_ledger_seq']
+            : $lastModifiedLedgerSeq;
 
-            $contractData = $change['data']['contract_data'] ?? null;
-            if (is_array($contractData)) {
-                $contractId = $this->normalizeContractId($contractData['contract'] ?? null);
-                if ($contractId !== null) {
-                    $entries[] = [
-                        'contractId' => $contractId,
-                        'key' => $this->buildStorageKey($contractData['key'] ?? null),
-                        'xdr' => null,
-                        'lastModifiedLedgerSeq' => isset($change['last_modified_ledger_seq'])
-                            ? (int) $change['last_modified_ledger_seq']
-                            : $ledger,
-                        'liveUntilLedgerSeq' => null,
-                        'changeType' => $changeType,
-                        'contractData' => $contractData,
-                    ];
+        if ($this->looksLikeContractData($node)) {
+            $contractId = $this->normalizeContractId($node['contract'] ?? null);
+            if ($contractId !== null) {
+                $entry = [
+                    'contractId' => $contractId,
+                    'key' => $this->buildStorageKey($node['key'] ?? null),
+                    'xdr' => null,
+                    'lastModifiedLedgerSeq' => $currentLastModifiedLedgerSeq ?? $ledger,
+                    'liveUntilLedgerSeq' => null,
+                    'changeType' => $changeType ?? 'unknown',
+                    'contractData' => $node,
+                ];
+                $dedupeKey = hash('sha256', (string) json_encode([
+                    $entry['contractId'],
+                    $entry['key'],
+                    $entry['lastModifiedLedgerSeq'],
+                    $entry['changeType'],
+                ]));
+                if (!isset($seen[$dedupeKey])) {
+                    $seen[$dedupeKey] = true;
+                    $entries[] = $entry;
                 }
             }
         }
 
-        foreach ($node as $child) {
-            $this->collectStorageEntries($child, $entries, $ledger);
+        foreach ($node as $key => $child) {
+            $childChangeType = $this->detectLedgerEntryChangeType($key, $changeType);
+            $this->collectStorageEntries($child, $entries, $ledger, $childChangeType, $currentLastModifiedLedgerSeq, $seen);
         }
+    }
+
+    private function detectLedgerEntryChangeType(mixed $key, ?string $fallback): ?string
+    {
+        if (!is_string($key)) {
+            return $fallback;
+        }
+
+        return match ($key) {
+            'created', 'ledger_entry_created' => 'created',
+            'updated', 'ledger_entry_updated' => 'updated',
+            'state', 'ledger_entry_state' => 'state',
+            default => $fallback,
+        };
+    }
+
+    private function looksLikeContractData(array $node): bool
+    {
+        return array_key_exists('contract', $node)
+            && array_key_exists('key', $node)
+            && array_key_exists('val', $node);
     }
 
     /**
