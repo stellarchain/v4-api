@@ -54,9 +54,6 @@ final class LedgerJsonContractExtractor
             $contractIds = [];
             foreach ($invokeCalls as $call) {
                 $this->addContractId($contractIds, $call['contractId'] ?? null);
-                foreach ($this->extractContractIdsFromMixed($call['args'] ?? []) as $contractId) {
-                    $contractIds[$contractId] = true;
-                }
             }
             foreach ($events as $event) {
                 $this->addContractId($contractIds, $event['contractId'] ?? null);
@@ -811,39 +808,6 @@ final class LedgerJsonContractExtractor
 
         foreach ($value as $child) {
             $this->collectAddresses($child, $addresses);
-        }
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function extractContractIdsFromMixed(mixed $value): array
-    {
-        $ids = [];
-        $this->collectContractIds($value, $ids);
-
-        return array_keys($ids);
-    }
-
-    /**
-     * @param array<string,bool> $ids
-     */
-    private function collectContractIds(mixed $value, array &$ids): void
-    {
-        if (is_string($value)) {
-            $contractId = $this->normalizeContractId($value);
-            if ($contractId !== null) {
-                $ids[$contractId] = true;
-            }
-            return;
-        }
-
-        if (!is_array($value)) {
-            return;
-        }
-
-        foreach ($value as $child) {
-            $this->collectContractIds($child, $ids);
         }
     }
 

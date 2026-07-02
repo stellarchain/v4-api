@@ -15,6 +15,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
     public function testExtractsInvokeEventsAndStorageFromLedgerJson(): void
     {
         $contractId = 'CDLZH2XWR46NF6EGV2JBEARYBOJQ5II2RZLNFBP63LCXBL524Y7ZNMOC';
+        $referencedOnlyContractId = 'CBZJ5GIDUCLFDST467SHWBHF7CSPKVRT6NXRMXRM6FIIDMFCUIFOOQ4D';
         $source = 'GCLWKHHHGBOYXMTSFBJNGCFEWIQ4NZWAGZR6GPB4NLMSLBYW4UP3N4SQ';
         $issuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
         $txHash = '83f148a802f659b2dcc122a395ed8fe50845d4648c979bd0fe6b504a7975813a';
@@ -65,6 +66,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                                         'function_name' => 'set_price',
                                                                         'args' => [
                                                                             ['address' => $source],
+                                                                            ['address' => ['contract' => $referencedOnlyContractId]],
                                                                             ['symbol' => 'XLMUSD'],
                                                                             ['i128' => '2001500'],
                                                                         ],
@@ -150,6 +152,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame($txHash, $tx['txHash']);
         self::assertSame($source, $tx['sourceAccount']);
         self::assertSame([$contractId], $tx['contractIds']);
+        self::assertSame(['contract' => $referencedOnlyContractId], $tx['invokeCalls'][1]['args'][1]);
         self::assertSame('create_contract', $tx['invokeCalls'][0]['functionName']);
         self::assertSame('set_price', $tx['invokeCalls'][1]['functionName']);
         self::assertSame(7844, $tx['resourceFeeCharged']);
