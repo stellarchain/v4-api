@@ -122,13 +122,13 @@ final class DecompileWasmContractsCommand extends Command
                         $this->connection->update(
                             'contracts',
                             [
-                                'is_sac' => 1,
+                                'is_sac' => true,
                                 'executable_type' => isset($result['executableType']) && is_int($result['executableType']) ? (int) $result['executableType'] : null,
                             ],
                             ['id' => $id],
                             [
                                 'id' => ParameterType::INTEGER,
-                                'is_sac' => ParameterType::INTEGER,
+                                'is_sac' => ParameterType::BOOLEAN,
                                 'executable_type' => isset($result['executableType']) && is_int($result['executableType']) ? ParameterType::INTEGER : ParameterType::NULL,
                             ]
                         );
@@ -161,8 +161,8 @@ final class DecompileWasmContractsCommand extends Command
                     'contracts',
                     [
                         'contract_id_hex' => is_string($result['contractIdHex'] ?? null) ? $result['contractIdHex'] : null,
-                        'source_code_verified' => $source !== '' ? 1 : 0,
-                        'sep55_verified' => $sep55Verification['isVerified'] ? 1 : 0,
+                        'source_code_verified' => $source !== '',
+                        'sep55_verified' => $sep55Verification['isVerified'],
                         'github_address' => $sep55Verification['githubAddress'],
                         'sep55_commit_hash' => $sep55Verification['commitHash'],
                         'sep55_attestation_url' => $sep55Verification['attestationUrl'],
@@ -172,20 +172,20 @@ final class DecompileWasmContractsCommand extends Command
                             ? $result['wasmId']
                             : (is_string($result['wasmSha256'] ?? null) ? $result['wasmSha256'] : null),
                         'executable_type' => isset($result['executableType']) && is_int($result['executableType']) ? (int) $result['executableType'] : null,
-                        'is_sac' => 0,
+                        'is_sac' => false,
                     ],
                     ['id' => $id],
                     [
                         'id' => ParameterType::INTEGER,
-                        'source_code_verified' => ParameterType::INTEGER,
-                        'sep55_verified' => ParameterType::INTEGER,
+                        'source_code_verified' => ParameterType::BOOLEAN,
+                        'sep55_verified' => ParameterType::BOOLEAN,
                         'github_address' => $sep55Verification['githubAddress'] !== null ? ParameterType::STRING : ParameterType::NULL,
                         'sep55_commit_hash' => $sep55Verification['commitHash'] !== null ? ParameterType::STRING : ParameterType::NULL,
                         'sep55_attestation_url' => $sep55Verification['attestationUrl'] !== null ? ParameterType::STRING : ParameterType::NULL,
                         'sep55_error' => $sep55Verification['error'] !== null ? ParameterType::STRING : ParameterType::NULL,
                         'sep55_last_checked_at' => ParameterType::STRING,
                         'executable_type' => isset($result['executableType']) && is_int($result['executableType']) ? ParameterType::INTEGER : ParameterType::NULL,
-                        'is_sac' => ParameterType::INTEGER,
+                        'is_sac' => ParameterType::BOOLEAN,
                     ]
                 );
                 if ($updated > 0) {
@@ -276,14 +276,14 @@ final class DecompileWasmContractsCommand extends Command
     {
         $filterSql = $processAll
             ? ''
-            : 'AND (source_code_verified = 0 OR source_code_verified IS NULL OR wasm_id IS NULL OR executable_type IS NULL)';
+            : 'AND (source_code_verified = FALSE OR source_code_verified IS NULL OR wasm_id IS NULL OR executable_type IS NULL)';
 
         return $this->connection->fetchAllAssociative(
             'SELECT id, contract_id, source_code_verified
              FROM contracts
              WHERE network = :network
                AND id > :after_id
-               AND (is_sac = 0 OR is_sac IS NULL)
+               AND (is_sac = FALSE OR is_sac IS NULL)
                AND contract_id IS NOT NULL
                AND contract_id <> \'\'
                ' . $filterSql . '
