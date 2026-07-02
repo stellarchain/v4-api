@@ -4,12 +4,24 @@ declare(strict_types=1);
 
 namespace App\Service\Stellar\Soroban;
 
+use Soneso\StellarSDK\Asset;
 use Soneso\StellarSDK\Crypto\StrKey;
+use Soneso\StellarSDK\Util\Hash;
+use Soneso\StellarSDK\Xdr\XdrContractIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrEnvelopeType;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimageContractID;
 
 final class LedgerJsonContractExtractor
 {
+    private const PUBLIC_NETWORK_PASSPHRASE = 'Public Global Stellar Network ; September 2015';
+
+    /** @var array<string,string> */
+    private array $sacContractIdCache = [];
+
     public function __construct(
         private readonly SorobanContractInspector $contractInspector,
+        private readonly string $networkPassphrase = self::PUBLIC_NETWORK_PASSPHRASE,
     ) {
     }
 
@@ -20,8 +32,12 @@ final class LedgerJsonContractExtractor
      *     transactions:list<array<string,mixed>>
      * }
      */
-    public function extract(array $ledger, bool $includeDiagnosticEvents = true): array
-    {
+    public function extract(
+        array $ledger,
+        bool $includeDiagnosticEvents = true,
+        ?string $networkPassphrase = null
+    ): array {
+        $networkPassphrase ??= $this->networkPassphrase;
         $sequence = (int) ($ledger['sequence'] ?? 0);
         $closedAt = $this->normalizeLedgerCloseTime($ledger['ledgerCloseTime'] ?? null);
         $metadata = is_array($ledger['metadataJson'] ?? null) ? $ledger['metadataJson'] : [];
@@ -49,6 +65,7 @@ final class LedgerJsonContractExtractor
             $events = $this->extractEvents($txProcessing, $txHash, $sequence, $closedAt, $includeDiagnosticEvents);
             $storage = $this->extractStorageEntries($txProcessing, $sequence);
             $contractMeta = $this->extractContractMetaFromStorage($storage);
+            $this->mergeClassicAssetContractMeta($contractMeta, $this->extractClassicAssetContractMeta($operations, $networkPassphrase));
             $this->mergeCreateContractMeta($contractMeta, $invokeCalls);
 
             $contractIds = [];
@@ -56,6 +73,9 @@ final class LedgerJsonContractExtractor
                 $this->addContractId($contractIds, $call['contractId'] ?? null);
             }
             foreach ($events as $event) {
+                if (($event['isDiagnostic'] ?? false) === true) {
+                    continue;
+                }
                 $this->addContractId($contractIds, $event['contractId'] ?? null);
             }
             foreach ($storage as $entry) {
@@ -483,6 +503,154 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
+    }
+
+    /**
+     * @param array<string,array<string,mixed>> $contractMeta
+     * @param array<string,array<string,mixed>> $classicAssetContractMeta
+     */
+    private function mergeClassicAssetContractMeta(array &$contractMeta, array $classicAssetContractMeta): void
+    {
+        foreach ($classicAssetContractMeta as $contractId => $meta) {
+            $existing = $contractMeta[$contractId] ?? [];
+            if (isset($existing['wasmId']) || (isset($existing['executableType']) && (int) $existing['executableType'] === 0)) {
+                continue;
+            }
+
+            $contractMeta[$contractId] = array_replace($meta, $existing);
+        }
+    }
+
+    /**
+     * @return array<string,array<string,mixed>>
+     */
+    private function extractClassicAssetContractMeta(array $operations, string $networkPassphrase): array
+    {
+        $assets = [];
+        foreach ($operations as $operation) {
+            if (!is_array($operation)) {
+                continue;
+            }
+
+            $body = is_array($operation['body'] ?? null) ? $operation['body'] : [];
+            if (array_key_exists('invoke_host_function', $body)) {
+                continue;
+            }
+
+            $this->collectClassicAssets($body, $assets);
+        }
+
+        $meta = [];
+        foreach ($assets as $asset) {
+            $contractId = $this->deriveSacContractId($asset, $networkPassphrase);
+            if ($contractId === null) {
+                continue;
+            }
+
+            $meta[$contractId] = [
+                'isSac' => true,
+                'executableType' => 1,
+                'assetCode' => $asset['assetCode'],
+                'assetIssuer' => $asset['assetIssuer'],
+                'assetAddress' => $contractId,
+            ];
+        }
+
+        return $meta;
+    }
+
+    /**
+     * @param array<string,array{assetCode:string,assetIssuer:?string}> $assets
+     */
+    private function collectClassicAssets(mixed $value, array &$assets): void
+    {
+        if (!is_array($value)) {
+            return;
+        }
+
+        $asset = $this->extractAssetMetaFromNode($value);
+        if ($asset !== null) {
+            $assets[$this->assetMetaKey($asset)] = $asset;
+            return;
+        }
+
+        foreach ($value as $child) {
+            $this->collectClassicAssets($child, $assets);
+        }
+    }
+
+    /**
+     * @return array{assetCode:string,assetIssuer:?string}|null
+     */
+    private function extractAssetMetaFromNode(array $value): ?array
+    {
+        foreach (['native', 'asset_type_native'] as $nativeKey) {
+            if (array_key_exists($nativeKey, $value)) {
+                return ['assetCode' => 'XLM', 'assetIssuer' => null];
+            }
+        }
+
+        $code = $this->normalizeAssetCode($value['asset_code'] ?? $value['code'] ?? null);
+        $issuer = $this->normalizeAccountId($value['asset_issuer'] ?? $value['issuer'] ?? null);
+        if ($code !== null && $issuer !== null) {
+            return ['assetCode' => $code, 'assetIssuer' => $issuer];
+        }
+
+        foreach ([
+            'alpha_num4',
+            'alpha_num12',
+            'alphaNum4',
+            'alphaNum12',
+            'credit_alphanum4',
+            'credit_alphanum12',
+            'credit_alphanum_4',
+            'credit_alphanum_12',
+        ] as $assetKey) {
+            if (array_key_exists($assetKey, $value) && is_array($value[$assetKey])) {
+                return $this->extractAssetMeta($value[$assetKey]);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array{assetCode:string,assetIssuer:?string} $asset
+     */
+    private function assetMetaKey(array $asset): string
+    {
+        return strtoupper($asset['assetCode']) . ':' . ($asset['assetIssuer'] ?? '');
+    }
+
+    /**
+     * @param array{assetCode:string,assetIssuer:?string} $assetMeta
+     */
+    private function deriveSacContractId(array $assetMeta, string $networkPassphrase): ?string
+    {
+        $cacheKey = hash('sha256', $networkPassphrase) . ':' . $this->assetMetaKey($assetMeta);
+        if (isset($this->sacContractIdCache[$cacheKey])) {
+            return $this->sacContractIdCache[$cacheKey];
+        }
+
+        try {
+            $asset = $assetMeta['assetCode'] === 'XLM' && $assetMeta['assetIssuer'] === null
+                ? Asset::native()
+                : Asset::createNonNativeAsset($assetMeta['assetCode'], (string) $assetMeta['assetIssuer']);
+
+            $contractIdPreimage = XdrContractIDPreimage::forAsset($asset->toXdr());
+            $hashPreimage = new XdrHashIDPreimage(new XdrEnvelopeType(XdrEnvelopeType::ENVELOPE_TYPE_CONTRACT_ID));
+            $hashPreimage->contractID = new XdrHashIDPreimageContractID(
+                Hash::generate($networkPassphrase),
+                $contractIdPreimage
+            );
+
+            $contractId = StrKey::encodeContractId(Hash::generate($hashPreimage->encode()));
+            $this->sacContractIdCache[$cacheKey] = $contractId;
+
+            return $contractId;
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**

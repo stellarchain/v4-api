@@ -75,6 +75,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
 
         $network = $this->resolveNetworkOption($input, $this->stellarNetworkResolver);
         $networkCode = $this->resolveNetworkCodeOption($input, $this->stellarNetworkResolver);
+        $networkPassphrase = $this->resolveNetworkPassphrase($network);
         $rpcUrl = $this->resolveRpcUrl($input, $network);
         $startLedger = $this->parsePositiveInt($input->getOption('start-ledger'));
         $endLedger = $this->parsePositiveInt($input->getOption('end-ledger'));
@@ -174,7 +175,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                     continue;
                 }
 
-                $extracted = $this->extractor->extract($ledger, $includeDiagnosticEvents);
+                $extracted = $this->extractor->extract($ledger, $includeDiagnosticEvents, $networkPassphrase);
                 $ledgerSequence = (int) ($extracted['sequence'] ?? 0);
                 if ($ledgerSequence <= 0) {
                     continue;
@@ -1028,6 +1029,15 @@ SQL,
         }
 
         return $this->stellarNetworkResolver->resolveSorobanRpcUrl($network);
+    }
+
+    private function resolveNetworkPassphrase(string $network): string
+    {
+        return match ($network) {
+            'testnet' => 'Test SDF Network ; September 2015',
+            'futurenet' => 'Test SDF Future Network ; October 2022',
+            default => 'Public Global Stellar Network ; September 2015',
+        };
     }
 
     private function decodeContractIdHexOrNull(string $contractId): ?string

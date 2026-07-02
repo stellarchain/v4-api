@@ -9,6 +9,13 @@ use App\Service\Stellar\Soroban\SorobanContractInspector;
 use App\Service\Stellar\Soroban\SorobanServerFactory;
 use App\Service\Stellar\StellarNetworkResolver;
 use PHPUnit\Framework\TestCase;
+use Soneso\StellarSDK\Asset;
+use Soneso\StellarSDK\Crypto\StrKey;
+use Soneso\StellarSDK\Util\Hash;
+use Soneso\StellarSDK\Xdr\XdrContractIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrEnvelopeType;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimageContractID;
 
 final class LedgerJsonContractExtractorTest extends TestCase
 {
@@ -135,6 +142,19 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                     ],
                                     'return_value' => 'void',
                                 ],
+                                'diagnostic_events' => [[
+                                    'event' => [
+                                        'ext' => 'v0',
+                                        'contract_id' => ['contract' => $referencedOnlyContractId],
+                                        'type_' => 'diagnostic',
+                                        'body' => [
+                                            'v0' => [
+                                                'topics' => [['symbol' => 'fn_call']],
+                                                'data' => ['void' => []],
+                                            ],
+                                        ],
+                                    ],
+                                ]],
                             ],
                         ],
                     ]],
@@ -169,5 +189,113 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame('USDC', $tx['contractMetaByContract'][$contractId]['assetCode']);
         self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
         self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
+    }
+
+    public function testClassifiesClassicAssetContractEventsAsSac(): void
+    {
+        $issuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+        $source = 'GCLWKHHHGBOYXMTSFBJNGCFEWIQ4NZWAGZR6GPB4NLMSLBYW4UP3N4SQ';
+        $txHash = '31071a94bb153284b453521d9f1e238b7bc62fcb8a1f517f7e9b70615fd85360';
+        $contractId = self::deriveSacContractId('USDC', $issuer);
+
+        $extractor = new LedgerJsonContractExtractor(
+            new SorobanContractInspector(new SorobanServerFactory(new StellarNetworkResolver()))
+        );
+
+        $ledger = [
+            'sequence' => 50457446,
+            'ledgerCloseTime' => '1708448537',
+            'metadataJson' => [
+                'v2' => [
+                    'tx_set' => [
+                        'v1' => [
+                            'phases' => [[
+                                'v1' => [
+                                    'execution_stages' => [[[
+                                        [
+                                            'tx' => [
+                                                'tx' => [
+                                                    'source_account' => $source,
+                                                    'fee' => 100,
+                                                    'operations' => [[
+                                                        'body' => [
+                                                            'manage_sell_offer' => [
+                                                                'selling' => [
+                                                                    'alpha_num4' => [
+                                                                        'asset_code' => 'USDC',
+                                                                        'issuer' => $issuer,
+                                                                    ],
+                                                                ],
+                                                                'buying' => ['native' => []],
+                                                                'amount' => '10',
+                                                            ],
+                                                        ],
+                                                    ]],
+                                                ],
+                                                'signatures' => [],
+                                            ],
+                                        ],
+                                    ]]],
+                                ],
+                            ]],
+                        ],
+                    ],
+                    'tx_processing' => [[
+                        'result' => [
+                            'transaction_hash' => $txHash,
+                            'result' => [
+                                'fee_charged' => '100',
+                                'result' => ['tx_success' => []],
+                            ],
+                        ],
+                        'tx_apply_processing' => [
+                            'v4' => [
+                                'operations' => [[
+                                    'events' => [[
+                                        'ext' => 'v0',
+                                        'contract_id' => ['contract' => $contractId],
+                                        'type_' => 'contract',
+                                        'body' => [
+                                            'v0' => [
+                                                'topics' => [['symbol' => 'transfer'], ['address' => $source]],
+                                                'data' => ['i128' => '1000000'],
+                                            ],
+                                        ],
+                                    ]],
+                                ]],
+                            ],
+                        ],
+                    ]],
+                ],
+            ],
+        ];
+
+        $result = $extractor->extract($ledger);
+
+        self::assertCount(1, $result['transactions']);
+        $tx = $result['transactions'][0];
+        self::assertSame([$contractId], $tx['contractIds']);
+        self::assertArrayHasKey($contractId, $tx['contractMetaByContract']);
+        self::assertTrue($tx['contractMetaByContract'][$contractId]['isSac']);
+        self::assertSame(1, $tx['contractMetaByContract'][$contractId]['executableType']);
+        self::assertSame('USDC', $tx['contractMetaByContract'][$contractId]['assetCode']);
+        self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
+        self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
+    }
+
+    private static function deriveSacContractId(string $code, ?string $issuer): string
+    {
+        $asset = $code === 'XLM' && $issuer === null
+            ? Asset::native()
+            : Asset::createNonNativeAsset($code, (string) $issuer);
+
+        $contractIdPreimage = XdrContractIDPreimage::forAsset($asset->toXdr());
+        $hashPreimage = new XdrHashIDPreimage(new XdrEnvelopeType(XdrEnvelopeType::ENVELOPE_TYPE_CONTRACT_ID));
+        $hashPreimage->contractID = new XdrHashIDPreimageContractID(
+            Hash::generate('Public Global Stellar Network ; September 2015'),
+            $contractIdPreimage
+        );
+
+        return StrKey::encodeContractId(Hash::generate($hashPreimage->encode()));
     }
 }
