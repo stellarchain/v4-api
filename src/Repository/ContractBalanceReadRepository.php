@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Repository;
 
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -101,10 +102,11 @@ final class ContractBalanceReadRepository
     private function resolveContractDbId(string $contractId, int $networkCode): ?int
     {
         $rowId = $this->connection->fetchOne(
-            'SELECT id
-             FROM contracts
-             WHERE contract_id = :contract_id
-               AND network = :network
+            'SELECT c.id
+             FROM contracts c
+             WHERE c.contract_id = :contract_id
+               AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,
@@ -185,9 +187,10 @@ final class ContractBalanceReadRepository
         }
 
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT id, contract_id
-             FROM contracts
-             WHERE id IN (:ids)',
+            'SELECT c.id, c.contract_id
+             FROM contracts c
+             WHERE c.id IN (:ids)
+               AND '.ContractVisibilitySql::confirmedPredicate('c'),
             ['ids' => $contractDbIds],
             ['ids' => ArrayParameterType::INTEGER]
         );

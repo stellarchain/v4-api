@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Controller;
 
 use App\Service\ContractEvents\ContractEventPayloadFallbackResolver;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -53,6 +54,7 @@ final class ContractEventDetailsController
              WHERE ce.id = :id
                AND c.contract_id = :contract_id
                AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'id' => $id,

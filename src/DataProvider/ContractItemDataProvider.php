@@ -7,6 +7,7 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -68,6 +69,7 @@ final class ContractItemDataProvider implements ProviderInterface
              LEFT JOIN contract_sources cs ON cs.wasm_id = c.wasm_id
              WHERE c.contract_id = :contract_id
                AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,

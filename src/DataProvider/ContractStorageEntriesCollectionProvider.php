@@ -8,6 +8,7 @@ use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -68,10 +69,11 @@ final class ContractStorageEntriesCollectionProvider implements ProviderInterfac
         }
 
         $contractDbId = $this->connection->fetchOne(
-            'SELECT id
-             FROM contracts
-             WHERE contract_id = :contract_id
-               AND network = :network
+            'SELECT c.id
+             FROM contracts c
+             WHERE c.contract_id = :contract_id
+               AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,

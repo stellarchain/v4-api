@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Repository;
 
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -20,10 +21,11 @@ final class ContractArgumentUsageReadRepository
     public function contractExists(string $contractId, int $networkCode): bool
     {
         $rowId = $this->connection->fetchOne(
-            'SELECT id
-             FROM contracts
-             WHERE contract_id = :contract_id
-               AND network = :network
+            'SELECT c.id
+             FROM contracts c
+             WHERE c.contract_id = :contract_id
+               AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,
@@ -62,6 +64,7 @@ final class ContractArgumentUsageReadRepository
                     SELECT c.id
                     FROM contracts c
                     WHERE c.network = :network
+                      AND '.ContractVisibilitySql::confirmedPredicate('c').'
                 )')
                 ->andWhere('ct.host_functions IS NOT NULL')
                 ->andWhere('ct.host_functions LIKE :needle')
@@ -134,6 +137,7 @@ final class ContractArgumentUsageReadRepository
                     SELECT c.id
                     FROM contracts c
                     WHERE c.network = :network
+                      AND '.ContractVisibilitySql::confirmedPredicate('c').'
                 )')
                 ->andWhere('ct.host_functions IS NOT NULL')
                 ->andWhere('ct.host_functions LIKE :needle')
@@ -209,9 +213,10 @@ final class ContractArgumentUsageReadRepository
         }
 
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT id, contract_id
-             FROM contracts
-             WHERE id IN (:ids)',
+            'SELECT c.id, c.contract_id
+             FROM contracts c
+             WHERE c.id IN (:ids)
+               AND '.ContractVisibilitySql::confirmedPredicate('c'),
             ['ids' => $contractDbIds],
             ['ids' => ArrayParameterType::INTEGER]
         );

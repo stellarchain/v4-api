@@ -191,7 +191,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
     }
 
-    public function testClassifiesClassicAssetContractEventsAsSac(): void
+    public function testSkipsClassicAssetContractEventsFromContractIndex(): void
     {
         $issuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
         $source = 'GCLWKHHHGBOYXMTSFBJNGCFEWIQ4NZWAGZR6GPB4NLMSLBYW4UP3N4SQ';
@@ -272,18 +272,10 @@ final class LedgerJsonContractExtractorTest extends TestCase
 
         $result = $extractor->extract($ledger);
 
-        self::assertCount(1, $result['transactions']);
-        $tx = $result['transactions'][0];
-        self::assertSame([$contractId], $tx['contractIds']);
-        self::assertArrayHasKey($contractId, $tx['contractMetaByContract']);
-        self::assertTrue($tx['contractMetaByContract'][$contractId]['isSac']);
-        self::assertSame(1, $tx['contractMetaByContract'][$contractId]['executableType']);
-        self::assertSame('USDC', $tx['contractMetaByContract'][$contractId]['assetCode']);
-        self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
-        self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
+        self::assertSame([], $result['transactions']);
     }
 
-    public function testClassifiesClassicAssetContractEventsFromCanonicalAssetTopic(): void
+    public function testSkipsClassicAssetContractEventsFromCanonicalAssetTopic(): void
     {
         $issuer = 'GCSKX37XIELFZN2BYHEGKAHEUYC2STQMBGXP5HNBQPGEYP7JRHBBUBH4';
         $source = 'GACSYCXZT7VW6KJG4BE2NLN7BCNCZZCJCZKGYAQEWPYLQ6NIVDR6HZ3A';
@@ -375,15 +367,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
 
         $result = $extractor->extract($ledger);
 
-        self::assertCount(1, $result['transactions']);
-        $tx = $result['transactions'][0];
-        self::assertSame([$contractId], $tx['contractIds']);
-        self::assertArrayHasKey($contractId, $tx['contractMetaByContract']);
-        self::assertTrue($tx['contractMetaByContract'][$contractId]['isSac']);
-        self::assertSame(1, $tx['contractMetaByContract'][$contractId]['executableType']);
-        self::assertSame('NNIC', $tx['contractMetaByContract'][$contractId]['assetCode']);
-        self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
-        self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
+        self::assertSame([], $result['transactions']);
     }
 
     private static function deriveSacContractId(string $code, ?string $issuer): string

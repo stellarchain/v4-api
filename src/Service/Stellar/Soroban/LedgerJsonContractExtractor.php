@@ -73,14 +73,26 @@ final class LedgerJsonContractExtractor
             foreach ($invokeCalls as $call) {
                 $this->addContractId($contractIds, $call['contractId'] ?? null);
             }
+            foreach ($storage as $entry) {
+                $this->addContractId($contractIds, $entry['contractId'] ?? null);
+            }
             foreach ($events as $event) {
                 if (($event['isDiagnostic'] ?? false) === true) {
                     continue;
                 }
-                $this->addContractId($contractIds, $event['contractId'] ?? null);
-            }
-            foreach ($storage as $entry) {
-                $this->addContractId($contractIds, $entry['contractId'] ?? null);
+
+                $eventContractId = $this->normalizeContractId($event['contractId'] ?? null);
+                if ($eventContractId === null) {
+                    continue;
+                }
+                if (
+                    !isset($contractIds[$eventContractId])
+                    && $this->isEventOnlyClassicAssetContract($eventContractId, $contractMeta)
+                ) {
+                    continue;
+                }
+
+                $contractIds[$eventContractId] = true;
             }
 
             if ($contractIds === []) {
@@ -601,6 +613,25 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
+    }
+
+    /**
+     * @param array<string,array<string,mixed>> $contractMeta
+     */
+    private function isEventOnlyClassicAssetContract(string $contractId, array $contractMeta): bool
+    {
+        $meta = $contractMeta[$contractId] ?? null;
+        if (!is_array($meta)) {
+            return false;
+        }
+        if (($meta['deployed'] ?? false) === true || isset($meta['wasmId'])) {
+            return false;
+        }
+
+        return ($meta['isSac'] ?? false) === true
+            && isset($meta['executableType'])
+            && (int) $meta['executableType'] === 1
+            && isset($meta['assetCode']);
     }
 
     /**

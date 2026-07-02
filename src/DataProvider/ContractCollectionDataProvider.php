@@ -6,6 +6,7 @@ namespace App\DataProvider;
 
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -45,7 +46,7 @@ final class ContractCollectionDataProvider implements ProviderInterface
         $itemsPerPage = max(1, min(self::MAX_ITEMS_PER_PAGE, $itemsPerPage));
         $offset = ($page - 1) * $itemsPerPage;
 
-        $where = ['c.network = :network'];
+        $where = ['c.network = :network', ContractVisibilitySql::confirmedPredicate('c')];
         $params = [
             'network' => $networkCode,
             'limit_rows' => $itemsPerPage,

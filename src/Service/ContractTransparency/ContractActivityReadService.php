@@ -121,6 +121,7 @@ final class ContractActivityReadService
              LEFT JOIN contract_sources cs ON cs.wasm_id = c.wasm_id
              WHERE c.contract_id = :contract_id
                AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,
