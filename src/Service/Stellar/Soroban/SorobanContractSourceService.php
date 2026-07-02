@@ -2,64 +2,188 @@
 
 namespace App\Service\Stellar\Soroban;
 
-use App\Entity\ContractSource;
-use App\Repository\ContractSourceRepository;
-use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\ParameterType;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class SorobanContractSourceService
 {
     public function __construct(
         private readonly LoggerInterface $logger,
-        private readonly ContractSourceRepository $contractSourceRepository,
-        private readonly EntityManagerInterface $entityManager,
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
+        private readonly Connection $connection,
     ) {
     }
 
     public function resolveOrDecompileContractSource(string $contractSourceId, string $wasmBytes, bool $forceRecompile = false): ?string
     {
         $wasmSha256 = hash('sha256', $wasmBytes);
-        $cached = $this->contractSourceRepository->findOneByWasmId($contractSourceId);
-        $now = new \DateTimeImmutable();
-        $record = $cached ?? (new ContractSource())->setWasmId($contractSourceId)->setCreatedAt($now);
-        $hasStoredWasm = $record->getWasmBlobSha256() === $wasmSha256 && $record->getWasmBlob() !== null;
-        if (!$hasStoredWasm) {
-            $record
-                ->setWasmBlob($wasmBytes)
-                ->setWasmBlobSha256($wasmSha256)
-                ->setUpdatedAt($now);
-        }
+        $cached = $this->loadCachedSource($contractSourceId);
+        $now = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
 
-        $cachedSourceCode = is_string($cached?->getSourceCode()) ? trim((string) $cached?->getSourceCode()) : '';
+        $hasStoredWasm = is_array($cached)
+            && $this->nullableString($cached['wasm_blob_sha256'] ?? null) === $wasmSha256
+            && $this->databaseBool($cached['has_wasm_blob'] ?? false);
+        $cachedSourceCode = is_array($cached) ? $this->nullableString($cached['source_code'] ?? null) : null;
+
         if (
             !$forceRecompile
-            &&
-            $cached instanceof ContractSource
-            && $cached->getStatus() === 1
-            && $cachedSourceCode !== ''
+            && is_array($cached)
+            && (int) ($cached['status'] ?? 0) === 1
+            && $cachedSourceCode !== null
         ) {
             if (!$hasStoredWasm) {
-                $this->entityManager->persist($record);
-                $this->entityManager->flush();
+                $this->upsertContractSource(
+                    $contractSourceId,
+                    $wasmBytes,
+                    $wasmSha256,
+                    $cachedSourceCode,
+                    $this->nullableString($cached['source_code_sha256'] ?? null),
+                    1,
+                    null,
+                    $this->nullableString($cached['decompiled_at'] ?? null),
+                    $now,
+                );
             }
-            return $cached->getSourceCode();
+
+            return $cachedSourceCode;
         }
 
         $sourceCode = $this->decompileWasmWithSorobanAuditor($wasmBytes);
-        $hasSourceCode = is_string($sourceCode) && trim($sourceCode) !== '';
+        $sourceCode = is_string($sourceCode) && trim($sourceCode) !== '' ? $sourceCode : null;
+        $sourceCodeSha256 = $sourceCode !== null ? hash('sha256', $sourceCode) : null;
 
-        $record
-            ->setSourceCode($hasSourceCode ? $sourceCode : null)
-            ->setSourceCodeSha256($hasSourceCode ? hash('sha256', (string) $sourceCode) : null)
-            ->setStatus($hasSourceCode ? 1 : 2)
-            ->setErrorMessage($hasSourceCode ? null : 'soroban-auditor returned empty output or non-zero exit')
-            ->setDecompiledAt($hasSourceCode ? $now : null)
-            ->setUpdatedAt($now);
+        $this->upsertContractSource(
+            $contractSourceId,
+            $wasmBytes,
+            $wasmSha256,
+            $sourceCode,
+            $sourceCodeSha256,
+            $sourceCode !== null ? 1 : 2,
+            $sourceCode !== null ? null : 'soroban-auditor returned empty output or non-zero exit',
+            $sourceCode !== null ? $now : null,
+            $now,
+        );
 
-        $this->entityManager->persist($record);
-        $this->entityManager->flush();
+        return $sourceCode;
+    }
 
-        return $hasSourceCode ? $sourceCode : null;
+    /**
+     * @return array<string,mixed>|false
+     */
+    private function loadCachedSource(string $contractSourceId): array|false
+    {
+        return $this->connection->fetchAssociative(
+            'SELECT
+                wasm_id,
+                source_code,
+                source_code_sha256,
+                wasm_blob_sha256,
+                wasm_blob IS NOT NULL AS has_wasm_blob,
+                status,
+                error_message,
+                decompiled_at
+             FROM contract_sources
+             WHERE wasm_id = :wasm_id
+             LIMIT 1',
+            ['wasm_id' => $contractSourceId],
+        );
+    }
+
+    private function upsertContractSource(
+        string $wasmId,
+        string $wasmBytes,
+        string $wasmSha256,
+        ?string $sourceCode,
+        ?string $sourceCodeSha256,
+        int $status,
+        ?string $errorMessage,
+        ?string $decompiledAt,
+        string $updatedAt,
+    ): void {
+        $this->connection->executeStatement(
+            'INSERT INTO contract_sources (
+                wasm_id,
+                source_code,
+                source_code_sha256,
+                wasm_blob,
+                wasm_blob_sha256,
+                status,
+                error_message,
+                decompiled_at,
+                created_at,
+                updated_at
+             ) VALUES (
+                :wasm_id,
+                :source_code,
+                :source_code_sha256,
+                :wasm_blob,
+                :wasm_blob_sha256,
+                :status,
+                :error_message,
+                :decompiled_at,
+                :created_at,
+                :updated_at
+             )
+             ON CONFLICT (wasm_id) DO UPDATE SET
+                source_code = EXCLUDED.source_code,
+                source_code_sha256 = EXCLUDED.source_code_sha256,
+                wasm_blob = EXCLUDED.wasm_blob,
+                wasm_blob_sha256 = EXCLUDED.wasm_blob_sha256,
+                status = EXCLUDED.status,
+                error_message = EXCLUDED.error_message,
+                decompiled_at = EXCLUDED.decompiled_at,
+                updated_at = EXCLUDED.updated_at',
+            [
+                'wasm_id' => $wasmId,
+                'source_code' => $sourceCode,
+                'source_code_sha256' => $sourceCodeSha256,
+                'wasm_blob' => $wasmBytes,
+                'wasm_blob_sha256' => $wasmSha256,
+                'status' => $status,
+                'error_message' => $errorMessage,
+                'decompiled_at' => $decompiledAt,
+                'created_at' => $updatedAt,
+                'updated_at' => $updatedAt,
+            ],
+            [
+                'source_code' => $sourceCode !== null ? ParameterType::STRING : ParameterType::NULL,
+                'source_code_sha256' => $sourceCodeSha256 !== null ? ParameterType::STRING : ParameterType::NULL,
+                'wasm_blob' => ParameterType::BINARY,
+                'status' => ParameterType::INTEGER,
+                'error_message' => $errorMessage !== null ? ParameterType::STRING : ParameterType::NULL,
+                'decompiled_at' => $decompiledAt !== null ? ParameterType::STRING : ParameterType::NULL,
+            ],
+        );
+    }
+
+    private function nullableString(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+        $value = trim($value);
+
+        return $value !== '' ? $value : null;
+    }
+
+    private function databaseBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                default => false,
+            };
+        }
+
+        return false;
     }
 
     private function decompileWasmWithSorobanAuditor(string $wasmBytes): ?string

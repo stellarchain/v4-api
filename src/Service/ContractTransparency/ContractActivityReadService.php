@@ -292,8 +292,8 @@ final class ContractActivityReadService
      */
     private function formatVerification(array $contract): array
     {
-        $sep55Verified = (bool) ($contract['sep55_verified'] ?? false);
-        $sourceCodeVerified = (bool) ($contract['source_code_verified'] ?? false);
+        $sep55Verified = $this->databaseBool($contract['sep55_verified'] ?? false);
+        $sourceCodeVerified = $this->databaseBool($contract['source_code_verified'] ?? false);
         $sep55Error = $this->nullableString($contract['sep55_error'] ?? null);
         $status = match (true) {
             $sep55Verified => 'verified',
@@ -410,6 +410,24 @@ final class ContractActivityReadService
         $trimmed = trim($value);
 
         return $trimmed !== '' ? $trimmed : null;
+    }
+
+    private function databaseBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                default => false,
+            };
+        }
+
+        return false;
     }
 
     private function nullableInt(mixed $value): ?int

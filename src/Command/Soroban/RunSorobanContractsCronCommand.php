@@ -625,7 +625,7 @@ final class RunSorobanContractsCronCommand extends Command
         $existingExecutableType = isset($contract['executable_type']) && $contract['executable_type'] !== null
             ? (int) $contract['executable_type']
             : null;
-        $existingIsSac = (bool) ($contract['is_sac'] ?? false);
+        $existingIsSac = $this->databaseBool($contract['is_sac'] ?? false);
         $existingAssetCode = $this->normalizeNullableString($contract['asset_code'] ?? null);
         $existingAssetIssuer = $this->normalizeNullableString($contract['asset_issuer'] ?? null);
         $existingAssetAddress = $this->normalizeNullableString($contract['asset_address'] ?? null);
@@ -916,6 +916,24 @@ final class RunSorobanContractsCronCommand extends Command
             return (int) trim($value);
         }
         return null;
+    }
+
+    private function databaseBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                default => false,
+            };
+        }
+
+        return false;
     }
 
     private function parseNonNegativeIntOption(mixed $value): ?int

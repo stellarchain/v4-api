@@ -16,6 +16,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
     {
         $contractId = 'CDLZH2XWR46NF6EGV2JBEARYBOJQ5II2RZLNFBP63LCXBL524Y7ZNMOC';
         $source = 'GCLWKHHHGBOYXMTSFBJNGCFEWIQ4NZWAGZR6GPB4NLMSLBYW4UP3N4SQ';
+        $issuer = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
         $txHash = '83f148a802f659b2dcc122a395ed8fe50845d4648c979bd0fe6b504a7975813a';
 
         $extractor = new LedgerJsonContractExtractor(
@@ -38,6 +39,24 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                     'source_account' => $source,
                                                     'fee' => 35014,
                                                     'operations' => [[
+                                                        'body' => [
+                                                            'invoke_host_function' => [
+                                                                'host_function' => [
+                                                                    'create_contract' => [
+                                                                        'contract_id_preimage' => [
+                                                                            'from_asset' => [
+                                                                                'credit_alphanum4' => [
+                                                                                    'asset_code' => 'USDC',
+                                                                                    'issuer' => $issuer,
+                                                                                ],
+                                                                            ],
+                                                                        ],
+                                                                        'executable' => 'stellar_asset',
+                                                                    ],
+                                                                ],
+                                                            ],
+                                                        ],
+                                                    ], [
                                                         'body' => [
                                                             'invoke_host_function' => [
                                                                 'host_function' => [
@@ -85,7 +104,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                     'val' => [
                                                         'contract_instance' => [
                                                             'executable' => [
-                                                                'wasm' => 'c1ad7ecc090b527f5d25198569f6065288e2f8fb35ae9bc511cc8d01d93993be',
+                                                                'stellar_asset' => [],
                                                             ],
                                                         ],
                                                     ],
@@ -131,7 +150,8 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame($txHash, $tx['txHash']);
         self::assertSame($source, $tx['sourceAccount']);
         self::assertSame([$contractId], $tx['contractIds']);
-        self::assertSame('set_price', $tx['invokeCalls'][0]['functionName']);
+        self::assertSame('create_contract', $tx['invokeCalls'][0]['functionName']);
+        self::assertSame('set_price', $tx['invokeCalls'][1]['functionName']);
         self::assertSame(7844, $tx['resourceFeeCharged']);
 
         self::assertCount(1, $tx['eventsByContract'][$contractId]);
@@ -139,8 +159,12 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame('2001500', $tx['eventsByContract'][$contractId][0]['amountRaw']);
 
         self::assertCount(1, $tx['storageByContract'][$contractId]);
-        self::assertSame('c1ad7ecc090b527f5d25198569f6065288e2f8fb35ae9bc511cc8d01d93993be', $tx['contractMetaByContract'][$contractId]['wasmId']);
         self::assertTrue($tx['contractMetaByContract'][$contractId]['deployed']);
-        self::assertSame('contract_instance_created', $tx['contractMetaByContract'][$contractId]['deploymentKind']);
+        self::assertSame('sac_contract_created', $tx['contractMetaByContract'][$contractId]['deploymentKind']);
+        self::assertTrue($tx['contractMetaByContract'][$contractId]['isSac']);
+        self::assertSame(1, $tx['contractMetaByContract'][$contractId]['executableType']);
+        self::assertSame('USDC', $tx['contractMetaByContract'][$contractId]['assetCode']);
+        self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
+        self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
     }
 }

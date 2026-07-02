@@ -7,12 +7,11 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
-use App\Entity\ContractStorageEntry;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\Stellar\StellarNetworkResolver;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
-use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\HttpFoundation\RequestStack;
 
@@ -23,9 +22,8 @@ final class ContractStorageEntriesCollectionProvider implements ProviderInterfac
     private const MAX_ITEMS_PER_PAGE = 200;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
-        private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
         private readonly ContractTransparencyCursor $cursorCodec,
@@ -134,15 +132,26 @@ final class ContractStorageEntriesCollectionProvider implements ProviderInterfac
         $nextBeforeId = $entryIds !== [] ? end($entryIds) : null;
         $nextBeforeId = is_int($nextBeforeId) ? $nextBeforeId : null;
 
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT
+                id,
+                storage_key,
+                entry_xdr,
+                entry_decoded,
+                entry_raw,
+                last_modified_ledger_seq,
+                live_until_ledger_seq,
+                updated_at
+             FROM contract_storage_entries
+             WHERE id IN (:ids)
+             ORDER BY id DESC',
+            ['ids' => $entryIds],
+            ['ids' => ArrayParameterType::INTEGER]
+        );
+
         $this->setMeta($page, $itemsPerPage, $cursor, $beforeId, $ledgerStart, $ledgerEnd, $hasMore ? $nextBeforeId : null, $hasMore);
 
-        return $this->entityManager->getRepository(ContractStorageEntry::class)
-            ->createQueryBuilder('cse')
-            ->andWhere('cse.id IN (:ids)')
-            ->setParameter('ids', $entryIds)
-            ->orderBy('cse.id', 'DESC')
-            ->getQuery()
-            ->getResult();
+        return array_map(fn (array $row): array => $this->formatRow($row), $rows);
     }
 
     private function setMeta(
@@ -182,5 +191,56 @@ final class ContractStorageEntriesCollectionProvider implements ProviderInterfac
         }
 
         return null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     * @return array<string,mixed>
+     */
+    private function formatRow(array $row): array
+    {
+        return [
+            'id' => isset($row['id']) ? (int) $row['id'] : null,
+            'storageKey' => is_string($row['storage_key'] ?? null) ? $row['storage_key'] : null,
+            'entryXdr' => is_string($row['entry_xdr'] ?? null) ? $row['entry_xdr'] : null,
+            'entryDecoded' => $this->decodeJsonValue($row['entry_decoded'] ?? null),
+            'entryRaw' => $this->decodeJsonValue($row['entry_raw'] ?? null),
+            'lastModifiedLedgerSeq' => isset($row['last_modified_ledger_seq']) ? (int) $row['last_modified_ledger_seq'] : null,
+            'liveUntilLedgerSeq' => isset($row['live_until_ledger_seq']) ? (int) $row['live_until_ledger_seq'] : null,
+            'updatedAt' => $this->toAtom($row['updated_at'] ?? null),
+        ];
+    }
+
+    private function toAtom(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format(\DateTimeInterface::ATOM);
+        }
+        if (!is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return (new \DateTimeImmutable($value))->format(\DateTimeInterface::ATOM);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function decodeJsonValue(mixed $value): mixed
+    {
+        if ($value === null || is_array($value)) {
+            return $value;
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $decoded = json_decode($value, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return $value;
+        }
+
+        return $decoded;
     }
 }

@@ -32,6 +32,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
 
     private const DEFAULT_PAGE_SIZE = 10;
     private const MAX_PAGE_SIZE = 200;
+    private const MAINNET_PROTOCOL_20_START_LEDGER = 50457424;
 
     /** @var array<string,int> */
     private array $contractIdCache = [];
@@ -95,6 +96,14 @@ final class IngestContractsFromRpcLedgersCommand extends Command
         }
         if ($startLedger > $endLedger) {
             [$startLedger, $endLedger] = [$endLedger, $startLedger];
+        }
+        if ($network === 'mainnet' && $startLedger < self::MAINNET_PROTOCOL_20_START_LEDGER) {
+            $io->writeln(sprintf(
+                'Mainnet Soroban contract ingest starts at Protocol 20 ledger %d; requested start ledger %d is before Soroban activation.',
+                self::MAINNET_PROTOCOL_20_START_LEDGER,
+                $startLedger
+            ));
+            $startLedger = self::MAINNET_PROTOCOL_20_START_LEDGER;
         }
 
         if (!$dryRun) {
@@ -338,6 +347,10 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                     isset($tx['txHash']) && is_string($tx['txHash']) ? $tx['txHash'] : null,
                     isset($tx['sourceAccount']) && is_string($tx['sourceAccount']) ? $tx['sourceAccount'] : null,
                     isset($meta['deploymentKind']) && is_string($meta['deploymentKind']) ? $meta['deploymentKind'] : null,
+                    ($meta['isSac'] ?? false) === true,
+                    isset($meta['assetCode']) && is_string($meta['assetCode']) ? $meta['assetCode'] : null,
+                    isset($meta['assetIssuer']) && is_string($meta['assetIssuer']) ? $meta['assetIssuer'] : null,
+                    isset($meta['assetAddress']) && is_string($meta['assetAddress']) ? $meta['assetAddress'] : null,
                     $dryRun
                 );
                 if ($contractDbId === null) {
@@ -594,6 +607,10 @@ SQL,
         ?string $deployTxHash,
         ?string $deploySourceAccount,
         ?string $deploymentKind,
+        bool $isSac,
+        ?string $assetCode,
+        ?string $assetIssuer,
+        ?string $assetAddress,
         bool $dryRun
     ): ?int {
         $contractId = strtoupper(trim($contractId));
@@ -617,12 +634,22 @@ SQL,
         $deploySourceAccount = $isDeployment && $deploySourceAccount !== null && $deploySourceAccount !== '' ? $deploySourceAccount : null;
         $deploymentKind = $isDeployment && $deploymentKind !== null && $deploymentKind !== '' ? $deploymentKind : null;
         $wasmId = is_string($wasmId) && preg_match('/^[0-9a-fA-F]{64}$/', $wasmId) === 1 ? strtolower($wasmId) : null;
+        $isSac = $isSac || $executableType === 1;
+        $assetCode = $this->normalizeNullableString($assetCode);
+        $assetIssuer = $this->normalizeNullableString($assetIssuer);
+        $assetAddress = $this->normalizeNullableString($assetAddress);
+        if ($isSac && $assetAddress === null) {
+            $assetAddress = $contractId;
+        }
 
         $id = $this->contractsConnection->fetchOne(
             <<<'SQL'
 INSERT INTO contracts (
     contract_id,
     contract_id_hex,
+    asset_code,
+    asset_address,
+    asset_issuer,
     network,
     created_at,
     deployed_at,
@@ -631,10 +658,14 @@ INSERT INTO contracts (
     deploy_source_account,
     deployment_kind,
     wasm_id,
-    executable_type
+    executable_type,
+    is_sac
 ) VALUES (
     :contract_id,
     :contract_id_hex,
+    :asset_code,
+    :asset_address,
+    :asset_issuer,
     :network,
     :created_at,
     :deployed_at,
@@ -643,9 +674,13 @@ INSERT INTO contracts (
     :deploy_source_account,
     :deployment_kind,
     :wasm_id,
-    :executable_type
+    :executable_type,
+    :is_sac
 )
 ON CONFLICT (contract_id, network) DO UPDATE SET
+    asset_code = COALESCE(contracts.asset_code, EXCLUDED.asset_code),
+    asset_address = COALESCE(contracts.asset_address, EXCLUDED.asset_address),
+    asset_issuer = COALESCE(contracts.asset_issuer, EXCLUDED.asset_issuer),
     created_at = COALESCE(contracts.created_at, EXCLUDED.created_at),
     deployed_at = COALESCE(contracts.deployed_at, EXCLUDED.deployed_at),
     deployed_ledger = COALESCE(contracts.deployed_ledger, EXCLUDED.deployed_ledger),
@@ -653,12 +688,16 @@ ON CONFLICT (contract_id, network) DO UPDATE SET
     deploy_source_account = COALESCE(contracts.deploy_source_account, EXCLUDED.deploy_source_account),
     deployment_kind = COALESCE(contracts.deployment_kind, EXCLUDED.deployment_kind),
     wasm_id = COALESCE(contracts.wasm_id, EXCLUDED.wasm_id),
-    executable_type = COALESCE(contracts.executable_type, EXCLUDED.executable_type)
+    executable_type = COALESCE(contracts.executable_type, EXCLUDED.executable_type),
+    is_sac = contracts.is_sac OR EXCLUDED.is_sac
 RETURNING id
 SQL,
             [
                 'contract_id' => $contractId,
                 'contract_id_hex' => $this->decodeContractIdHexOrNull($contractId),
+                'asset_code' => $assetCode,
+                'asset_address' => $assetAddress,
+                'asset_issuer' => $assetIssuer,
                 'network' => $networkCode,
                 'created_at' => $createdAt,
                 'deployed_at' => $deployedAt,
@@ -668,8 +707,12 @@ SQL,
                 'deployment_kind' => $deploymentKind,
                 'wasm_id' => $wasmId,
                 'executable_type' => $executableType,
+                'is_sac' => $isSac,
             ],
             [
+                'asset_code' => $assetCode !== null ? ParameterType::STRING : ParameterType::NULL,
+                'asset_address' => $assetAddress !== null ? ParameterType::STRING : ParameterType::NULL,
+                'asset_issuer' => $assetIssuer !== null ? ParameterType::STRING : ParameterType::NULL,
                 'network' => ParameterType::INTEGER,
                 'deployed_at' => $deployedAt !== null ? ParameterType::STRING : ParameterType::NULL,
                 'deployed_ledger' => $deployedLedger !== null ? ParameterType::INTEGER : ParameterType::NULL,
@@ -678,6 +721,7 @@ SQL,
                 'deployment_kind' => $deploymentKind !== null ? ParameterType::STRING : ParameterType::NULL,
                 'wasm_id' => $wasmId !== null ? ParameterType::STRING : ParameterType::NULL,
                 'executable_type' => $executableType !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                'is_sac' => ParameterType::BOOLEAN,
             ]
         );
         $id = is_numeric($id) ? (int) $id : null;
@@ -723,7 +767,12 @@ SQL,
             'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_tx_hash VARCHAR(300) DEFAULT NULL',
             'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deploy_source_account VARCHAR(300) DEFAULT NULL',
             'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS deployment_kind VARCHAR(64) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS asset_code VARCHAR(255) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS asset_address VARCHAR(255) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS asset_issuer VARCHAR(255) DEFAULT NULL',
+            'ALTER TABLE contracts ADD COLUMN IF NOT EXISTS is_sac BOOLEAN NOT NULL DEFAULT FALSE',
             'CREATE INDEX IF NOT EXISTS idx_contract_network_deployed ON contracts (network, deployed_at, id)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_network_asset ON contracts (network, asset_code, asset_issuer, id)',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_raw JSONB DEFAULT NULL',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE',
             'ALTER TABLE contract_storage_entries ADD COLUMN IF NOT EXISTS entry_raw JSONB DEFAULT NULL',

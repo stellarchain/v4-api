@@ -100,7 +100,7 @@ final class DecompileWasmContractsCommand extends Command
                 }
 
                 $metrics['processed']++;
-                if ((bool) ($row['source_code_verified'] ?? false) && !$processAll) {
+                if ($this->databaseBool($row['source_code_verified'] ?? false) && !$processAll) {
                     $metrics['already_verified']++;
                     continue;
                 }
@@ -315,6 +315,24 @@ final class DecompileWasmContractsCommand extends Command
         }
 
         return null;
+    }
+
+    private function databaseBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                default => false,
+            };
+        }
+
+        return false;
     }
 
     private function parseNonNegativeInt(mixed $value): ?int

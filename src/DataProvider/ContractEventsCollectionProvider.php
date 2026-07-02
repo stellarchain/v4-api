@@ -7,12 +7,11 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
-use App\Entity\ContractEvent;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\Stellar\StellarNetworkResolver;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
-use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\HttpFoundation\RequestStack;
 
@@ -23,9 +22,8 @@ final class ContractEventsCollectionProvider implements ProviderInterface
     private const MAX_ITEMS_PER_PAGE = 200;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
-        private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
         private readonly ContractTransparencyCursor $cursorCodec,
@@ -151,6 +149,28 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         $nextBeforeId = $eventIds !== [] ? end($eventIds) : null;
         $nextBeforeId = is_int($nextBeforeId) ? $nextBeforeId : null;
 
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT
+                id,
+                tx_hash,
+                event_idx,
+                ledger,
+                ledger_closed_at,
+                event_type,
+                topic_decoded,
+                value_decoded,
+                addresses,
+                amount_raw,
+                created_at,
+                event_raw,
+                is_diagnostic
+             FROM contract_events
+             WHERE id IN (:ids)
+             ORDER BY id DESC',
+            ['ids' => $eventIds],
+            ['ids' => ArrayParameterType::INTEGER]
+        );
+
         $request?->attributes->set('_cursor_meta', [
             'page' => $page,
             'itemsPerPage' => $itemsPerPage,
@@ -166,13 +186,7 @@ final class ContractEventsCollectionProvider implements ProviderInterface
             'mode' => $beforeId !== null ? 'keyset' : 'offset',
         ]);
 
-        return $this->entityManager->getRepository(ContractEvent::class)
-            ->createQueryBuilder('ce')
-            ->andWhere('ce.id IN (:ids)')
-            ->setParameter('ids', $eventIds)
-            ->orderBy('ce.id', 'DESC')
-            ->getQuery()
-            ->getResult();
+        return array_map(fn (array $row): array => $this->formatRow($row), $rows);
     }
 
     private function normalizePositiveInt(mixed $value): ?int
@@ -197,5 +211,79 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         $trimmed = trim($value);
 
         return $trimmed !== '' ? $trimmed : null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     * @return array<string,mixed>
+     */
+    private function formatRow(array $row): array
+    {
+        return [
+            'id' => isset($row['id']) ? (int) $row['id'] : null,
+            'txHash' => $this->normalizeNullableString($row['tx_hash'] ?? null),
+            'eventIndex' => isset($row['event_idx']) ? (int) $row['event_idx'] : 0,
+            'ledger' => isset($row['ledger']) ? (int) $row['ledger'] : null,
+            'ledgerClosedAt' => $this->toAtom($row['ledger_closed_at'] ?? null),
+            'eventType' => $this->normalizeNullableString($row['event_type'] ?? null) ?? 'unknown',
+            'topicDecoded' => $this->decodeJsonValue($row['topic_decoded'] ?? null),
+            'valueDecoded' => $this->decodeJsonValue($row['value_decoded'] ?? null),
+            'addresses' => $this->decodeJsonValue($row['addresses'] ?? null),
+            'amountRaw' => $this->normalizeNullableString($row['amount_raw'] ?? null),
+            'createdAt' => $this->toAtom($row['created_at'] ?? null),
+            'eventRaw' => $this->decodeJsonValue($row['event_raw'] ?? null),
+            'isDiagnostic' => $this->databaseBool($row['is_diagnostic'] ?? false),
+        ];
+    }
+
+    private function databaseBool(mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_int($value)) {
+            return $value !== 0;
+        }
+        if (is_string($value)) {
+            return match (strtolower(trim($value))) {
+                '1', 't', 'true', 'yes', 'on' => true,
+                default => false,
+            };
+        }
+
+        return false;
+    }
+
+    private function toAtom(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format(\DateTimeInterface::ATOM);
+        }
+        if (!is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return (new \DateTimeImmutable($value))->format(\DateTimeInterface::ATOM);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function decodeJsonValue(mixed $value): mixed
+    {
+        if ($value === null || is_array($value)) {
+            return $value;
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $decoded = json_decode($value, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return $value;
+        }
+
+        return $decoded;
     }
 }

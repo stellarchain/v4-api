@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Service\Stellar\Soroban;
 
+use Soneso\StellarSDK\Crypto\StrKey;
+
 final class LedgerJsonContractExtractor
 {
     public function __construct(
@@ -47,6 +49,7 @@ final class LedgerJsonContractExtractor
             $events = $this->extractEvents($txProcessing, $txHash, $sequence, $closedAt, $includeDiagnosticEvents);
             $storage = $this->extractStorageEntries($txProcessing, $sequence);
             $contractMeta = $this->extractContractMetaFromStorage($storage);
+            $this->mergeCreateContractMeta($contractMeta, $invokeCalls);
 
             $contractIds = [];
             foreach ($invokeCalls as $call) {
@@ -461,9 +464,14 @@ final class LedgerJsonContractExtractor
             }
 
             $contractData = is_array($entry['contractData'] ?? null) ? $entry['contractData'] : [];
-            $wasmId = $contractData['val']['contract_instance']['executable']['wasm'] ?? null;
+            $executable = $contractData['val']['contract_instance']['executable'] ?? null;
+            $wasmId = is_array($executable) ? ($executable['wasm'] ?? null) : null;
             if (is_string($wasmId) && preg_match('/^[0-9a-fA-F]{64}$/', $wasmId) === 1) {
                 $meta[$contractId]['wasmId'] = strtolower($wasmId);
+                $meta[$contractId]['executableType'] = 0;
+            }
+            if ($this->containsStellarAssetExecutable($executable)) {
+                $meta[$contractId]['isSac'] = true;
                 $meta[$contractId]['executableType'] = 1;
             }
 
@@ -478,6 +486,210 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
+    }
+
+    /**
+     * @param array<string,array<string,mixed>> $contractMeta
+     * @param list<array<string,mixed>> $invokeCalls
+     */
+    private function mergeCreateContractMeta(array &$contractMeta, array $invokeCalls): void
+    {
+        $deployedContractIds = [];
+        foreach ($contractMeta as $contractId => $meta) {
+            if (($meta['deployed'] ?? false) === true) {
+                $deployedContractIds[] = $contractId;
+            }
+        }
+        if (count($deployedContractIds) !== 1) {
+            return;
+        }
+
+        $createMetas = [];
+        foreach ($invokeCalls as $call) {
+            $type = is_string($call['type'] ?? null) ? $call['type'] : '';
+            if (!in_array($type, ['create_contract', 'create_contract_v2'], true)) {
+                continue;
+            }
+
+            $createMeta = $this->extractCreateContractMeta($call['args'] ?? null);
+            if ($createMeta !== null) {
+                $createMetas[] = $createMeta;
+            }
+        }
+        if (count($createMetas) !== 1) {
+            return;
+        }
+
+        $contractId = $deployedContractIds[0];
+        $contractMeta[$contractId] = array_replace($contractMeta[$contractId] ?? [], $createMetas[0]);
+        if (($createMetas[0]['isSac'] ?? false) === true) {
+            $contractMeta[$contractId]['assetAddress'] ??= $contractId;
+            $contractMeta[$contractId]['deploymentKind'] = 'sac_contract_created';
+        }
+    }
+
+    /**
+     * @return array<string,mixed>|null
+     */
+    private function extractCreateContractMeta(mixed $args): ?array
+    {
+        if (!is_array($args)) {
+            return null;
+        }
+
+        $isSac = $this->containsStellarAssetExecutable($args);
+        if (!$isSac) {
+            return null;
+        }
+
+        $asset = $this->extractAssetMeta($args);
+        $meta = [
+            'isSac' => true,
+            'executableType' => 1,
+        ];
+
+        if ($asset !== null) {
+            $meta['assetCode'] = $asset['assetCode'];
+            $meta['assetIssuer'] = $asset['assetIssuer'];
+        }
+
+        return $meta;
+    }
+
+    private function containsStellarAssetExecutable(mixed $value): bool
+    {
+        if (is_string($value)) {
+            return in_array(strtolower($value), [
+                'stellar_asset',
+                'contract_executable_stellar_asset',
+                'contract_executable_type_stellar_asset',
+            ], true);
+        }
+
+        if (!is_array($value)) {
+            return false;
+        }
+
+        foreach ($value as $key => $child) {
+            if (is_string($key) && in_array(strtolower($key), [
+                'stellar_asset',
+                'contract_executable_stellar_asset',
+                'contract_executable_type_stellar_asset',
+            ], true)) {
+                return true;
+            }
+            if ($this->containsStellarAssetExecutable($child)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array{assetCode:string,assetIssuer:?string}|null
+     */
+    private function extractAssetMeta(mixed $value): ?array
+    {
+        if (is_string($value)) {
+            return strtolower($value) === 'native' ? ['assetCode' => 'XLM', 'assetIssuer' => null] : null;
+        }
+
+        if (!is_array($value)) {
+            return null;
+        }
+
+        foreach (['native', 'asset_type_native'] as $nativeKey) {
+            if (array_key_exists($nativeKey, $value)) {
+                return ['assetCode' => 'XLM', 'assetIssuer' => null];
+            }
+        }
+
+        $code = $this->normalizeAssetCode($value['asset_code'] ?? $value['code'] ?? null);
+        $issuer = $this->normalizeAccountId($value['asset_issuer'] ?? $value['issuer'] ?? null);
+        if ($code !== null && $issuer !== null) {
+            return ['assetCode' => $code, 'assetIssuer' => $issuer];
+        }
+
+        foreach ([
+            'alpha_num4',
+            'alpha_num12',
+            'alphaNum4',
+            'alphaNum12',
+            'credit_alphanum4',
+            'credit_alphanum12',
+            'credit_alphanum_4',
+            'credit_alphanum_12',
+            'from_asset',
+            'asset',
+        ] as $assetKey) {
+            if (array_key_exists($assetKey, $value)) {
+                $asset = $this->extractAssetMeta($value[$assetKey]);
+                if ($asset !== null) {
+                    return $asset;
+                }
+            }
+        }
+
+        foreach ($value as $child) {
+            $asset = $this->extractAssetMeta($child);
+            if ($asset !== null) {
+                return $asset;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeAssetCode(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $value = rtrim(trim($value), "\0");
+        return $value !== '' && strlen($value) <= 12 ? $value : null;
+    }
+
+    private function normalizeAccountId(mixed $value): ?string
+    {
+        if (is_array($value)) {
+            foreach (['account_id', 'accountId', 'ed25519', 'issuer', 'public_key', 'publicKey'] as $key) {
+                $accountId = $this->normalizeAccountId($value[$key] ?? null);
+                if ($accountId !== null) {
+                    return $accountId;
+                }
+            }
+            foreach ($value as $child) {
+                $accountId = $this->normalizeAccountId($child);
+                if ($accountId !== null) {
+                    return $accountId;
+                }
+            }
+
+            return null;
+        }
+
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        if (StrKey::isValidAccountId($value)) {
+            return strtoupper($value);
+        }
+        if (preg_match('/^[0-9a-fA-F]{64}$/', $value) === 1) {
+            try {
+                return StrKey::encodeAccountId(hex2bin(strtolower($value)));
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private function isContractInstanceStorageKey(mixed $value): bool
