@@ -589,7 +589,8 @@ SQL,
             ? (int) $assetReference['ledger']
             : (isset($tx['ledger']) ? (int) $tx['ledger'] : 0);
         $eventIndex = isset($assetReference['eventIndex']) ? (int) $assetReference['eventIndex'] : 0;
-        $sacContractId = strtoupper(trim((string) ($assetReference['sacContractId'] ?? '')));
+        $sacContractId = $this->normalizeBoundedString($assetReference['sacContractId'] ?? null, 128);
+        $sacContractId = $sacContractId !== null ? strtoupper($sacContractId) : '';
         $assetKey = trim((string) ($assetReference['assetKey'] ?? ''));
         $assetCode = trim((string) ($assetReference['assetCode'] ?? ''));
         $txHash = trim((string) ($assetReference['txHash'] ?? $tx['txHash'] ?? ''));
@@ -604,8 +605,8 @@ SQL,
             'sac_contract_id' => $sacContractId,
             'asset_key' => $assetKey,
             'asset_code' => $assetCode,
-            'asset_issuer' => $this->normalizeNullableString($assetReference['assetIssuer'] ?? null),
-            'asset_address' => $this->normalizeNullableString($assetReference['assetAddress'] ?? null),
+            'asset_issuer' => $this->normalizeBoundedString($assetReference['assetIssuer'] ?? null, 128),
+            'asset_address' => $this->normalizeBoundedString($assetReference['assetAddress'] ?? null, 128),
             'tx_hash' => $txHash,
             'event_idx' => $eventIndex,
             'ledger' => $ledger,
@@ -615,7 +616,7 @@ SQL,
             'value_decoded' => $this->encodeJson($assetReference['valueDecoded'] ?? null),
             'addresses' => $this->encodeJson($assetReference['addresses'] ?? []),
             'amount_raw' => $this->normalizeNullableString($assetReference['amountRaw'] ?? null),
-            'source_account' => $this->normalizeNullableString($tx['sourceAccount'] ?? null),
+            'source_account' => $this->normalizeBoundedString($tx['sourceAccount'] ?? null, 128),
             'operation_types' => $this->encodeJson($tx['operationTypes'] ?? []),
             'created_at' => $ledgerClosedAt,
             'event_raw' => $storeRaw ? $this->encodeJson($assetReference['raw'] ?? null) : null,
@@ -969,11 +970,11 @@ SQL,
 CREATE TABLE IF NOT EXISTS contract_event_asset_references (
     id BIGSERIAL NOT NULL,
     network INT NOT NULL,
-    sac_contract_id VARCHAR(56) NOT NULL,
+    sac_contract_id VARCHAR(128) NOT NULL,
     asset_key VARCHAR(80) NOT NULL,
     asset_code VARCHAR(12) NOT NULL,
-    asset_issuer VARCHAR(56) DEFAULT NULL,
-    asset_address VARCHAR(56) DEFAULT NULL,
+    asset_issuer VARCHAR(128) DEFAULT NULL,
+    asset_address VARCHAR(128) DEFAULT NULL,
     tx_hash VARCHAR(64) NOT NULL,
     event_idx INT NOT NULL,
     ledger INT NOT NULL,
@@ -983,21 +984,21 @@ CREATE TABLE IF NOT EXISTS contract_event_asset_references (
     value_decoded JSONB DEFAULT NULL,
     addresses JSONB DEFAULT NULL,
     amount_raw VARCHAR(100) DEFAULT NULL,
-    source_account VARCHAR(56) DEFAULT NULL,
+    source_account VARCHAR(128) DEFAULT NULL,
     operation_types JSONB DEFAULT NULL,
     created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
     event_raw JSONB DEFAULT NULL,
     PRIMARY KEY (ledger, id)
 ) PARTITION BY RANGE (ledger)
 SQL,
-            'ALTER TABLE contract_event_asset_references ALTER COLUMN sac_contract_id TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN sac_contract_id TYPE VARCHAR(128)',
             'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_key TYPE VARCHAR(80)',
             'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_code TYPE VARCHAR(12)',
-            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_issuer TYPE VARCHAR(56)',
-            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_address TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_issuer TYPE VARCHAR(128)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_address TYPE VARCHAR(128)',
             'ALTER TABLE contract_event_asset_references ALTER COLUMN tx_hash TYPE VARCHAR(64)',
             'ALTER TABLE contract_event_asset_references ALTER COLUMN event_type TYPE VARCHAR(32)',
-            'ALTER TABLE contract_event_asset_references ALTER COLUMN source_account TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN source_account TYPE VARCHAR(128)',
             'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_event_asset_ref_ledger ON contract_event_asset_references (network, ledger, sac_contract_id, tx_hash, event_idx, asset_key)',
             'DROP INDEX IF EXISTS uniq_contract_event_asset_ref',
             'CREATE INDEX IF NOT EXISTS idx_contract_event_asset_asset_ledger_id ON contract_event_asset_references (network, asset_code, asset_issuer, ledger DESC, id DESC)',
@@ -1367,6 +1368,16 @@ SQL,
 
         $trimmed = trim($value);
         return $trimmed !== '' ? $trimmed : null;
+    }
+
+    private function normalizeBoundedString(mixed $value, int $maxLength): ?string
+    {
+        $normalized = $this->normalizeNullableString($value);
+        if ($normalized === null) {
+            return null;
+        }
+
+        return strlen($normalized) <= $maxLength ? $normalized : null;
     }
 
     private function encodeJson(mixed $value): ?string
