@@ -131,6 +131,16 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                 'data' => ['i128' => '2001500'],
                                             ],
                                         ],
+                                    ], [
+                                        'ext' => 'v0',
+                                        'contract_id' => ['contract' => $referencedOnlyContractId],
+                                        'type_' => 'contract',
+                                        'body' => [
+                                            'v0' => [
+                                                'topics' => [['symbol' => 'transfer'], ['address' => $source]],
+                                                'data' => ['i128' => '143464'],
+                                            ],
+                                        ],
                                     ]],
                                 ]],
                                 'soroban_meta' => [

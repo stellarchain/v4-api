@@ -61,7 +61,6 @@ final class LedgerJsonContractExtractor
 
             $operations = is_array($envelope['operations'] ?? null) ? $envelope['operations'] : [];
             $invokeCalls = $this->extractInvokeCallsFromOperations($operations);
-            $hasSorobanHostFunction = $this->hasInvokeHostFunctionOperation($operations);
             $operationTypes = $this->extractOperationTypes($operations);
             $events = $this->extractEvents($txProcessing, $txHash, $sequence, $closedAt, $includeDiagnosticEvents);
             $storage = $this->extractStorageEntries($txProcessing, $sequence);
@@ -89,13 +88,7 @@ final class LedgerJsonContractExtractor
                 if ($eventContractId === null) {
                     continue;
                 }
-                if (!isset($contractIds[$eventContractId]) && !$hasSorobanHostFunction) {
-                    continue;
-                }
-                if (
-                    !isset($contractIds[$eventContractId])
-                    && $this->isEventOnlyClassicAssetContract($eventContractId, $contractMeta)
-                ) {
+                if (!isset($contractIds[$eventContractId])) {
                     continue;
                 }
 
@@ -320,22 +313,6 @@ final class LedgerJsonContractExtractor
         }
 
         return array_keys($types);
-    }
-
-    private function hasInvokeHostFunctionOperation(array $operations): bool
-    {
-        foreach ($operations as $operation) {
-            if (!is_array($operation)) {
-                continue;
-            }
-
-            $body = is_array($operation['body'] ?? null) ? $operation['body'] : [];
-            if (array_key_exists('invoke_host_function', $body)) {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /**
@@ -720,25 +697,6 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
-    }
-
-    /**
-     * @param array<string,array<string,mixed>> $contractMeta
-     */
-    private function isEventOnlyClassicAssetContract(string $contractId, array $contractMeta): bool
-    {
-        $meta = $contractMeta[$contractId] ?? null;
-        if (!is_array($meta)) {
-            return false;
-        }
-        if (($meta['deployed'] ?? false) === true || isset($meta['wasmId'])) {
-            return false;
-        }
-
-        return ($meta['isSac'] ?? false) === true
-            && isset($meta['executableType'])
-            && (int) $meta['executableType'] === 1
-            && isset($meta['assetCode']);
     }
 
     /**
