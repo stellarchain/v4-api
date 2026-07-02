@@ -23,12 +23,12 @@ final class LedgerJsonContractExtractor
         $sequence = (int) ($ledger['sequence'] ?? 0);
         $closedAt = $this->normalizeLedgerCloseTime($ledger['ledgerCloseTime'] ?? null);
         $metadata = is_array($ledger['metadataJson'] ?? null) ? $ledger['metadataJson'] : [];
-        $v2 = is_array($metadata['v2'] ?? null) ? $metadata['v2'] : $metadata;
+        $closeMeta = $this->extractCloseMetaPayload($metadata);
 
         $envelopes = [];
-        $this->collectTransactionEnvelopes($v2['tx_set'] ?? null, $envelopes);
+        $this->collectTransactionEnvelopes($closeMeta['tx_set'] ?? null, $envelopes);
 
-        $txProcessingRows = is_array($v2['tx_processing'] ?? null) ? array_values($v2['tx_processing']) : [];
+        $txProcessingRows = is_array($closeMeta['tx_processing'] ?? null) ? array_values($closeMeta['tx_processing']) : [];
         $transactions = [];
         foreach ($txProcessingRows as $index => $txProcessing) {
             if (!is_array($txProcessing)) {
@@ -114,6 +114,20 @@ final class LedgerJsonContractExtractor
             'closedAt' => $closedAt,
             'transactions' => $transactions,
         ];
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function extractCloseMetaPayload(array $metadata): array
+    {
+        foreach (['v2', 'v1', 'v0'] as $versionKey) {
+            if (is_array($metadata[$versionKey] ?? null)) {
+                return $metadata[$versionKey];
+            }
+        }
+
+        return $metadata;
     }
 
     /**
@@ -420,7 +434,7 @@ final class LedgerJsonContractExtractor
 
             if (
                 ($entry['changeType'] ?? null) === 'created'
-                && ($contractData['key'] ?? null) === 'ledger_key_contract_instance'
+                && $this->isContractInstanceStorageKey($contractData['key'] ?? null)
                 && is_array($contractData['val']['contract_instance'] ?? null)
             ) {
                 $meta[$contractId]['deployed'] = true;
@@ -429,6 +443,29 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
+    }
+
+    private function isContractInstanceStorageKey(mixed $value): bool
+    {
+        if ($value === 'ledger_key_contract_instance') {
+            return true;
+        }
+
+        if (!is_array($value)) {
+            return false;
+        }
+
+        if (array_key_exists('ledger_key_contract_instance', $value)) {
+            return true;
+        }
+
+        foreach ($value as $child) {
+            if ($this->isContractInstanceStorageKey($child)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -693,6 +730,24 @@ final class LedgerJsonContractExtractor
 
     private function normalizeContractId(mixed $value): ?string
     {
+        if (is_array($value)) {
+            foreach (['contract', 'contract_id', 'contractId', 'contract_address', 'contractAddress'] as $key) {
+                $contractId = $this->normalizeContractId($value[$key] ?? null);
+                if ($contractId !== null) {
+                    return $contractId;
+                }
+            }
+
+            foreach ($value as $child) {
+                $contractId = $this->normalizeContractId($child);
+                if ($contractId !== null) {
+                    return $contractId;
+                }
+            }
+
+            return null;
+        }
+
         if (!is_string($value) || trim($value) === '') {
             return null;
         }

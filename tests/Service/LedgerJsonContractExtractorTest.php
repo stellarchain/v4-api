@@ -26,7 +26,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
             'sequence' => 3382589,
             'ledgerCloseTime' => '1782927703',
             'metadataJson' => [
-                'v2' => [
+                'v1' => [
                     'tx_set' => [
                         'v1' => [
                             'phases' => [[
@@ -42,7 +42,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                             'invoke_host_function' => [
                                                                 'host_function' => [
                                                                     'invoke_contract' => [
-                                                                        'contract_address' => $contractId,
+                                                                        'contract_address' => ['contract' => $contractId],
                                                                         'function_name' => 'set_price',
                                                                         'args' => [
                                                                             ['address' => $source],
@@ -79,8 +79,8 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                             'last_modified_ledger_seq' => 3382589,
                                             'data' => [
                                                 'contract_data' => [
-                                                    'contract' => $contractId,
-                                                    'key' => 'ledger_key_contract_instance',
+                                                    'contract' => ['contract' => $contractId],
+                                                    'key' => ['ledger_key_contract_instance' => []],
                                                     'durability' => 'persistent',
                                                     'val' => [
                                                         'contract_instance' => [
@@ -95,7 +95,7 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                     ]],
                                     'events' => [[
                                         'ext' => 'v0',
-                                        'contract_id' => $contractId,
+                                        'contract_id' => ['contract' => $contractId],
                                         'type_' => 'contract',
                                         'body' => [
                                             'v0' => [
