@@ -61,13 +61,17 @@ final class LedgerJsonContractExtractor
 
             $operations = is_array($envelope['operations'] ?? null) ? $envelope['operations'] : [];
             $invokeCalls = $this->extractInvokeCallsFromOperations($operations);
+            $hasSorobanHostFunction = $this->hasInvokeHostFunctionOperation($operations);
             $operationTypes = $this->extractOperationTypes($operations);
             $events = $this->extractEvents($txProcessing, $txHash, $sequence, $closedAt, $includeDiagnosticEvents);
             $storage = $this->extractStorageEntries($txProcessing, $sequence);
             $contractMeta = $this->extractContractMetaFromStorage($storage);
-            $this->mergeClassicAssetContractMeta($contractMeta, $this->extractClassicAssetContractMeta($operations, $networkPassphrase));
-            $this->mergeClassicAssetContractMeta($contractMeta, $this->extractEventAssetContractMeta($events, $networkPassphrase));
+            $classicAssetContractMeta = $this->extractClassicAssetContractMeta($operations, $networkPassphrase);
+            $eventAssetContractMeta = $this->extractEventAssetContractMeta($events, $networkPassphrase);
+            $this->mergeClassicAssetContractMeta($contractMeta, $classicAssetContractMeta);
+            $this->mergeClassicAssetContractMeta($contractMeta, $eventAssetContractMeta);
             $this->mergeCreateContractMeta($contractMeta, $invokeCalls);
+            $assetEventReferences = $this->extractAssetEventReferences($events, $classicAssetContractMeta, $networkPassphrase);
 
             $contractIds = [];
             foreach ($invokeCalls as $call) {
@@ -85,6 +89,9 @@ final class LedgerJsonContractExtractor
                 if ($eventContractId === null) {
                     continue;
                 }
+                if (!isset($contractIds[$eventContractId]) && !$hasSorobanHostFunction) {
+                    continue;
+                }
                 if (
                     !isset($contractIds[$eventContractId])
                     && $this->isEventOnlyClassicAssetContract($eventContractId, $contractMeta)
@@ -95,7 +102,7 @@ final class LedgerJsonContractExtractor
                 $contractIds[$eventContractId] = true;
             }
 
-            if ($contractIds === []) {
+            if ($contractIds === [] && $assetEventReferences === []) {
                 continue;
             }
 
@@ -134,6 +141,7 @@ final class LedgerJsonContractExtractor
                 'contractIds' => array_keys($contractIds),
                 'eventsByContract' => $eventsByContract,
                 'storageByContract' => $storageByContract,
+                'assetEventReferences' => $assetEventReferences,
                 'contractMetaByContract' => $contractMeta,
                 'returnValue' => $this->extractReturnValue($txProcessing),
                 'resourceFeeCharged' => $this->extractResourceFeeCharged($txProcessing),
@@ -314,6 +322,22 @@ final class LedgerJsonContractExtractor
         return array_keys($types);
     }
 
+    private function hasInvokeHostFunctionOperation(array $operations): bool
+    {
+        foreach ($operations as $operation) {
+            if (!is_array($operation)) {
+                continue;
+            }
+
+            $body = is_array($operation['body'] ?? null) ? $operation['body'] : [];
+            if (array_key_exists('invoke_host_function', $body)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * @return list<array<string,mixed>>
      */
@@ -344,6 +368,7 @@ final class LedgerJsonContractExtractor
             $normalized[] = [
                 'contractId' => $contractId,
                 'txHash' => $txHash,
+                'eventIndex' => count($normalized) + 1,
                 'ledger' => $ledger,
                 'ledgerClosedAt' => $closedAt,
                 'eventType' => $eventType,
@@ -516,6 +541,88 @@ final class LedgerJsonContractExtractor
         }
 
         return $meta;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $events
+     * @param array<string,array<string,mixed>> $classicAssetContractMeta
+     * @return list<array<string,mixed>>
+     */
+    private function extractAssetEventReferences(
+        array $events,
+        array $classicAssetContractMeta,
+        string $networkPassphrase
+    ): array {
+        $references = [];
+        $seen = [];
+        foreach ($events as $event) {
+            if (($event['isDiagnostic'] ?? false) === true) {
+                continue;
+            }
+
+            $contractId = $this->normalizeContractId($event['contractId'] ?? null);
+            if ($contractId === null) {
+                continue;
+            }
+
+            $assets = [];
+            $this->collectClassicAssetReferences([
+                $event['topicDecoded'] ?? null,
+                $event['valueDecoded'] ?? null,
+                $event['raw'] ?? null,
+            ], $assets);
+
+            if ($assets === [] && is_array($classicAssetContractMeta[$contractId] ?? null)) {
+                $meta = $classicAssetContractMeta[$contractId];
+                $assetCode = isset($meta['assetCode']) && is_string($meta['assetCode']) ? $meta['assetCode'] : null;
+                if ($assetCode !== null) {
+                    $asset = [
+                        'assetCode' => $assetCode,
+                        'assetIssuer' => isset($meta['assetIssuer']) && is_string($meta['assetIssuer']) ? $meta['assetIssuer'] : null,
+                    ];
+                    $assets[$this->assetMetaKey($asset)] = $asset;
+                }
+            }
+
+            foreach ($assets as $asset) {
+                if ($this->deriveSacContractId($asset, $networkPassphrase) !== $contractId) {
+                    continue;
+                }
+
+                $assetKey = $this->assetMetaKey($asset);
+                $eventIndex = isset($event['eventIndex']) ? (int) $event['eventIndex'] : count($references) + 1;
+                $referenceKey = implode(':', [
+                    $contractId,
+                    (string) ($event['txHash'] ?? ''),
+                    (string) $eventIndex,
+                    $assetKey,
+                ]);
+                if (isset($seen[$referenceKey])) {
+                    continue;
+                }
+                $seen[$referenceKey] = true;
+
+                $references[] = [
+                    'sacContractId' => $contractId,
+                    'assetKey' => $assetKey,
+                    'assetCode' => $asset['assetCode'],
+                    'assetIssuer' => $asset['assetIssuer'],
+                    'assetAddress' => $contractId,
+                    'txHash' => $event['txHash'] ?? null,
+                    'eventIndex' => $eventIndex,
+                    'ledger' => $event['ledger'] ?? null,
+                    'ledgerClosedAt' => $event['ledgerClosedAt'] ?? null,
+                    'eventType' => $event['eventType'] ?? 'unknown',
+                    'topicDecoded' => $event['topicDecoded'] ?? [],
+                    'valueDecoded' => $event['valueDecoded'] ?? null,
+                    'addresses' => $event['addresses'] ?? [],
+                    'amountRaw' => $event['amountRaw'] ?? null,
+                    'raw' => $event['raw'] ?? null,
+                ];
+            }
+        }
+
+        return $references;
     }
 
     /**
@@ -747,7 +854,7 @@ final class LedgerJsonContractExtractor
      */
     private function assetMetaKey(array $asset): string
     {
-        return strtoupper($asset['assetCode']) . ':' . ($asset['assetIssuer'] ?? '');
+        return $asset['assetCode'] . ':' . ($asset['assetIssuer'] ?? '');
     }
 
     /**

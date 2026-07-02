@@ -33,6 +33,8 @@ final class IngestContractsFromRpcLedgersCommand extends Command
     private const DEFAULT_PAGE_SIZE = 10;
     private const MAX_PAGE_SIZE = 200;
     private const MAINNET_PROTOCOL_20_START_LEDGER = 50457424;
+    private const ASSET_EVENT_REFERENCE_INSERT_CHUNK_SIZE = 500;
+    private const ASSET_EVENT_REFERENCE_PARTITION_LEDGER_SPAN = 1_000_000;
 
     /** @var array<string,int> */
     private array $contractIdCache = [];
@@ -65,6 +67,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
             ->addOption('maintenance-batch-size', null, InputOption::VALUE_REQUIRED, 'Contracts per automatic maintenance batch.', '500')
             ->addOption('derived-index-batch-size', null, InputOption::VALUE_REQUIRED, 'Transaction batch size per contract for derived argument index rebuild.', '5000')
             ->addOption('maintenance-max-contracts', null, InputOption::VALUE_REQUIRED, 'Max queued contracts to maintain after this run, 0 for all.', '0')
+            ->addOption('store-asset-event-raw', null, InputOption::VALUE_NONE, 'Store full raw event JSON for classic asset event references. Off by default to avoid duplicating data-lake payloads at TB scale.')
             ->addOption('dry-run', null, InputOption::VALUE_NONE, 'Parse ledgers without database writes.')
             ->addOption('timeout', null, InputOption::VALUE_REQUIRED, 'RPC request timeout in seconds.', '120');
     }
@@ -88,6 +91,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
         $maintenanceBatchSize = max(1, $this->parsePositiveInt($input->getOption('maintenance-batch-size')) ?? 500);
         $derivedIndexBatchSize = max(1, $this->parsePositiveInt($input->getOption('derived-index-batch-size')) ?? 5000);
         $maintenanceMaxContracts = max(0, (int) ($input->getOption('maintenance-max-contracts') ?? 0));
+        $storeAssetEventRaw = (bool) $input->getOption('store-asset-event-raw');
         $dryRun = (bool) $input->getOption('dry-run');
         $timeout = max(5, (int) ($input->getOption('timeout') ?? 120));
 
@@ -109,6 +113,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
 
         if (!$dryRun) {
             $this->ensureAuxiliarySchema();
+            $this->ensureAssetEventReferenceLedgerPartitions($startLedger, $endLedger);
         }
 
         if ($resume && !$dryRun) {
@@ -134,6 +139,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
             'transactions' => 0,
             'contracts' => 0,
             'events' => 0,
+            'asset_event_references' => 0,
             'storage_entries' => 0,
             'maintenance_contracts' => 0,
             'maintenance_metrics_refreshed' => 0,
@@ -182,7 +188,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                 }
 
                 try {
-                    $ledgerAffectedContracts = $this->persistExtractedLedger($extracted, $networkCode, $dryRun);
+                    $ledgerAffectedContracts = $this->persistExtractedLedger($extracted, $networkCode, $dryRun, $storeAssetEventRaw);
                     foreach ($ledgerAffectedContracts as $contractDbId) {
                         $affectedContractDbIds[$contractDbId] = true;
                     }
@@ -194,9 +200,20 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                         if (!is_array($tx)) {
                             continue;
                         }
-                        foreach (($tx['eventsByContract'] ?? []) as $events) {
+                        $indexedContractIds = [];
+                        foreach ((is_array($tx['contractIds'] ?? null) ? $tx['contractIds'] : []) as $contractId) {
+                            if (is_string($contractId) && $contractId !== '') {
+                                $indexedContractIds[$contractId] = true;
+                            }
+                        }
+                        foreach (($tx['eventsByContract'] ?? []) as $contractId => $events) {
+                            if (!is_string($contractId) || !isset($indexedContractIds[$contractId])) {
+                                continue;
+                            }
                             $metrics['events'] += is_array($events) ? count($events) : 0;
                         }
+                        $assetReferences = is_array($tx['assetEventReferences'] ?? null) ? $tx['assetEventReferences'] : [];
+                        $metrics['asset_event_references'] += count($assetReferences);
                         foreach (($tx['storageByContract'] ?? []) as $entries) {
                             $metrics['storage_entries'] += is_array($entries) ? count($entries) : 0;
                         }
@@ -270,6 +287,7 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                 ['transactions_indexed', (string) $metrics['transactions']],
                 ['contract_touches', (string) $metrics['contracts']],
                 ['events_indexed', (string) $metrics['events']],
+                ['asset_event_references_indexed', (string) $metrics['asset_event_references']],
                 ['storage_entries_indexed', (string) $metrics['storage_entries']],
                 ['maintenance_contracts', (string) $metrics['maintenance_contracts']],
                 ['maintenance_metrics_refreshed', (string) $metrics['maintenance_metrics_refreshed']],
@@ -320,12 +338,24 @@ final class IngestContractsFromRpcLedgersCommand extends Command
      * @param array<string,mixed> $extracted
      * @return list<int>
      */
-    private function persistExtractedLedger(array $extracted, int $networkCode, bool $dryRun): array
+    private function persistExtractedLedger(array $extracted, int $networkCode, bool $dryRun, bool $storeAssetEventRaw): array
     {
         $affected = [];
+        $assetEventReferenceRows = [];
         foreach (($extracted['transactions'] ?? []) as $tx) {
             if (!is_array($tx)) {
                 continue;
+            }
+
+            $assetReferences = is_array($tx['assetEventReferences'] ?? null) ? $tx['assetEventReferences'] : [];
+            foreach ($assetReferences as $assetReference) {
+                if (!is_array($assetReference)) {
+                    continue;
+                }
+                $assetEventReferenceRow = $this->buildAssetEventReferenceRow($networkCode, $tx, $assetReference, $storeAssetEventRaw);
+                if ($assetEventReferenceRow !== null) {
+                    $assetEventReferenceRows[] = $assetEventReferenceRow;
+                }
             }
 
             $contractIds = is_array($tx['contractIds'] ?? null) ? $tx['contractIds'] : [];
@@ -384,6 +414,10 @@ final class IngestContractsFromRpcLedgersCommand extends Command
                     }
                 }
             }
+        }
+
+        if (!$dryRun && $assetEventReferenceRows !== []) {
+            $this->upsertAssetEventReferences($assetEventReferenceRows);
         }
 
         return array_keys($affected);
@@ -542,6 +576,161 @@ SQL,
                 'is_diagnostic' => ParameterType::BOOLEAN,
             ]
         );
+    }
+
+    /**
+     * @param array<string,mixed> $tx
+     * @param array<string,mixed> $assetReference
+     * @return array<string,mixed>|null
+     */
+    private function buildAssetEventReferenceRow(int $networkCode, array $tx, array $assetReference, bool $storeRaw): ?array
+    {
+        $ledger = isset($assetReference['ledger'])
+            ? (int) $assetReference['ledger']
+            : (isset($tx['ledger']) ? (int) $tx['ledger'] : 0);
+        $eventIndex = isset($assetReference['eventIndex']) ? (int) $assetReference['eventIndex'] : 0;
+        $sacContractId = strtoupper(trim((string) ($assetReference['sacContractId'] ?? '')));
+        $assetKey = trim((string) ($assetReference['assetKey'] ?? ''));
+        $assetCode = trim((string) ($assetReference['assetCode'] ?? ''));
+        $txHash = trim((string) ($assetReference['txHash'] ?? $tx['txHash'] ?? ''));
+        if ($ledger <= 0 || $eventIndex <= 0 || $sacContractId === '' || $assetKey === '' || $assetCode === '' || $txHash === '') {
+            return null;
+        }
+
+        $ledgerClosedAt = $this->normalizeDateTime($assetReference['ledgerClosedAt'] ?? $tx['createdAt'] ?? null);
+
+        return [
+            'network' => $networkCode,
+            'sac_contract_id' => $sacContractId,
+            'asset_key' => $assetKey,
+            'asset_code' => $assetCode,
+            'asset_issuer' => $this->normalizeNullableString($assetReference['assetIssuer'] ?? null),
+            'asset_address' => $this->normalizeNullableString($assetReference['assetAddress'] ?? null),
+            'tx_hash' => $txHash,
+            'event_idx' => $eventIndex,
+            'ledger' => $ledger,
+            'ledger_closed_at' => $ledgerClosedAt,
+            'event_type' => $this->normalizeNullableString($assetReference['eventType'] ?? null) ?? 'unknown',
+            'topic_decoded' => $this->encodeJson($assetReference['topicDecoded'] ?? []),
+            'value_decoded' => $this->encodeJson($assetReference['valueDecoded'] ?? null),
+            'addresses' => $this->encodeJson($assetReference['addresses'] ?? []),
+            'amount_raw' => $this->normalizeNullableString($assetReference['amountRaw'] ?? null),
+            'source_account' => $this->normalizeNullableString($tx['sourceAccount'] ?? null),
+            'operation_types' => $this->encodeJson($tx['operationTypes'] ?? []),
+            'created_at' => $ledgerClosedAt,
+            'event_raw' => $storeRaw ? $this->encodeJson($assetReference['raw'] ?? null) : null,
+        ];
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     */
+    private function upsertAssetEventReferences(array $rows): void
+    {
+        foreach (array_chunk($rows, self::ASSET_EVENT_REFERENCE_INSERT_CHUNK_SIZE) as $chunk) {
+            $valuesSql = [];
+            $params = [];
+            $types = [];
+
+            foreach ($chunk as $index => $row) {
+                $suffix = '_' . $index;
+                $valuesSql[] = sprintf(
+                    '(:network%s, :sac_contract_id%s, :asset_key%s, :asset_code%s, :asset_issuer%s, :asset_address%s, :tx_hash%s, :event_idx%s, :ledger%s, :ledger_closed_at%s, :event_type%s, CAST(:topic_decoded%s AS JSONB), CAST(:value_decoded%s AS JSONB), CAST(:addresses%s AS JSONB), :amount_raw%s, :source_account%s, CAST(:operation_types%s AS JSONB), :created_at%s, CAST(:event_raw%s AS JSONB))',
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix,
+                    $suffix
+                );
+
+                foreach ($row as $key => $value) {
+                    $params[$key . $suffix] = $value;
+                }
+
+                $types['network' . $suffix] = ParameterType::INTEGER;
+                $types['asset_issuer' . $suffix] = $row['asset_issuer'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['asset_address' . $suffix] = $row['asset_address'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['event_idx' . $suffix] = ParameterType::INTEGER;
+                $types['ledger' . $suffix] = ParameterType::INTEGER;
+                $types['ledger_closed_at' . $suffix] = $row['ledger_closed_at'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['amount_raw' . $suffix] = $row['amount_raw'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['source_account' . $suffix] = $row['source_account'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['created_at' . $suffix] = $row['created_at'] !== null ? ParameterType::STRING : ParameterType::NULL;
+                $types['event_raw' . $suffix] = $row['event_raw'] !== null ? ParameterType::STRING : ParameterType::NULL;
+            }
+
+            $this->contractsConnection->executeStatement(
+                sprintf(
+                    <<<'SQL'
+INSERT INTO contract_event_asset_references (
+    network,
+    sac_contract_id,
+    asset_key,
+    asset_code,
+    asset_issuer,
+    asset_address,
+    tx_hash,
+    event_idx,
+    ledger,
+    ledger_closed_at,
+    event_type,
+    topic_decoded,
+    value_decoded,
+    addresses,
+    amount_raw,
+    source_account,
+    operation_types,
+    created_at,
+    event_raw
+) VALUES %s
+ON CONFLICT (network, ledger, sac_contract_id, tx_hash, event_idx, asset_key) DO UPDATE SET
+    asset_code = EXCLUDED.asset_code,
+    asset_issuer = EXCLUDED.asset_issuer,
+    asset_address = EXCLUDED.asset_address,
+    ledger_closed_at = EXCLUDED.ledger_closed_at,
+    event_type = EXCLUDED.event_type,
+    topic_decoded = EXCLUDED.topic_decoded,
+    value_decoded = EXCLUDED.value_decoded,
+    addresses = EXCLUDED.addresses,
+    amount_raw = EXCLUDED.amount_raw,
+    source_account = EXCLUDED.source_account,
+    operation_types = EXCLUDED.operation_types,
+    created_at = EXCLUDED.created_at,
+    event_raw = EXCLUDED.event_raw
+WHERE contract_event_asset_references.asset_code IS DISTINCT FROM EXCLUDED.asset_code
+   OR contract_event_asset_references.asset_issuer IS DISTINCT FROM EXCLUDED.asset_issuer
+   OR contract_event_asset_references.asset_address IS DISTINCT FROM EXCLUDED.asset_address
+   OR contract_event_asset_references.ledger_closed_at IS DISTINCT FROM EXCLUDED.ledger_closed_at
+   OR contract_event_asset_references.event_type IS DISTINCT FROM EXCLUDED.event_type
+   OR contract_event_asset_references.topic_decoded IS DISTINCT FROM EXCLUDED.topic_decoded
+   OR contract_event_asset_references.value_decoded IS DISTINCT FROM EXCLUDED.value_decoded
+   OR contract_event_asset_references.addresses IS DISTINCT FROM EXCLUDED.addresses
+   OR contract_event_asset_references.amount_raw IS DISTINCT FROM EXCLUDED.amount_raw
+   OR contract_event_asset_references.source_account IS DISTINCT FROM EXCLUDED.source_account
+   OR contract_event_asset_references.operation_types IS DISTINCT FROM EXCLUDED.operation_types
+   OR contract_event_asset_references.created_at IS DISTINCT FROM EXCLUDED.created_at
+   OR contract_event_asset_references.event_raw IS DISTINCT FROM EXCLUDED.event_raw
+SQL,
+                    implode(",\n", $valuesSql)
+                ),
+                $params,
+                $types
+            );
+        }
     }
 
     /**
@@ -776,7 +965,55 @@ SQL,
             'CREATE INDEX IF NOT EXISTS idx_contract_network_asset ON contracts (network, asset_code, asset_issuer, id)',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS event_raw JSONB DEFAULT NULL',
             'ALTER TABLE contract_events ADD COLUMN IF NOT EXISTS is_diagnostic BOOLEAN NOT NULL DEFAULT FALSE',
+            <<<'SQL'
+CREATE TABLE IF NOT EXISTS contract_event_asset_references (
+    id BIGSERIAL NOT NULL,
+    network INT NOT NULL,
+    sac_contract_id VARCHAR(56) NOT NULL,
+    asset_key VARCHAR(80) NOT NULL,
+    asset_code VARCHAR(12) NOT NULL,
+    asset_issuer VARCHAR(56) DEFAULT NULL,
+    asset_address VARCHAR(56) DEFAULT NULL,
+    tx_hash VARCHAR(64) NOT NULL,
+    event_idx INT NOT NULL,
+    ledger INT NOT NULL,
+    ledger_closed_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
+    event_type VARCHAR(32) NOT NULL DEFAULT 'unknown',
+    topic_decoded JSONB DEFAULT NULL,
+    value_decoded JSONB DEFAULT NULL,
+    addresses JSONB DEFAULT NULL,
+    amount_raw VARCHAR(100) DEFAULT NULL,
+    source_account VARCHAR(56) DEFAULT NULL,
+    operation_types JSONB DEFAULT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE DEFAULT NULL,
+    event_raw JSONB DEFAULT NULL,
+    PRIMARY KEY (ledger, id)
+) PARTITION BY RANGE (ledger)
+SQL,
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN sac_contract_id TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_key TYPE VARCHAR(80)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_code TYPE VARCHAR(12)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_issuer TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN asset_address TYPE VARCHAR(56)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN tx_hash TYPE VARCHAR(64)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN event_type TYPE VARCHAR(32)',
+            'ALTER TABLE contract_event_asset_references ALTER COLUMN source_account TYPE VARCHAR(56)',
+            'CREATE UNIQUE INDEX IF NOT EXISTS uniq_contract_event_asset_ref_ledger ON contract_event_asset_references (network, ledger, sac_contract_id, tx_hash, event_idx, asset_key)',
+            'DROP INDEX IF EXISTS uniq_contract_event_asset_ref',
+            'CREATE INDEX IF NOT EXISTS idx_contract_event_asset_asset_ledger_id ON contract_event_asset_references (network, asset_code, asset_issuer, ledger DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_event_asset_sac_ledger_id ON contract_event_asset_references (network, sac_contract_id, ledger DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_event_asset_tx_network ON contract_event_asset_references (network, tx_hash)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_event_asset_ledger_brin ON contract_event_asset_references USING BRIN (ledger) WITH (pages_per_range = 64)',
+            'DROP INDEX IF EXISTS idx_contract_event_asset_asset',
+            'DROP INDEX IF EXISTS idx_contract_event_asset_sac',
+            'DROP INDEX IF EXISTS idx_contract_event_asset_tx',
             'ALTER TABLE contract_storage_entries ADD COLUMN IF NOT EXISTS entry_raw JSONB DEFAULT NULL',
+            'CREATE INDEX IF NOT EXISTS idx_contract_tx_contract_ledger_id_desc ON contract_transactions (contract_id, ledger DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_events_contract_ledger_id_desc ON contract_events (contract_id, ledger DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_storage_contract_ledger_id_desc ON contract_storage_entries (contract_id, last_modified_ledger_seq DESC, id DESC)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_tx_ledger_brin ON contract_transactions USING BRIN (ledger) WITH (pages_per_range = 64)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_events_ledger_brin ON contract_events USING BRIN (ledger) WITH (pages_per_range = 64)',
+            'CREATE INDEX IF NOT EXISTS idx_contract_storage_ledger_brin ON contract_storage_entries USING BRIN (last_modified_ledger_seq) WITH (pages_per_range = 64)',
             <<<'SQL'
 CREATE TABLE IF NOT EXISTS contract_index_maintenance_queue (
     contract_id BIGINT PRIMARY KEY,
@@ -807,6 +1044,52 @@ SQL,
         ] as $sql) {
             $this->contractsConnection->executeStatement($sql);
         }
+    }
+
+    private function ensureAssetEventReferenceLedgerPartitions(int $startLedger, int $endLedger): void
+    {
+        if (!$this->isPostgresPartitionedTable('contract_event_asset_references')) {
+            return;
+        }
+
+        $span = self::ASSET_EVENT_REFERENCE_PARTITION_LEDGER_SPAN;
+        $partitionStart = intdiv(max(0, $startLedger), $span) * $span;
+        $partitionEnd = (intdiv(max($startLedger, $endLedger), $span) + 1) * $span;
+        for ($from = $partitionStart; $from < $partitionEnd; $from += $span) {
+            $to = $from + $span;
+            $partitionName = sprintf('contract_event_asset_refs_p%d_%d', $from, $to - 1);
+            $quotedPartitionName = $this->contractsConnection->quoteIdentifier($partitionName);
+
+            $this->contractsConnection->executeStatement(sprintf(
+                'CREATE TABLE IF NOT EXISTS %s PARTITION OF contract_event_asset_references FOR VALUES FROM (%d) TO (%d)',
+                $quotedPartitionName,
+                $from,
+                $to
+            ));
+            $this->contractsConnection->executeStatement(sprintf(
+                'ALTER TABLE %s SET (fillfactor = 95, autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.01)',
+                $quotedPartitionName
+            ));
+        }
+    }
+
+    private function isPostgresPartitionedTable(string $tableName): bool
+    {
+        $result = $this->contractsConnection->fetchOne(
+            <<<'SQL'
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_partitioned_table pt
+    INNER JOIN pg_class c ON c.oid = pt.partrelid
+    INNER JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = current_schema()
+      AND c.relname = :table_name
+)
+SQL,
+            ['table_name' => $tableName]
+        );
+
+        return $this->toBool($result);
     }
 
     private function markMaintenanceNeeded(int $contractDbId, int $networkCode): void

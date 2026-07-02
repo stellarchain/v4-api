@@ -272,7 +272,16 @@ final class LedgerJsonContractExtractorTest extends TestCase
 
         $result = $extractor->extract($ledger);
 
-        self::assertSame([], $result['transactions']);
+        self::assertCount(1, $result['transactions']);
+        $tx = $result['transactions'][0];
+        self::assertSame([], $tx['contractIds']);
+        self::assertCount(1, $tx['assetEventReferences']);
+        self::assertSame($contractId, $tx['assetEventReferences'][0]['sacContractId']);
+        self::assertSame('USDC', $tx['assetEventReferences'][0]['assetCode']);
+        self::assertSame($issuer, $tx['assetEventReferences'][0]['assetIssuer']);
+        self::assertSame('USDC:' . $issuer, $tx['assetEventReferences'][0]['assetKey']);
+        self::assertSame('transfer', $tx['assetEventReferences'][0]['eventType']);
+        self::assertSame('1000000', $tx['assetEventReferences'][0]['amountRaw']);
     }
 
     public function testSkipsClassicAssetContractEventsFromCanonicalAssetTopic(): void
@@ -354,6 +363,96 @@ final class LedgerJsonContractExtractorTest extends TestCase
                                                     ['string' => 'NNIC:' . $issuer],
                                                 ],
                                                 'data' => ['i128' => '994999990050000'],
+                                            ],
+                                        ],
+                                    ]],
+                                ]],
+                            ],
+                        ],
+                    ]],
+                ],
+            ],
+        ];
+
+        $result = $extractor->extract($ledger);
+
+        self::assertCount(1, $result['transactions']);
+        $tx = $result['transactions'][0];
+        self::assertSame([], $tx['contractIds']);
+        self::assertCount(1, $tx['assetEventReferences']);
+        self::assertSame($contractId, $tx['assetEventReferences'][0]['sacContractId']);
+        self::assertSame('NNIC', $tx['assetEventReferences'][0]['assetCode']);
+        self::assertSame($issuer, $tx['assetEventReferences'][0]['assetIssuer']);
+        self::assertSame('NNIC:' . $issuer, $tx['assetEventReferences'][0]['assetKey']);
+        self::assertSame('transfer', $tx['assetEventReferences'][0]['eventType']);
+        self::assertSame('994999990050000', $tx['assetEventReferences'][0]['amountRaw']);
+    }
+
+    public function testSkipsNonSorobanContractEventsWhenAssetMetadataIsMissing(): void
+    {
+        $source = 'GACSYCXZT7VW6KJG4BE2NLN7BCNCZZCJCZKGYAQEWPYLQ6NIVDR6HZ3A';
+        $destination = 'GBPFWMB6QSZ57AB66UWLFF2P675U37EG7L726DJL4VXX6DWBNVBMJCSR';
+        $txHash = '8d1b607a774ac5ac58a12aa8b509fed91a757b08fd3f04476f53886a0618ea91';
+        $contractId = 'CBLTA2GJSGLOKYVFTKO3RNGR6FPGIKRYHRTKAODESAYVMYAK2JME7GO4';
+
+        $extractor = new LedgerJsonContractExtractor(
+            new SorobanContractInspector(new SorobanServerFactory(new StellarNetworkResolver()))
+        );
+
+        $ledger = [
+            'sequence' => 50457517,
+            'ledgerCloseTime' => '1708448782',
+            'metadataJson' => [
+                'v2' => [
+                    'tx_set' => [
+                        'v1' => [
+                            'phases' => [[
+                                'v1' => [
+                                    'execution_stages' => [[[
+                                        [
+                                            'tx' => [
+                                                'tx' => [
+                                                    'source_account' => $source,
+                                                    'fee' => 100,
+                                                    'operations' => [[
+                                                        'body' => [
+                                                            'manage_sell_offer' => [
+                                                                'amount' => '10',
+                                                            ],
+                                                        ],
+                                                    ]],
+                                                ],
+                                                'signatures' => [],
+                                            ],
+                                        ],
+                                    ]]],
+                                ],
+                            ]],
+                        ],
+                    ],
+                    'tx_processing' => [[
+                        'result' => [
+                            'transaction_hash' => $txHash,
+                            'result' => [
+                                'fee_charged' => '100',
+                                'result' => ['tx_success' => []],
+                            ],
+                        ],
+                        'tx_apply_processing' => [
+                            'v4' => [
+                                'operations' => [[
+                                    'events' => [[
+                                        'ext' => 'v0',
+                                        'contract_id' => ['contract' => $contractId],
+                                        'type_' => 'contract',
+                                        'body' => [
+                                            'v0' => [
+                                                'topics' => [
+                                                    ['symbol' => 'transfer'],
+                                                    ['address' => $source],
+                                                    ['address' => $destination],
+                                                ],
+                                                'data' => ['i128' => '143464'],
                                             ],
                                         ],
                                     ]],
