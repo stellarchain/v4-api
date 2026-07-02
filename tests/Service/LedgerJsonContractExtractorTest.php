@@ -283,6 +283,109 @@ final class LedgerJsonContractExtractorTest extends TestCase
         self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
     }
 
+    public function testClassifiesClassicAssetContractEventsFromCanonicalAssetTopic(): void
+    {
+        $issuer = 'GCSKX37XIELFZN2BYHEGKAHEUYC2STQMBGXP5HNBQPGEYP7JRHBBUBH4';
+        $source = 'GACSYCXZT7VW6KJG4BE2NLN7BCNCZZCJCZKGYAQEWPYLQ6NIVDR6HZ3A';
+        $destination = 'GBPFWMB6QSZ57AB66UWLFF2P675U37EG7L726DJL4VXX6DWBNVBMJCSR';
+        $txHash = 'd7a75fdcb3579fc5fdcdd0803a1848ef12022665bbd05f02d2b5dacc65d6eff9';
+        $contractId = self::deriveSacContractId('NNIC', $issuer);
+
+        $extractor = new LedgerJsonContractExtractor(
+            new SorobanContractInspector(new SorobanServerFactory(new StellarNetworkResolver()))
+        );
+
+        $ledger = [
+            'sequence' => 50457425,
+            'ledgerCloseTime' => '1708448417',
+            'metadataJson' => [
+                'v2' => [
+                    'tx_set' => [
+                        'v1' => [
+                            'phases' => [[
+                                'v1' => [
+                                    'execution_stages' => [[[
+                                        [
+                                            'tx' => [
+                                                'tx' => [
+                                                    'source_account' => $source,
+                                                    'fee' => 2012,
+                                                    'operations' => [[
+                                                        'body' => [
+                                                            'path_payment_strict_send' => [
+                                                                'send_asset' => 'native',
+                                                                'dest_asset' => [
+                                                                    'credit_alphanum4' => [
+                                                                        'asset_code' => 'yXLM',
+                                                                        'issuer' => 'GARDNV3Q7YGT4AKSDF25LT32YSCCW4EV22Y2TV3I2PU2MMXJTEDL5T55',
+                                                                    ],
+                                                                ],
+                                                                'path' => [[
+                                                                    'credit_alphanum4' => [
+                                                                        'asset_code' => 'AFR',
+                                                                        'issuer' => 'GBX6YI45VU7WNAAKA3RBFDR3I3UKNFHTJPQ5F6KOOKSGYIAM4TRQN54W',
+                                                                    ],
+                                                                ]],
+                                                            ],
+                                                        ],
+                                                    ]],
+                                                ],
+                                                'signatures' => [],
+                                            ],
+                                        ],
+                                    ]]],
+                                ],
+                            ]],
+                        ],
+                    ],
+                    'tx_processing' => [[
+                        'result' => [
+                            'transaction_hash' => $txHash,
+                            'result' => [
+                                'fee_charged' => '2012',
+                                'result' => ['tx_success' => []],
+                            ],
+                        ],
+                        'tx_apply_processing' => [
+                            'v4' => [
+                                'operations' => [[
+                                    'events' => [[
+                                        'ext' => 'v0',
+                                        'contract_id' => ['contract' => $contractId],
+                                        'type_' => 'contract',
+                                        'body' => [
+                                            'v0' => [
+                                                'topics' => [
+                                                    ['symbol' => 'transfer'],
+                                                    ['address' => $source],
+                                                    ['address' => $destination],
+                                                    ['string' => 'NNIC:' . $issuer],
+                                                ],
+                                                'data' => ['i128' => '994999990050000'],
+                                            ],
+                                        ],
+                                    ]],
+                                ]],
+                            ],
+                        ],
+                    ]],
+                ],
+            ],
+        ];
+
+        $result = $extractor->extract($ledger);
+
+        self::assertCount(1, $result['transactions']);
+        $tx = $result['transactions'][0];
+        self::assertSame([$contractId], $tx['contractIds']);
+        self::assertArrayHasKey($contractId, $tx['contractMetaByContract']);
+        self::assertTrue($tx['contractMetaByContract'][$contractId]['isSac']);
+        self::assertSame(1, $tx['contractMetaByContract'][$contractId]['executableType']);
+        self::assertSame('NNIC', $tx['contractMetaByContract'][$contractId]['assetCode']);
+        self::assertSame($issuer, $tx['contractMetaByContract'][$contractId]['assetIssuer']);
+        self::assertSame($contractId, $tx['contractMetaByContract'][$contractId]['assetAddress']);
+    }
+
     private static function deriveSacContractId(string $code, ?string $issuer): string
     {
         $asset = $code === 'XLM' && $issuer === null

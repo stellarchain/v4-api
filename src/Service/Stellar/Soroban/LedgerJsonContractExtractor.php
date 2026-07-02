@@ -66,6 +66,7 @@ final class LedgerJsonContractExtractor
             $storage = $this->extractStorageEntries($txProcessing, $sequence);
             $contractMeta = $this->extractContractMetaFromStorage($storage);
             $this->mergeClassicAssetContractMeta($contractMeta, $this->extractClassicAssetContractMeta($operations, $networkPassphrase));
+            $this->mergeClassicAssetContractMeta($contractMeta, $this->extractEventAssetContractMeta($events, $networkPassphrase));
             $this->mergeCreateContractMeta($contractMeta, $invokeCalls);
 
             $contractIds = [];
@@ -560,6 +561,49 @@ final class LedgerJsonContractExtractor
     }
 
     /**
+     * @param list<array<string,mixed>> $events
+     * @return array<string,array<string,mixed>>
+     */
+    private function extractEventAssetContractMeta(array $events, string $networkPassphrase): array
+    {
+        $meta = [];
+        foreach ($events as $event) {
+            if (($event['isDiagnostic'] ?? false) === true) {
+                continue;
+            }
+
+            $contractId = $this->normalizeContractId($event['contractId'] ?? null);
+            if ($contractId === null) {
+                continue;
+            }
+
+            $assets = [];
+            $this->collectClassicAssetReferences([
+                $event['topicDecoded'] ?? null,
+                $event['valueDecoded'] ?? null,
+                $event['raw'] ?? null,
+            ], $assets);
+
+            foreach ($assets as $asset) {
+                if ($this->deriveSacContractId($asset, $networkPassphrase) !== $contractId) {
+                    continue;
+                }
+
+                $meta[$contractId] = [
+                    'isSac' => true,
+                    'executableType' => 1,
+                    'assetCode' => $asset['assetCode'],
+                    'assetIssuer' => $asset['assetIssuer'],
+                    'assetAddress' => $contractId,
+                ];
+                break;
+            }
+        }
+
+        return $meta;
+    }
+
+    /**
      * @param array<string,array{assetCode:string,assetIssuer:?string}> $assets
      */
     private function collectClassicAssets(mixed $value, array &$assets): void
@@ -577,6 +621,59 @@ final class LedgerJsonContractExtractor
         foreach ($value as $child) {
             $this->collectClassicAssets($child, $assets);
         }
+    }
+
+    /**
+     * @param array<string,array{assetCode:string,assetIssuer:?string}> $assets
+     */
+    private function collectClassicAssetReferences(mixed $value, array &$assets): void
+    {
+        if (is_string($value)) {
+            $asset = $this->extractAssetMetaFromString($value);
+            if ($asset !== null) {
+                $assets[$this->assetMetaKey($asset)] = $asset;
+            }
+
+            return;
+        }
+
+        if (!is_array($value)) {
+            return;
+        }
+
+        $asset = $this->extractAssetMetaFromNode($value);
+        if ($asset !== null) {
+            $assets[$this->assetMetaKey($asset)] = $asset;
+        }
+
+        foreach ($value as $child) {
+            $this->collectClassicAssetReferences($child, $assets);
+        }
+    }
+
+    /**
+     * @return array{assetCode:string,assetIssuer:?string}|null
+     */
+    private function extractAssetMetaFromString(string $value): ?array
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return null;
+        }
+        if (strtolower($value) === 'native' || strtoupper($value) === 'XLM') {
+            return ['assetCode' => 'XLM', 'assetIssuer' => null];
+        }
+
+        if (preg_match('/^([A-Za-z0-9]{1,12}):(G[A-Z2-7]{55})$/', $value, $matches) !== 1) {
+            return null;
+        }
+
+        $code = $this->normalizeAssetCode($matches[1]);
+        $issuer = $this->normalizeAccountId($matches[2]);
+
+        return $code !== null && $issuer !== null
+            ? ['assetCode' => $code, 'assetIssuer' => $issuer]
+            : null;
     }
 
     /**
