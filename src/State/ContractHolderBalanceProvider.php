@@ -42,12 +42,23 @@ final class ContractHolderBalanceProvider implements ProviderInterface
             return [];
         }
 
-        $rows = $this->readRepository->findHolderBalancesAcrossContracts(
-            $contractId,
-            $networkCode,
-            $this->normalizeLimit($request?->query->get('limit', $filters['limit'] ?? null)),
-            $this->normalizeOffset($request?->query->get('offset', $filters['offset'] ?? null))
-        );
+        $limit = $this->normalizeLimit($request?->query->get('limit', $filters['limit'] ?? null));
+        $offset = $this->normalizeOffset($request?->query->get('offset', $filters['offset'] ?? null));
+        $rows = $this->readRepository->findHolderBalancesAcrossContracts($contractId, $networkCode, $limit + 1, $offset);
+        $hasMore = count($rows) > $limit;
+        if ($hasMore) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+
+        $request?->attributes->set('_cursor_meta', [
+            'limit' => $limit,
+            'offset' => $offset,
+            'nextOffset' => $hasMore ? $offset + $limit : null,
+            'hasMore' => $hasMore,
+            'summary' => [
+                'hasMore' => $hasMore,
+            ],
+        ]);
 
         $result = [];
         foreach ($rows as $row) {

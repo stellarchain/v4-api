@@ -63,6 +63,58 @@ final class ContractBalanceReadRepository
     }
 
     /**
+     * @return array{holders_count:int,indexed_balance_raw:string,inflow_raw:string,outflow_raw:string}
+     */
+    public function findContractBalanceSummary(string $contractId, int $networkCode): array
+    {
+        $contractDbId = $this->resolveContractDbId($contractId, $networkCode);
+        if ($contractDbId === null) {
+            return [
+                'holders_count' => 0,
+                'indexed_balance_raw' => '0',
+                'inflow_raw' => '0',
+                'outflow_raw' => '0',
+            ];
+        }
+
+        $amountCastType = $this->amountCastType();
+        $row = $this->connection->fetchAssociative(
+            sprintf('SELECT
+                COUNT(*) AS holders_count,
+                CAST(COALESCE(SUM(chb.balance_raw), 0) AS %1$s) AS indexed_balance_raw,
+                CAST(COALESCE(SUM(chb.inflow_raw), 0) AS %1$s) AS inflow_raw,
+                CAST(COALESCE(SUM(chb.outflow_raw), 0) AS %1$s) AS outflow_raw
+             FROM contract_holder_balances chb
+             WHERE chb.contract_id = :contract_id
+               AND chb.network = :network', $amountCastType),
+            [
+                'contract_id' => $contractDbId,
+                'network' => $networkCode,
+            ],
+            [
+                'contract_id' => ParameterType::INTEGER,
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+
+        if (!is_array($row)) {
+            return [
+                'holders_count' => 0,
+                'indexed_balance_raw' => '0',
+                'inflow_raw' => '0',
+                'outflow_raw' => '0',
+            ];
+        }
+
+        return [
+            'holders_count' => isset($row['holders_count']) ? (int) $row['holders_count'] : 0,
+            'indexed_balance_raw' => (string) ($row['indexed_balance_raw'] ?? '0'),
+            'inflow_raw' => (string) ($row['inflow_raw'] ?? '0'),
+            'outflow_raw' => (string) ($row['outflow_raw'] ?? '0'),
+        ];
+    }
+
+    /**
      * @return list<array{related_contract_id:string,balance_raw:string,inflow_raw:string,outflow_raw:string}>
      */
     public function findHolderBalancesAcrossContracts(string $holderAddress, int $networkCode, int $limit, int $offset = 0): array

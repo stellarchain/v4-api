@@ -84,7 +84,7 @@ final class ContractItemDataProvider implements ProviderInterface
             return null;
         }
 
-        return $this->formatContractRow($row, $network);
+        return $this->toResponseObject($this->formatContractRow($row, $network));
     }
 
     /**
@@ -99,6 +99,19 @@ final class ContractItemDataProvider implements ProviderInterface
         $sourceCode = $this->nullableString($row['source_code'] ?? null);
         $sourceError = $this->nullableString($row['source_error_message'] ?? null);
         $sourceCodeAvailable = $sourceCodeVerified || $sourceCode !== null;
+        $hasVerifiedMetadata =
+            $this->nullableString($row['verified_display_name'] ?? null) !== null
+            || $this->nullableString($row['verified_metadata_type'] ?? null) !== null
+            || $row['verified_is_sep41'] !== null
+            || $this->nullableString($row['verified_symbol'] ?? null) !== null
+            || $row['verified_decimals'] !== null
+            || $row['verified_metadata_is_verified'] !== null
+            || $this->nullableString($row['verified_website'] ?? null) !== null
+            || $this->nullableString($row['verified_description'] ?? null) !== null
+            || $this->nullableString($row['verified_icon_url'] ?? null) !== null
+            || $row['verified_added_at'] !== null
+            || $row['verified_raw_payload'] !== null
+            || $this->nullableString($row['verified_source_name'] ?? null) !== null;
 
         return [
             'id' => isset($row['id']) ? (int) $row['id'] : null,
@@ -133,7 +146,7 @@ final class ContractItemDataProvider implements ProviderInterface
             'totalStorageEntries' => isset($row['total_storage_entries']) ? (int) $row['total_storage_entries'] : 0,
             'totalInvokes' => isset($row['total_invokes']) ? (int) $row['total_invokes'] : 0,
             'totalInvokeTransactions' => isset($row['total_invokes']) ? (int) $row['total_invokes'] : 0,
-            'verifiedMetadata' => [
+            'verifiedMetadata' => $hasVerifiedMetadata ? [
                 'displayName' => $this->nullableString($row['verified_display_name'] ?? null),
                 'metadataType' => $this->nullableString($row['verified_metadata_type'] ?? null),
                 'isSep41' => $row['verified_is_sep41'] !== null ? $this->databaseBool($row['verified_is_sep41']) : null,
@@ -146,7 +159,7 @@ final class ContractItemDataProvider implements ProviderInterface
                 'addedAt' => $this->toDate($row['verified_added_at'] ?? null),
                 'sourceName' => $this->nullableString($row['verified_source_name'] ?? null),
                 'rawPayload' => $this->decodeJsonValue($row['verified_raw_payload'] ?? null),
-            ],
+            ] : null,
             'source' => [
                 'type' => $sep55Verified ? 'sep55' : ($sourceCodeVerified ? 'decompiled' : null),
                 'githubAddress' => $this->nullableString($row['github_address'] ?? null),
@@ -244,7 +257,7 @@ final class ContractItemDataProvider implements ProviderInterface
     private function decodeJsonValue(mixed $value): mixed
     {
         if ($value === null || is_array($value)) {
-            return $value;
+            return $this->normalizeResponseValue($value);
         }
         if (!is_string($value)) {
             return $value;
@@ -255,6 +268,38 @@ final class ContractItemDataProvider implements ProviderInterface
             return $value;
         }
 
-        return $decoded;
+        return $this->normalizeResponseValue($decoded);
+    }
+
+    /**
+     * API Platform's JSON-LD normalizer treats nested arrays returned from an item
+     * provider as collections. Convert associative maps to objects while keeping
+     * real lists as arrays.
+     *
+     * @param array<string,mixed> $data
+     */
+    private function toResponseObject(array $data): object
+    {
+        $value = $this->normalizeResponseValue($data);
+
+        return is_object($value) ? $value : (object) $data;
+    }
+
+    private function normalizeResponseValue(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            return array_map(fn (mixed $item): mixed => $this->normalizeResponseValue($item), $value);
+        }
+
+        $object = new \stdClass();
+        foreach ($value as $key => $child) {
+            $object->{(string) $key} = $this->normalizeResponseValue($child);
+        }
+
+        return $object;
     }
 }

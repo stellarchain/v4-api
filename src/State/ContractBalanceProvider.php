@@ -42,12 +42,28 @@ final class ContractBalanceProvider implements ProviderInterface
             return [];
         }
 
-        $rows = $this->readRepository->findBalancesByContract(
-            $contractId,
-            $networkCode,
-            $this->normalizeLimit($request?->query->get('limit', $filters['limit'] ?? null)),
-            $this->normalizeOffset($request?->query->get('offset', $filters['offset'] ?? null))
-        );
+        $limit = $this->normalizeLimit($request?->query->get('limit', $filters['limit'] ?? null));
+        $offset = $this->normalizeOffset($request?->query->get('offset', $filters['offset'] ?? null));
+        $rows = $this->readRepository->findBalancesByContract($contractId, $networkCode, $limit + 1, $offset);
+        $summary = $this->readRepository->findContractBalanceSummary($contractId, $networkCode);
+        $hasMore = count($rows) > $limit;
+        if ($hasMore) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+
+        $request?->attributes->set('_cursor_meta', [
+            'limit' => $limit,
+            'offset' => $offset,
+            'nextOffset' => $hasMore ? $offset + $limit : null,
+            'hasMore' => $hasMore,
+            'summary' => [
+                'holdersCount' => $summary['holders_count'],
+                'indexedBalanceRaw' => $summary['indexed_balance_raw'],
+                'inflowRaw' => $summary['inflow_raw'],
+                'outflowRaw' => $summary['outflow_raw'],
+                'hasMore' => $hasMore,
+            ],
+        ]);
 
         $result = [];
         foreach ($rows as $row) {

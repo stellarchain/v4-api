@@ -8,6 +8,7 @@ use ApiPlatform\Metadata\Operation;
 use App\Repository\ContractArgumentUsageReadRepository;
 use App\Service\Stellar\StellarNetworkResolver;
 use App\State\ContractArgumentUsagesProvider;
+use Doctrine\DBAL\DriverManager;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestStack;
@@ -18,30 +19,56 @@ final class ContractArgumentUsagesProviderTest extends TestCase
     {
         $targetContractId = 'CDYYTZZ7J2ADE6UVYZ4P37PJY25LVIG3EUKEMI4JNJSM4QVEYSITUHIU';
 
-        $readRepository = $this->createMock(ContractArgumentUsageReadRepository::class);
-        $readRepository->expects(self::once())
-            ->method('contractExists')
-            ->with($targetContractId, 1)
-            ->willReturn(true);
-        $readRepository->expects(self::once())
-            ->method('countArgumentUsages')
-            ->with($targetContractId, 1)
-            ->willReturn(1);
-        $readRepository->expects(self::once())
-            ->method('loadCandidateRows')
-            ->willReturn([
-                [
-                    'id' => 901,
-                    'tx_hash' => '46c4edd05d612d1ef7a093afae401bec2ecc67e0aa6522fade124163d72b6376',
-                    'source_account' => 'GBGVK3U6E7UWVLUDZWVICWZ6L5IWJ7YSDHAE5SRW6UXFSOACS7OU4YJS',
-                    'function_name' => 'distribute',
-                    'matched_paths' => json_encode(['$.args[2][0].address'], JSON_UNESCAPED_SLASHES),
-                    'matches_count' => 1,
-                    'ledger' => 61426367,
-                    'created_at' => '2026-02-27 18:45:00',
-                    'target_contract_id' => 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75',
-                ],
-            ]);
+        $connection = DriverManager::getConnection(['driver' => 'pdo_sqlite', 'memory' => true]);
+        $connection->executeStatement('CREATE TABLE contracts (
+            id INTEGER PRIMARY KEY,
+            contract_id VARCHAR(64) NOT NULL,
+            network INTEGER NOT NULL,
+            deployed_ledger INTEGER DEFAULT NULL,
+            deployed_at VARCHAR(32) DEFAULT NULL,
+            wasm_id VARCHAR(128) DEFAULT NULL,
+            executable_type INTEGER DEFAULT NULL,
+            total_invokes INTEGER DEFAULT 0,
+            total_storage_entries INTEGER DEFAULT 0
+        )');
+        $connection->executeStatement('CREATE TABLE contract_transactions (
+            id INTEGER PRIMARY KEY,
+            contract_id INTEGER NOT NULL,
+            host_functions TEXT DEFAULT NULL
+        )');
+        $connection->executeStatement('CREATE TABLE contract_argument_usages (
+            id INTEGER PRIMARY KEY,
+            tx_hash VARCHAR(128) NOT NULL,
+            source_account VARCHAR(64) DEFAULT NULL,
+            ledger INTEGER DEFAULT NULL,
+            created_at VARCHAR(32) DEFAULT NULL,
+            function_name VARCHAR(128) DEFAULT NULL,
+            matched_paths TEXT DEFAULT NULL,
+            matches_count INTEGER DEFAULT 0,
+            target_contract_address VARCHAR(64) NOT NULL,
+            referenced_contract_id VARCHAR(64) NOT NULL,
+            network INTEGER NOT NULL
+        )');
+        $connection->insert('contracts', [
+            'id' => 1,
+            'contract_id' => $targetContractId,
+            'network' => 1,
+            'deployed_ledger' => 61426367,
+        ]);
+        $connection->insert('contract_argument_usages', [
+            'id' => 901,
+            'tx_hash' => '46c4edd05d612d1ef7a093afae401bec2ecc67e0aa6522fade124163d72b6376',
+            'source_account' => 'GBGVK3U6E7UWVLUDZWVICWZ6L5IWJ7YSDHAE5SRW6UXFSOACS7OU4YJS',
+            'function_name' => 'distribute',
+            'matched_paths' => json_encode(['$.args[2][0].address'], JSON_UNESCAPED_SLASHES),
+            'matches_count' => 1,
+            'ledger' => 61426367,
+            'created_at' => '2026-02-27 18:45:00',
+            'target_contract_address' => 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75',
+            'referenced_contract_id' => $targetContractId,
+            'network' => 1,
+        ]);
+        $readRepository = new ContractArgumentUsageReadRepository($connection);
 
         $request = new Request([
             'network' => 'mainnet',
@@ -69,7 +96,7 @@ final class ContractArgumentUsagesProviderTest extends TestCase
 
         $meta = $request->attributes->get('_cursor_meta');
         self::assertIsArray($meta);
-        self::assertSame(1, $meta['total']);
         self::assertFalse($meta['hasMore']);
+        self::assertSame(30, $meta['itemsPerPage']);
     }
 }

@@ -222,6 +222,17 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         };
     }
 
+    private function normalizeNullableString(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $trimmed = trim($value);
+
+        return $trimmed !== '' ? $trimmed : null;
+    }
+
     /**
      * @param array<string,mixed> $row
      * @return array<string,mixed>

@@ -8,6 +8,7 @@ use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
 use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
+use App\State\Pagination\FixedTotalArrayPaginator;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -97,13 +98,39 @@ final class ContractCollectionDataProvider implements ProviderInterface
             $params['search'] = '%' . $search . '%';
         }
 
+        $whereSql = implode(' AND ', $where);
+        $countParams = $params;
+        $countTypes = $types;
+        unset($countParams['limit_rows'], $countParams['offset_rows'], $countTypes['limit_rows'], $countTypes['offset_rows']);
+
+        $totalItems = (int) $this->connection->fetchOne(
+            sprintf(
+                'SELECT COUNT(DISTINCT c.id)
+                 FROM contracts c
+                 LEFT JOIN contract_verified_metadata cvm ON cvm.contract_id = c.id
+                 WHERE %s',
+                $whereSql
+            ),
+            $countParams,
+            $countTypes
+        );
+
         $rows = $this->connection->fetchAllAssociative(
             sprintf(
                 'SELECT
                     c.*,
                     cvm.display_name AS verified_display_name,
+                    cvm.metadata_type AS verified_metadata_type,
+                    cvm.is_sep41 AS verified_is_sep41,
                     cvm.symbol AS verified_symbol,
+                    cvm.decimals AS verified_decimals,
                     cvm.is_verified AS verified_metadata_is_verified,
+                    cvm.website AS verified_website,
+                    cvm.description AS verified_description,
+                    cvm.icon_url AS verified_icon_url,
+                    cvm.added_at AS verified_added_at,
+                    cvm.raw_payload AS verified_raw_payload,
+                    cvm.source_name AS verified_source_name,
                     cs.source_code_sha256,
                     cs.wasm_blob_sha256,
                     cs.status AS source_status,
@@ -115,14 +142,16 @@ final class ContractCollectionDataProvider implements ProviderInterface
                  WHERE %s
                  ORDER BY %s
                  LIMIT :limit_rows OFFSET :offset_rows',
-                implode(' AND ', $where),
+                $whereSql,
                 $this->resolveOrderSql($queryParams['order'] ?? ($filters['order'] ?? null))
             ),
             $params,
             $types
         );
 
-        return array_map(fn (array $row): array => $this->formatContractRow($row, $network), $rows);
+        $items = array_map(fn (array $row): object => $this->toResponseObject($this->formatContractRow($row, $network)), $rows);
+
+        return new FixedTotalArrayPaginator($items, $page, $itemsPerPage, $totalItems);
     }
 
     private function resolveOrderSql(mixed $order): string
@@ -196,6 +225,19 @@ final class ContractCollectionDataProvider implements ProviderInterface
         $sep55Error = $this->nullableString($row['sep55_error'] ?? null);
         $sourceError = $this->nullableString($row['source_error_message'] ?? null);
         $sourceCodeAvailable = $sourceCodeVerified || $this->nullableString($row['source_code_sha256'] ?? null) !== null;
+        $hasVerifiedMetadata =
+            $this->nullableString($row['verified_display_name'] ?? null) !== null
+            || $this->nullableString($row['verified_metadata_type'] ?? null) !== null
+            || ($row['verified_is_sep41'] ?? null) !== null
+            || $this->nullableString($row['verified_symbol'] ?? null) !== null
+            || ($row['verified_decimals'] ?? null) !== null
+            || ($row['verified_metadata_is_verified'] ?? null) !== null
+            || $this->nullableString($row['verified_website'] ?? null) !== null
+            || $this->nullableString($row['verified_description'] ?? null) !== null
+            || $this->nullableString($row['verified_icon_url'] ?? null) !== null
+            || ($row['verified_added_at'] ?? null) !== null
+            || ($row['verified_raw_payload'] ?? null) !== null
+            || $this->nullableString($row['verified_source_name'] ?? null) !== null;
 
         return [
             'id' => isset($row['id']) ? (int) $row['id'] : null,
@@ -230,11 +272,20 @@ final class ContractCollectionDataProvider implements ProviderInterface
             'totalStorageEntries' => isset($row['total_storage_entries']) ? (int) $row['total_storage_entries'] : 0,
             'totalInvokes' => isset($row['total_invokes']) ? (int) $row['total_invokes'] : 0,
             'totalInvokeTransactions' => isset($row['total_invokes']) ? (int) $row['total_invokes'] : 0,
-            'verifiedMetadata' => [
+            'verifiedMetadata' => $hasVerifiedMetadata ? [
                 'displayName' => $this->nullableString($row['verified_display_name'] ?? null),
+                'metadataType' => $this->nullableString($row['verified_metadata_type'] ?? null),
+                'isSep41' => ($row['verified_is_sep41'] ?? null) !== null ? $this->databaseBool($row['verified_is_sep41']) : null,
                 'symbol' => $this->nullableString($row['verified_symbol'] ?? null),
-                'isVerified' => $row['verified_metadata_is_verified'] !== null ? $this->databaseBool($row['verified_metadata_is_verified']) : null,
-            ],
+                'decimals' => isset($row['verified_decimals']) ? (int) $row['verified_decimals'] : null,
+                'isVerified' => ($row['verified_metadata_is_verified'] ?? null) !== null ? $this->databaseBool($row['verified_metadata_is_verified']) : null,
+                'website' => $this->nullableString($row['verified_website'] ?? null),
+                'description' => $this->nullableString($row['verified_description'] ?? null),
+                'iconUrl' => $this->nullableString($row['verified_icon_url'] ?? null),
+                'addedAt' => $this->toDate($row['verified_added_at'] ?? null),
+                'sourceName' => $this->nullableString($row['verified_source_name'] ?? null),
+                'rawPayload' => $this->decodeJsonValue($row['verified_raw_payload'] ?? null),
+            ] : null,
             'source' => [
                 'type' => $sep55Verified ? 'sep55' : ($sourceCodeVerified ? 'decompiled' : null),
                 'githubAddress' => $this->nullableString($row['github_address'] ?? null),
@@ -326,5 +377,66 @@ final class ContractCollectionDataProvider implements ProviderInterface
         } catch (\Throwable) {
             return null;
         }
+    }
+
+    private function toDate(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format('Y-m-d');
+        }
+        if (!is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return (new \DateTimeImmutable($value))->format('Y-m-d');
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function decodeJsonValue(mixed $value): mixed
+    {
+        if ($value === null || is_array($value)) {
+            return $this->normalizeResponseValue($value);
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $decoded = json_decode($value, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return $value;
+        }
+
+        return $this->normalizeResponseValue($decoded);
+    }
+
+    /**
+     * @param array<string,mixed> $data
+     */
+    private function toResponseObject(array $data): object
+    {
+        $value = $this->normalizeResponseValue($data);
+
+        return is_object($value) ? $value : (object) $data;
+    }
+
+    private function normalizeResponseValue(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            return array_map(fn (mixed $item): mixed => $this->normalizeResponseValue($item), $value);
+        }
+
+        $object = new \stdClass();
+        foreach ($value as $key => $child) {
+            $object->{(string) $key} = $this->normalizeResponseValue($child);
+        }
+
+        return $object;
     }
 }

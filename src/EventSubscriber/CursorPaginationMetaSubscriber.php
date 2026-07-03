@@ -25,7 +25,7 @@ final class CursorPaginationMetaSubscriber implements EventSubscriberInterface
 
         $request = $event->getRequest();
         $path = $request->getPathInfo();
-        if (!preg_match('#^/v1/contracts/[^/]+/(events|transactions|storage|argument-usages)$#', $path)) {
+        if (!preg_match('#^/v1/contracts/[^/]+/(events|transactions|storage|argument-usages|balances|holder-balances)$#', $path)) {
             return;
         }
 
