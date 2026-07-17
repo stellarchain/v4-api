@@ -20,6 +20,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         '24h' => '-24 hours',
         '7d' => '-7 days',
         '30d' => '-30 days',
+        '1y' => '-1 year',
     ];
 
     /**

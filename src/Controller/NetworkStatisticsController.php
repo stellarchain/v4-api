@@ -17,7 +17,7 @@ final class NetworkStatisticsController
     private const DEFAULT_RANGE = '7d';
     private const DEFAULT_BUCKET_MINUTES = 5;
     private const MAX_LIMIT_BUCKETS = 1440;
-    private const ALLOWED_RANGES = ['24h', '7d', '30d'];
+    private const ALLOWED_RANGES = ['24h', '7d', '30d', '1y'];
     private const ALLOWED_NETWORKS = ['mainnet', 'public', 'testnet', 'test', 'futurenet', 'future'];
 
     public function __construct(
@@ -35,7 +35,7 @@ final class NetworkStatisticsController
 
         $range = strtolower($this->queryString($request, 'range', self::DEFAULT_RANGE));
         if (!in_array($range, self::ALLOWED_RANGES, true)) {
-            return $this->error('Invalid range. Use 24h, 7d, or 30d.', Response::HTTP_BAD_REQUEST, 'invalid_range');
+            return $this->error('Invalid range. Use 24h, 7d, 30d, or 1y.', Response::HTTP_BAD_REQUEST, 'invalid_range');
         }
 
         $bucketMinutes = $this->queryPositiveInt($request, 'bucketMinutes', self::DEFAULT_BUCKET_MINUTES);

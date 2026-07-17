@@ -303,39 +303,80 @@ final class Sep55ContractVerificationService
      */
     private function parseScMetaEntries(string $payload): array
     {
-        $entries = [];
         if (strlen($payload) < 4) {
+            return [];
+        }
+
+        $entries = $this->parseSequentialScMetaEntries($payload, 0);
+        if ($entries !== []) {
             return $entries;
         }
 
         $offset = 0;
         $count = $this->readUint32Be($payload, $offset);
         if ($count === null) {
-            return $entries;
+            return [];
         }
 
+        $entries = [];
         for ($i = 0; $i < $count; $i++) {
-            $discriminant = $this->readUint32Be($payload, $offset);
-            if ($discriminant === null) {
-                break;
-            }
-            if ($discriminant !== 0) {
-                continue;
-            }
-
-            $key = $this->readXdrString($payload, $offset);
-            $value = $this->readXdrString($payload, $offset);
-            if ($key === null || $value === null) {
+            $entry = $this->readScMetaEntry($payload, $offset);
+            if ($entry === null) {
                 break;
             }
 
-            $entries[] = [
-                'key' => $key,
-                'value' => $value,
-            ];
+            $entries[] = $entry;
         }
 
         return $entries;
+    }
+
+    /**
+     * @return list<array{key:string,value:string}>
+     */
+    private function parseSequentialScMetaEntries(string $payload, int $offset): array
+    {
+        $entries = [];
+        $size = strlen($payload);
+        while ($offset < $size) {
+            if ($offset + 4 > $size) {
+                return [];
+            }
+
+            $entry = $this->readScMetaEntry($payload, $offset);
+            if ($entry === null) {
+                return $entries === [] ? [] : $entries;
+            }
+
+            $entries[] = $entry;
+        }
+
+        return $entries;
+    }
+
+    /**
+     * @return array{key:string,value:string}|null
+     */
+    private function readScMetaEntry(string $payload, int &$offset): ?array
+    {
+        $startOffset = $offset;
+        $discriminant = $this->readUint32Be($payload, $offset);
+        if ($discriminant !== 0) {
+            $offset = $startOffset;
+            return null;
+        }
+
+        $key = $this->readXdrString($payload, $offset);
+        $value = $this->readXdrString($payload, $offset);
+        if ($key === null || $value === null) {
+            $offset = $startOffset;
+            return null;
+        }
+
+        return [
+            'key' => $key,
+            'value' => $value,
+        ];
     }
 
     private function readLeb128Unsigned(string $value, int &$offset, int $limit): ?int

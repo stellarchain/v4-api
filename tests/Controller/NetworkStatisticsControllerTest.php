@@ -58,6 +58,39 @@ final class NetworkStatisticsControllerTest extends TestCase
         self::assertSame('invalid_range', json_decode((string) $response->getContent(), true)['error']['type']);
     }
 
+    public function testItAcceptsOneYearRange(): void
+    {
+        $service = new class implements NetworkStatisticsReadServiceInterface {
+            public array $calls = [];
+
+            public function read(
+                string $network,
+                string $range,
+                int $bucketMinutes,
+                ?\DateTimeImmutable $before = null,
+                int $limitBuckets = 288
+            ): array
+            {
+                $this->calls[] = [$network, $range, $bucketMinutes, $before, $limitBuckets];
+
+                return [
+                    'network' => 'mainnet',
+                    'range' => $range,
+                    'bucketMinutes' => $bucketMinutes,
+                    'coverage' => ['bucketCount' => 0],
+                    'sections' => [],
+                    'chart' => ['points' => []],
+                ];
+            }
+        };
+
+        $controller = new NetworkStatisticsController($service);
+        $response = $controller(Request::create('/v1/statistics/network?range=1y&bucketMinutes=1440&limitBuckets=366'));
+
+        self::assertSame(Response::HTTP_OK, $response->getStatusCode());
+        self::assertSame([['mainnet', '1y', 1440, null, 366]], $service->calls);
+    }
+
     public function testItRejectsInvalidNetwork(): void
     {
         $controller = new NetworkStatisticsController($this->unusedService());
