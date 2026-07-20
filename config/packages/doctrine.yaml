@@ -5,6 +5,12 @@ doctrine:
             default:
                 url: '%env(resolve:DATABASE_URL)%'
                 profiling_collect_backtrace: '%kernel.debug%'
+            statistics:
+                url: '%env(resolve:default:app.default_statistics_database_url:DATABASE_STATISTICS_URL)%'
+                profiling_collect_backtrace: '%kernel.debug%'
+            contracts:
+                url: '%env(resolve:default:app.default_contracts_database_url:DATABASE_CONTRACTS_URL)%'
+                profiling_collect_backtrace: '%kernel.debug%'
             external:
                 url: '%env(resolve:DATABASE_URL_EXTERNAL)%'
                 profiling_collect_backtrace: '%kernel.debug%'

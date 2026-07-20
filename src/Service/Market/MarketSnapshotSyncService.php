@@ -102,12 +102,12 @@ final class MarketSnapshotSyncService
                 'issuer' => $issuer,
                 'network' => $networkCode,
                 'score' => $score,
-                'price_xlm' => $this->normalizeDecimal($this->toFloat($tradeMetrics['latest_price_xlm'] ?? null), 8),
-                'price_change1h' => $this->normalizeDecimal($this->toFloat($tradeMetrics['price_change_1h'] ?? null), 4),
-                'price_change24h' => $this->normalizeDecimal($priceChange24h, 4),
+                'price_xlm' => $this->normalizeDecimal($this->toFloat($tradeMetrics['latest_price_xlm'] ?? null), 8, 18),
+                'price_change1h' => $this->normalizeDecimal($this->toFloat($tradeMetrics['price_change_1h'] ?? null), 4, 12),
+                'price_change24h' => $this->normalizeDecimal($priceChange24h, 4, 12),
                 // Keep schema stable: reuse "7d" field to carry 1d (24h) change for now.
-                'price_change7d' => $this->normalizeDecimal($priceChange24h, 4),
-                'volume_xlm24h' => $this->normalizeDecimal($volume24h, 7),
+                'price_change7d' => $this->normalizeDecimal($priceChange24h, 4, 12),
+                'volume_xlm24h' => $this->normalizeDecimal($volume24h, 7, 30),
                 'trades24h' => $trades24h,
                 'trustlines_total' => $trustlinesTotal,
                 'supply' => $supply,
@@ -709,10 +709,19 @@ SQL,
         return (int) $this->localConnection->lastInsertId();
     }
 
-    private function normalizeDecimal(?float $value, int $scale): ?string
+    private function normalizeDecimal(?float $value, int $scale, ?int $precision = null): ?string
     {
         if ($value === null || !is_finite($value)) {
             return null;
+        }
+
+        if ($precision !== null && $precision > $scale) {
+            // For DECIMAL(precision, scale), max absolute value is 10^(precision-scale)-10^(-scale).
+            $integerDigits = $precision - $scale;
+            $limit = (10 ** $integerDigits) - (10 ** (-$scale));
+            if (abs($value) > $limit) {
+                return null;
+            }
         }
 
         return number_format($value, $scale, '.', '');

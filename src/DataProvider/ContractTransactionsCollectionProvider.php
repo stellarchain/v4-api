@@ -7,11 +7,12 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
-use App\Entity\ContractTransaction;
+use App\Service\ContractTransparency\ContractTransparencyCursor;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
-use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\HttpFoundation\RequestStack;
 
@@ -22,11 +23,11 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
     private const MAX_ITEMS_PER_PAGE = 200;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
-        private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
+        private readonly ContractTransparencyCursor $cursorCodec,
     ) {
     }
 
@@ -57,15 +58,23 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
             $itemsPerPage = self::MAX_ITEMS_PER_PAGE;
         }
         $offset = ($page - 1) * $itemsPerPage;
-        $beforeId = $this->normalizePositiveInt($request?->query->get('beforeId', $filters['beforeId'] ?? $filters['before_id'] ?? null));
+        $cursor = $request?->query->get('cursor', $filters['cursor'] ?? null);
+        $beforeId = $this->normalizePositiveInt($request?->query->get('beforeId', $filters['beforeId'] ?? $filters['before_id'] ?? null))
+            ?? $this->cursorCodec->decodeId($cursor);
+        $ledgerStart = $this->normalizePositiveInt($request?->query->get('ledgerStart', $filters['ledgerStart'] ?? $filters['ledger_start'] ?? $filters['startLedger'] ?? null));
+        $ledgerEnd = $this->normalizePositiveInt($request?->query->get('ledgerEnd', $filters['ledgerEnd'] ?? $filters['ledger_end'] ?? $filters['endLedger'] ?? null));
+        if ($ledgerStart !== null && $ledgerEnd !== null && $ledgerStart > $ledgerEnd) {
+            [$ledgerStart, $ledgerEnd] = [$ledgerEnd, $ledgerStart];
+        }
         $invocationsOnly = $this->parseNullableBool($request?->query->get('invocationsOnly', $filters['invocationsOnly'] ?? $filters['invocations_only'] ?? null)) === true;
         $limitForFetch = $itemsPerPage + 1;
 
         $contractDbId = $this->connection->fetchOne(
-            'SELECT id
-             FROM contracts
-             WHERE contract_id = :contract_id
-               AND network = :network
+            'SELECT c.id
+             FROM contracts c
+             WHERE c.contract_id = :contract_id
+               AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,
@@ -83,6 +92,16 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         $params = ['contract_id' => (int) $contractDbId, 'limit' => $limitForFetch];
         $types = ['contract_id' => ParameterType::INTEGER, 'limit' => ParameterType::INTEGER];
 
+        if ($ledgerStart !== null) {
+            $whereSql .= ' AND ct.ledger >= :ledger_start';
+            $params['ledger_start'] = $ledgerStart;
+            $types['ledger_start'] = ParameterType::INTEGER;
+        }
+        if ($ledgerEnd !== null) {
+            $whereSql .= ' AND ct.ledger <= :ledger_end';
+            $params['ledger_end'] = $ledgerEnd;
+            $types['ledger_end'] = ParameterType::INTEGER;
+        }
         if ($beforeId !== null) {
             $whereSql .= ' AND ct.id < :before_id';
             $params['before_id'] = $beforeId;
@@ -114,7 +133,12 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
             $request?->attributes->set('_cursor_meta', [
                 'page' => $page,
                 'itemsPerPage' => $itemsPerPage,
+                'limit' => $itemsPerPage,
+                'cursor' => is_string($cursor) && trim($cursor) !== '' ? trim($cursor) : null,
                 'beforeId' => $beforeId,
+                'ledgerStart' => $ledgerStart,
+                'ledgerEnd' => $ledgerEnd,
+                'nextCursor' => null,
                 'nextBeforeId' => null,
                 'hasMore' => false,
                 'mode' => $beforeId !== null ? 'keyset' : 'offset',
@@ -130,22 +154,43 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         $nextBeforeId = $txIds !== [] ? end($txIds) : null;
         $nextBeforeId = is_int($nextBeforeId) ? $nextBeforeId : null;
 
+        $rows = $this->connection->fetchAllAssociative(
+            'SELECT
+                id,
+                tx_hash,
+                source_account,
+                host_functions,
+                fee_charged,
+                max_fee,
+                ledger,
+                total_operations,
+                created_at,
+                envelope_decoded,
+                meta_decoded,
+                return_value_decoded,
+                resource_fee_charged
+             FROM contract_transactions
+             WHERE id IN (:ids)
+             ORDER BY id DESC',
+            ['ids' => $txIds],
+            ['ids' => ArrayParameterType::INTEGER]
+        );
+
         $request?->attributes->set('_cursor_meta', [
             'page' => $page,
             'itemsPerPage' => $itemsPerPage,
+            'limit' => $itemsPerPage,
+            'cursor' => is_string($cursor) && trim($cursor) !== '' ? trim($cursor) : null,
             'beforeId' => $beforeId,
+            'ledgerStart' => $ledgerStart,
+            'ledgerEnd' => $ledgerEnd,
+            'nextCursor' => $hasMore && $nextBeforeId !== null ? $this->cursorCodec->encodeId($nextBeforeId) : null,
             'nextBeforeId' => $hasMore ? $nextBeforeId : null,
             'hasMore' => $hasMore,
             'mode' => $beforeId !== null ? 'keyset' : 'offset',
         ]);
 
-        return $this->entityManager->getRepository(ContractTransaction::class)
-            ->createQueryBuilder('ct')
-            ->andWhere('ct.id IN (:ids)')
-            ->setParameter('ids', $txIds)
-            ->orderBy('ct.id', 'DESC')
-            ->getQuery()
-            ->getResult();
+        return array_map(fn (array $row): array => $this->formatRow($row), $rows);
     }
 
     private function normalizePositiveInt(mixed $value): ?int
@@ -175,5 +220,72 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
             '0', 'false', 'no', 'off' => false,
             default => null,
         };
+    }
+
+    private function normalizeNullableString(mixed $value): ?string
+    {
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $trimmed = trim($value);
+
+        return $trimmed !== '' ? $trimmed : null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     * @return array<string,mixed>
+     */
+    private function formatRow(array $row): array
+    {
+        return [
+            'id' => isset($row['id']) ? (int) $row['id'] : null,
+            'txHash' => $this->normalizeNullableString($row['tx_hash'] ?? null),
+            'sourceAccount' => $this->normalizeNullableString($row['source_account'] ?? null),
+            'hostFunctions' => $this->decodeJsonValue($row['host_functions'] ?? null),
+            'feeCharged' => isset($row['fee_charged']) ? (int) $row['fee_charged'] : 0,
+            'maxFee' => isset($row['max_fee']) ? (int) $row['max_fee'] : 0,
+            'ledger' => isset($row['ledger']) ? (int) $row['ledger'] : null,
+            'totalOperations' => isset($row['total_operations']) ? (int) $row['total_operations'] : null,
+            'createdAt' => $this->toAtom($row['created_at'] ?? null),
+            'envelopeDecoded' => $this->decodeJsonValue($row['envelope_decoded'] ?? null),
+            'metaDecoded' => $this->decodeJsonValue($row['meta_decoded'] ?? null),
+            'returnValueDecoded' => $this->decodeJsonValue($row['return_value_decoded'] ?? null),
+            'resourceFeeCharged' => isset($row['resource_fee_charged']) ? (int) $row['resource_fee_charged'] : null,
+        ];
+    }
+
+    private function toAtom(mixed $value): ?string
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format(\DateTimeInterface::ATOM);
+        }
+        if (!is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return (new \DateTimeImmutable($value))->format(\DateTimeInterface::ATOM);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function decodeJsonValue(mixed $value): mixed
+    {
+        if ($value === null || is_array($value)) {
+            return $value;
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+
+        $decoded = json_decode($value, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return $value;
+        }
+
+        return $decoded;
     }
 }

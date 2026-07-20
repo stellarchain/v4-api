@@ -9,12 +9,14 @@ use ApiPlatform\Metadata\GetCollection;
 use ApiPlatform\Metadata\Link;
 use ApiPlatform\OpenApi\Model\Operation as OpenApiOperation;
 use ApiPlatform\OpenApi\Model\Parameter as OpenApiParameter;
+use App\DataProvider\ContractStorageEntriesCollectionProvider;
 use Doctrine\ORM\Mapping as ORM;
 
 #[ApiResource(
     operations: [
         new GetCollection(
             uriTemplate: '/contracts/{contractId}/storage',
+            provider: ContractStorageEntriesCollectionProvider::class,
             uriVariables: [
                 'contractId' => new Link(fromClass: Contract::class, toProperty: 'contract'),
             ],
@@ -29,9 +31,37 @@ use Doctrine\ORM\Mapping as ORM;
                         required: false,
                         schema: ['type' => 'string', 'enum' => ['mainnet', 'testnet', 'futurenet']]
                     ),
+                    new OpenApiParameter(
+                        name: 'cursor',
+                        in: 'query',
+                        description: 'Opaque cursor returned in meta.nextCursor.',
+                        required: false,
+                        schema: ['type' => 'string']
+                    ),
+                    new OpenApiParameter(
+                        name: 'beforeId',
+                        in: 'query',
+                        description: 'Keyset cursor: return storage rows with id < beforeId.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
+                    new OpenApiParameter(
+                        name: 'ledgerStart',
+                        in: 'query',
+                        description: 'Inclusive minimum last_modified_ledger_seq filter.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
+                    new OpenApiParameter(
+                        name: 'ledgerEnd',
+                        in: 'query',
+                        description: 'Inclusive maximum last_modified_ledger_seq filter.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
                 ]
             ),
-            paginationEnabled: true
+            paginationEnabled: false
         ),
     ]
 )]
@@ -162,4 +192,3 @@ class ContractStorageEntry
         return $this;
     }
 }
-

@@ -83,6 +83,7 @@ final class SorobanRpcService
      *     contractId?:string,
      *     latestLedger?:int,
      *     startLedger?:int,
+     *     endLedger?:int,
      *     events?:array<int,array<string,mixed>>,
      *     storageEntries?:array<int,array<string,mixed>>,
      *     transactions?:array<int,array<string,mixed>>,

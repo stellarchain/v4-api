@@ -4,15 +4,17 @@ declare(strict_types=1);
 
 namespace App\Repository;
 
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class ContractBalanceReadRepository
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
     ) {
     }
@@ -27,17 +29,18 @@ final class ContractBalanceReadRepository
             return [];
         }
 
+        $amountCastType = $this->amountCastType();
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT
-                holder_address AS address,
-                CAST(balance_raw AS CHAR) AS balance_raw,
-                CAST(inflow_raw AS CHAR) AS inflow_raw,
-                CAST(outflow_raw AS CHAR) AS outflow_raw
-             FROM contract_holder_balances
-             WHERE contract_id = :contract_id
-               AND network = :network
-             ORDER BY balance_raw DESC, holder_address ASC
-             LIMIT :limit_rows OFFSET :offset_rows',
+            sprintf('SELECT
+                chb.holder_address AS address,
+                CAST(chb.balance_raw AS %1$s) AS balance_raw,
+                CAST(chb.inflow_raw AS %1$s) AS inflow_raw,
+                CAST(chb.outflow_raw AS %1$s) AS outflow_raw
+             FROM contract_holder_balances chb
+             WHERE chb.contract_id = :contract_id
+               AND chb.network = :network
+             ORDER BY chb.balance_raw DESC, chb.holder_address ASC
+             LIMIT :limit_rows OFFSET :offset_rows', $amountCastType),
             [
                 'contract_id' => $contractDbId,
                 'network' => $networkCode,
@@ -60,21 +63,74 @@ final class ContractBalanceReadRepository
     }
 
     /**
+     * @return array{holders_count:int,indexed_balance_raw:string,inflow_raw:string,outflow_raw:string}
+     */
+    public function findContractBalanceSummary(string $contractId, int $networkCode): array
+    {
+        $contractDbId = $this->resolveContractDbId($contractId, $networkCode);
+        if ($contractDbId === null) {
+            return [
+                'holders_count' => 0,
+                'indexed_balance_raw' => '0',
+                'inflow_raw' => '0',
+                'outflow_raw' => '0',
+            ];
+        }
+
+        $amountCastType = $this->amountCastType();
+        $row = $this->connection->fetchAssociative(
+            sprintf('SELECT
+                COUNT(*) AS holders_count,
+                CAST(COALESCE(SUM(chb.balance_raw), 0) AS %1$s) AS indexed_balance_raw,
+                CAST(COALESCE(SUM(chb.inflow_raw), 0) AS %1$s) AS inflow_raw,
+                CAST(COALESCE(SUM(chb.outflow_raw), 0) AS %1$s) AS outflow_raw
+             FROM contract_holder_balances chb
+             WHERE chb.contract_id = :contract_id
+               AND chb.network = :network', $amountCastType),
+            [
+                'contract_id' => $contractDbId,
+                'network' => $networkCode,
+            ],
+            [
+                'contract_id' => ParameterType::INTEGER,
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+
+        if (!is_array($row)) {
+            return [
+                'holders_count' => 0,
+                'indexed_balance_raw' => '0',
+                'inflow_raw' => '0',
+                'outflow_raw' => '0',
+            ];
+        }
+
+        return [
+            'holders_count' => isset($row['holders_count']) ? (int) $row['holders_count'] : 0,
+            'indexed_balance_raw' => (string) ($row['indexed_balance_raw'] ?? '0'),
+            'inflow_raw' => (string) ($row['inflow_raw'] ?? '0'),
+            'outflow_raw' => (string) ($row['outflow_raw'] ?? '0'),
+        ];
+    }
+
+    /**
      * @return list<array{related_contract_id:string,balance_raw:string,inflow_raw:string,outflow_raw:string}>
      */
     public function findHolderBalancesAcrossContracts(string $holderAddress, int $networkCode, int $limit, int $offset = 0): array
     {
+        $amountCastType = $this->amountCastType();
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT
+            sprintf('SELECT
                 chb.contract_id,
-                CAST(chb.balance_raw AS CHAR) AS balance_raw,
-                CAST(chb.inflow_raw AS CHAR) AS inflow_raw,
-                CAST(chb.outflow_raw AS CHAR) AS outflow_raw
+                CAST(chb.balance_raw AS %1$s) AS balance_raw,
+                CAST(chb.inflow_raw AS %1$s) AS inflow_raw,
+                CAST(chb.outflow_raw AS %1$s) AS outflow_raw
              FROM contract_holder_balances chb
              WHERE chb.holder_address = :holder_address
                AND chb.network = :network
              ORDER BY ABS(chb.balance_raw) DESC, chb.contract_id ASC
-             LIMIT :limit_rows OFFSET :offset_rows',
+             LIMIT :limit_rows OFFSET :offset_rows', $amountCastType),
             [
                 'holder_address' => $holderAddress,
                 'network' => $networkCode,
@@ -98,10 +154,11 @@ final class ContractBalanceReadRepository
     private function resolveContractDbId(string $contractId, int $networkCode): ?int
     {
         $rowId = $this->connection->fetchOne(
-            'SELECT id
-             FROM contracts
-             WHERE contract_id = :contract_id
-               AND network = :network
+            'SELECT c.id
+             FROM contracts c
+             WHERE c.contract_id = :contract_id
+               AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'contract_id' => $contractId,
@@ -122,6 +179,11 @@ final class ContractBalanceReadRepository
         }
 
         return $normalizedId;
+    }
+
+    private function amountCastType(): string
+    {
+        return $this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform ? 'TEXT' : 'CHAR';
     }
 
     /**
@@ -177,9 +239,10 @@ final class ContractBalanceReadRepository
         }
 
         $rows = $this->connection->fetchAllAssociative(
-            'SELECT id, contract_id
-             FROM contracts
-             WHERE id IN (:ids)',
+            'SELECT c.id, c.contract_id
+             FROM contracts c
+             WHERE c.id IN (:ids)
+               AND '.ContractVisibilitySql::confirmedPredicate('c'),
             ['ids' => $contractDbIds],
             ['ids' => ArrayParameterType::INTEGER]
         );

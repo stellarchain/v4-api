@@ -4,13 +4,13 @@ namespace App\Command\Soroban;
 
 use App\Command\Support\NetworkOptionTrait;
 use App\Dto\ContractRef;
-use App\Entity\Contract;
-use App\Repository\ContractRepository;
 use App\Service\ContractTxSyncService;
 use App\Service\Console\SorobanSyncProgressReporter;
 use App\Service\Stellar\Soroban\SorobanContractInspector;
 use App\Service\Stellar\StellarNetworkResolver;
-use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Soneso\StellarSDK\Crypto\StrKey;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
@@ -18,6 +18,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 #[AsCommand(
     name: 'app:soroban:sync-contract-data',
@@ -28,8 +29,8 @@ final class SyncSorobanContractCommand extends Command
     use NetworkOptionTrait;
 
     public function __construct(
-        private readonly ContractRepository $contractRepository,
-        private readonly EntityManagerInterface $entityManager,
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
+        private readonly Connection $connection,
         private readonly ContractTxSyncService $txSyncService,
         private readonly SorobanSyncProgressReporter $syncProgressReporter,
         private readonly SorobanContractInspector $sorobanContractInspector,
@@ -99,11 +100,24 @@ final class SyncSorobanContractCommand extends Command
 
     private function loadContract(int $networkCode, string $network, string $singleContract, bool $dryRun): ?ContractRef
     {
-        $existing = $this->contractRepository->findOneByContractIdAndNetwork($singleContract, $networkCode);
-        if ($existing instanceof Contract) {
+        $existing = $this->connection->fetchAssociative(
+            'SELECT id, contract_id
+             FROM contracts
+             WHERE contract_id = :contract_id
+               AND network = :network
+             LIMIT 1',
+            [
+                'contract_id' => $singleContract,
+                'network' => $networkCode,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+        if (is_array($existing)) {
             return new ContractRef(
-                (int) $existing->getId(),
-                (string) $existing->getContractId(),
+                (int) $existing['id'],
+                (string) $existing['contract_id'],
             );
         }
 
@@ -120,20 +134,52 @@ final class SyncSorobanContractCommand extends Command
             return new ContractRef(0, $contractId);
         }
 
-        $contract = (new Contract())
-            ->setContractId($contractId)
-            ->setNetwork($networkCode)
-            ->setCreatedAt(new \DateTimeImmutable());
-
         $decoded = $this->decodeContractIdHexOrNull($contractId);
-        if ($decoded !== null) {
-            $contract->setContractIdHex($decoded);
+        $createdAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+
+        $this->connection->executeStatement(
+            $this->buildInsertContractIgnoreSql(),
+            [
+                'contract_id' => $contractId,
+                'contract_id_hex' => $decoded,
+                'network' => $networkCode,
+                'created_at' => $createdAt,
+            ],
+            [
+                'contract_id_hex' => $decoded !== null ? ParameterType::STRING : ParameterType::NULL,
+                'network' => ParameterType::INTEGER,
+                'created_at' => ParameterType::STRING,
+            ]
+        );
+
+        $id = $this->connection->fetchOne(
+            'SELECT id FROM contracts WHERE contract_id = :contract_id AND network = :network LIMIT 1',
+            [
+                'contract_id' => $contractId,
+                'network' => $networkCode,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+            ]
+        );
+        if ($id === false || (int) $id <= 0) {
+            throw new \RuntimeException(sprintf('Unable to create or load contract %s.', $contractId));
         }
 
-        $this->entityManager->persist($contract);
-        $this->entityManager->flush();
+        return new ContractRef((int) $id, $contractId);
+    }
 
-        return new ContractRef((int) $contract->getId(), $contractId);
+    private function buildInsertContractIgnoreSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                    VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                    ON CONFLICT (contract_id, network) DO NOTHING';
+        }
+
+        return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                ON DUPLICATE KEY UPDATE contract_id = contract_id';
     }
 
     private function normalizeNullableString(mixed $value): ?string
@@ -168,6 +214,11 @@ final class SyncSorobanContractCommand extends Command
             $io->error('Option --contract is required for this command.');
             return null;
         }
+        $normalizedContractId = $this->sorobanContractInspector->normalizeContractId($contractIdInput);
+        if (!is_string($normalizedContractId) || $normalizedContractId === '') {
+            $io->error('Option --contract must be a valid Soroban contract id.');
+            return null;
+        }
 
         $startLedgerOption = $input->getOption('start-ledger');
         $endLedgerOption = $input->getOption('end-ledger');
@@ -191,7 +242,7 @@ final class SyncSorobanContractCommand extends Command
         return [
             'network' => $network,
             'networkCode' => $networkCode,
-            'contractIdInput' => $contractIdInput,
+            'contractIdInput' => $normalizedContractId,
             'startLedger' => $startLedger,
             'endLedger' => $endLedger,
             'dryRun' => (bool) $input->getOption('dry-run'),

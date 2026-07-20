@@ -53,9 +53,12 @@ final class AccountRankPositionOrderExtension implements QueryCollectionExtensio
                 'CASE WHEN %1$s.rankPosition IS NULL THEN 1 ELSE 0 END AS HIDDEN rankPositionEmptyOrder',
                 $metricAlias
             ))
+            ->addSelect(sprintf(
+                'IDENTITY(%1$s.account) AS HIDDEN rankPositionAccountOrder',
+                $metricAlias
+            ))
             ->addOrderBy('rankPositionEmptyOrder', 'ASC')
             ->addOrderBy($metricAlias . '.rankPosition', 'ASC')
-            ->addOrderBy($rootAlias . '.id', 'ASC');
+            ->addOrderBy('rankPositionAccountOrder', 'ASC');
     }
 }
-

@@ -6,12 +6,13 @@ use App\Service\Stellar\Soroban\SorobanContractInspector;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class ContractTxUpsertService
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly SorobanContractInspector $sorobanContractInspector,
     ) {
@@ -149,19 +150,7 @@ final class ContractTxUpsertService
             ];
 
             $this->connection->executeStatement(
-                'INSERT INTO contract_events
-                (contract_id, tx_hash, event_idx, ledger, ledger_closed_at, event_type, topic_decoded, value_decoded, addresses, amount_raw, created_at)
-                VALUES
-                (:contract_id, :tx_hash, :event_idx, :ledger, :ledger_closed_at, :event_type, :topic_decoded, :value_decoded, :addresses, :amount_raw, :created_at)
-                ON DUPLICATE KEY UPDATE
-                    ledger = VALUES(ledger),
-                    ledger_closed_at = VALUES(ledger_closed_at),
-                    event_type = VALUES(event_type),
-                    topic_decoded = VALUES(topic_decoded),
-                    value_decoded = VALUES(value_decoded),
-                    addresses = VALUES(addresses),
-                    amount_raw = VALUES(amount_raw),
-                    created_at = VALUES(created_at)',
+                $this->buildEventUpsertSql(),
                 [
                     'contract_id' => $contractId,
                     'tx_hash' => $txHash,
@@ -179,11 +168,47 @@ final class ContractTxUpsertService
                     'contract_id' => ParameterType::INTEGER,
                     'event_idx' => ParameterType::INTEGER,
                     'ledger' => $rowPayload['ledger'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                    'topic_decoded' => $rowPayload['topic_decoded'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                    'value_decoded' => $rowPayload['value_decoded'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                    'addresses' => $rowPayload['addresses'] !== null ? ParameterType::STRING : ParameterType::NULL,
                 ]
             );
         }
 
         $this->refreshContractHolderBalances($contractId);
+    }
+
+    private function buildEventUpsertSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contract_events
+                (contract_id, tx_hash, event_idx, ledger, ledger_closed_at, event_type, topic_decoded, value_decoded, addresses, amount_raw, created_at)
+                VALUES
+                (:contract_id, :tx_hash, :event_idx, :ledger, :ledger_closed_at, :event_type, CAST(:topic_decoded AS JSONB), CAST(:value_decoded AS JSONB), CAST(:addresses AS JSONB), :amount_raw, :created_at)
+                ON CONFLICT (contract_id, tx_hash, event_idx) DO UPDATE SET
+                    ledger = EXCLUDED.ledger,
+                    ledger_closed_at = EXCLUDED.ledger_closed_at,
+                    event_type = EXCLUDED.event_type,
+                    topic_decoded = EXCLUDED.topic_decoded,
+                    value_decoded = EXCLUDED.value_decoded,
+                    addresses = EXCLUDED.addresses,
+                    amount_raw = EXCLUDED.amount_raw,
+                    created_at = EXCLUDED.created_at';
+        }
+
+        return 'INSERT INTO contract_events
+            (contract_id, tx_hash, event_idx, ledger, ledger_closed_at, event_type, topic_decoded, value_decoded, addresses, amount_raw, created_at)
+            VALUES
+            (:contract_id, :tx_hash, :event_idx, :ledger, :ledger_closed_at, :event_type, :topic_decoded, :value_decoded, :addresses, :amount_raw, :created_at)
+            ON DUPLICATE KEY UPDATE
+                ledger = VALUES(ledger),
+                ledger_closed_at = VALUES(ledger_closed_at),
+                event_type = VALUES(event_type),
+                topic_decoded = VALUES(topic_decoded),
+                value_decoded = VALUES(value_decoded),
+                addresses = VALUES(addresses),
+                amount_raw = VALUES(amount_raw),
+                created_at = VALUES(created_at)';
     }
 
     public function rebuildArgumentUsageIndexForContract(int $contractId, int $batchSize = 2000): void
@@ -272,15 +297,7 @@ final class ContractTxUpsertService
 
             $existing = $existingByKey[$storageKey] ?? null;
             if (!is_array($existing)) {
-                $this->connection->insert('contract_storage_entries', [
-                    'contract_id' => $contractId,
-                    'storage_key' => $storageKey,
-                    ...$rowPayload,
-                ], [
-                    'contract_id' => ParameterType::INTEGER,
-                    'last_modified_ledger_seq' => $rowPayload['last_modified_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
-                    'live_until_ledger_seq' => $rowPayload['live_until_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
-                ]);
+                $this->insertStorageEntry($contractId, $storageKey, $rowPayload);
                 continue;
             }
 
@@ -288,17 +305,100 @@ final class ContractTxUpsertService
                 continue;
             }
 
-            $this->connection->update(
-                'contract_storage_entries',
-                $rowPayload,
-                ['id' => (int) $existing['id']],
+            $this->updateStorageEntry((int) $existing['id'], $rowPayload);
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $rowPayload
+     */
+    private function insertStorageEntry(int $contractId, string $storageKey, array $rowPayload): void
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            $this->connection->executeStatement(
+                'INSERT INTO contract_storage_entries (
+                    contract_id,
+                    storage_key,
+                    entry_xdr,
+                    entry_decoded,
+                    last_modified_ledger_seq,
+                    live_until_ledger_seq,
+                    updated_at
+                ) VALUES (
+                    :contract_id,
+                    :storage_key,
+                    :entry_xdr,
+                    CAST(:entry_decoded AS JSONB),
+                    :last_modified_ledger_seq,
+                    :live_until_ledger_seq,
+                    :updated_at
+                )',
                 [
+                    'contract_id' => $contractId,
+                    'storage_key' => $storageKey,
+                    ...$rowPayload,
+                ],
+                [
+                    'contract_id' => ParameterType::INTEGER,
+                    'entry_decoded' => $rowPayload['entry_decoded'] !== null ? ParameterType::STRING : ParameterType::NULL,
+                    'last_modified_ledger_seq' => $rowPayload['last_modified_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                    'live_until_ledger_seq' => $rowPayload['live_until_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                ]
+            );
+
+            return;
+        }
+
+        $this->connection->insert('contract_storage_entries', [
+            'contract_id' => $contractId,
+            'storage_key' => $storageKey,
+            ...$rowPayload,
+        ], [
+            'contract_id' => ParameterType::INTEGER,
+            'last_modified_ledger_seq' => $rowPayload['last_modified_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+            'live_until_ledger_seq' => $rowPayload['live_until_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+        ]);
+    }
+
+    /**
+     * @param array<string,mixed> $rowPayload
+     */
+    private function updateStorageEntry(int $rowId, array $rowPayload): void
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            $this->connection->executeStatement(
+                'UPDATE contract_storage_entries
+                 SET entry_xdr = :entry_xdr,
+                     entry_decoded = CAST(:entry_decoded AS JSONB),
+                     last_modified_ledger_seq = :last_modified_ledger_seq,
+                     live_until_ledger_seq = :live_until_ledger_seq,
+                     updated_at = :updated_at
+                 WHERE id = :id',
+                [
+                    ...$rowPayload,
+                    'id' => $rowId,
+                ],
+                [
+                    'entry_decoded' => $rowPayload['entry_decoded'] !== null ? ParameterType::STRING : ParameterType::NULL,
                     'last_modified_ledger_seq' => $rowPayload['last_modified_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
                     'live_until_ledger_seq' => $rowPayload['live_until_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
                     'id' => ParameterType::INTEGER,
                 ]
             );
+
+            return;
         }
+
+        $this->connection->update(
+            'contract_storage_entries',
+            $rowPayload,
+            ['id' => $rowId],
+            [
+                'last_modified_ledger_seq' => $rowPayload['last_modified_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                'live_until_ledger_seq' => $rowPayload['live_until_ledger_seq'] !== null ? ParameterType::INTEGER : ParameterType::NULL,
+                'id' => ParameterType::INTEGER,
+            ]
+        );
     }
 
     /**
@@ -470,7 +570,74 @@ final class ContractTxUpsertService
                         $paths = array_values(array_unique($paths));
                         $matchedPathsJson = json_encode($paths, JSON_UNESCAPED_SLASHES);
                         $this->connection->executeStatement(
-                            'INSERT INTO contract_argument_usages (
+                            $this->buildArgumentUsageInsertSql(),
+                            [
+                                'contract_transaction_id' => $contractTxId,
+                                'target_contract_id' => $contractId,
+                                'target_contract_address' => $targetContractAddress,
+                                'referenced_contract_id' => $referencedContractId,
+                                'network' => $networkCode,
+                                'tx_hash' => (string) ($row['tx_hash'] ?? ''),
+                                'source_account' => $this->normalizeNullableString($row['source_account'] ?? null),
+                                'ledger' => isset($row['ledger']) ? (int) $row['ledger'] : null,
+                                'function_name' => $functionName,
+                                'matched_paths' => is_string($matchedPathsJson) ? $matchedPathsJson : '[]',
+                                'matches_count' => count($paths),
+                                'created_at' => $this->normalizeDateTime($row['created_at'] ?? null),
+                                'updated_at' => $now,
+                            ],
+                            [
+                                'contract_transaction_id' => ParameterType::INTEGER,
+                                'target_contract_id' => ParameterType::INTEGER,
+                                'network' => ParameterType::INTEGER,
+                                'ledger' => isset($row['ledger']) ? ParameterType::INTEGER : ParameterType::NULL,
+                                'matched_paths' => ParameterType::STRING,
+                                'matches_count' => ParameterType::INTEGER,
+                            ]
+                        );
+                    }
+                }
+            }
+        } catch (\Throwable) {
+            // Derived index is best-effort and must not block core tx ingestion.
+        }
+    }
+
+    private function buildArgumentUsageInsertSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contract_argument_usages (
+                                contract_transaction_id,
+                                target_contract_id,
+                                target_contract_address,
+                                referenced_contract_id,
+                                network,
+                                tx_hash,
+                                source_account,
+                                ledger,
+                                function_name,
+                                matched_paths,
+                                matches_count,
+                                created_at,
+                                updated_at
+                            ) VALUES (
+                                :contract_transaction_id,
+                                :target_contract_id,
+                                :target_contract_address,
+                                :referenced_contract_id,
+                                :network,
+                                :tx_hash,
+                                :source_account,
+                                :ledger,
+                                :function_name,
+                                CAST(:matched_paths AS JSONB),
+                                :matches_count,
+                                :created_at,
+                                :updated_at
+                            )';
+        }
+
+        return 'INSERT INTO contract_argument_usages (
                                 contract_transaction_id,
                                 target_contract_id,
                                 target_contract_address,
@@ -498,36 +665,7 @@ final class ContractTxUpsertService
                                 :matches_count,
                                 :created_at,
                                 :updated_at
-                            )',
-                            [
-                                'contract_transaction_id' => $contractTxId,
-                                'target_contract_id' => $contractId,
-                                'target_contract_address' => $targetContractAddress,
-                                'referenced_contract_id' => $referencedContractId,
-                                'network' => $networkCode,
-                                'tx_hash' => (string) ($row['tx_hash'] ?? ''),
-                                'source_account' => $this->normalizeNullableString($row['source_account'] ?? null),
-                                'ledger' => isset($row['ledger']) ? (int) $row['ledger'] : null,
-                                'function_name' => $functionName,
-                                'matched_paths' => is_string($matchedPathsJson) ? $matchedPathsJson : '[]',
-                                'matches_count' => count($paths),
-                                'created_at' => $this->normalizeDateTime($row['created_at'] ?? null),
-                                'updated_at' => $now,
-                            ],
-                            [
-                                'contract_transaction_id' => ParameterType::INTEGER,
-                                'target_contract_id' => ParameterType::INTEGER,
-                                'network' => ParameterType::INTEGER,
-                                'ledger' => isset($row['ledger']) ? ParameterType::INTEGER : ParameterType::NULL,
-                                'matches_count' => ParameterType::INTEGER,
-                            ]
-                        );
-                    }
-                }
-            }
-        } catch (\Throwable) {
-            // Derived index is best-effort and must not block core tx ingestion.
-        }
+                            )';
     }
 
     private function refreshContractHolderBalances(int $contractId): void
@@ -551,7 +689,72 @@ final class ContractTxUpsertService
 
             $now = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
             $rows = $this->connection->fetchAllAssociative(
-                <<<'SQL'
+                $this->buildHolderBalancesSql(),
+                ['contract_id' => $contractId],
+                ['contract_id' => ParameterType::INTEGER]
+            );
+
+            foreach ($rows as $row) {
+                $holder = $this->normalizeNullableString($row['holder_address'] ?? null);
+                if ($holder === null) {
+                    continue;
+                }
+
+                $this->connection->insert('contract_holder_balances', [
+                    'contract_id' => $contractId,
+                    'network' => $networkCode,
+                    'holder_address' => $holder,
+                    'balance_raw' => (string) ($row['balance_raw'] ?? '0'),
+                    'inflow_raw' => (string) ($row['inflow_raw'] ?? '0'),
+                    'outflow_raw' => (string) ($row['outflow_raw'] ?? '0'),
+                    'updated_at' => $now,
+                ], [
+                    'contract_id' => ParameterType::INTEGER,
+                    'network' => ParameterType::INTEGER,
+                    'updated_at' => ParameterType::STRING,
+                ]);
+            }
+        } catch (\Throwable) {
+            // Derived index is best-effort and must not block core events ingestion.
+        }
+    }
+
+    private function buildHolderBalancesSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return <<<'SQL'
+SELECT
+  t.address AS holder_address,
+  CAST(SUM(t.delta_amount) AS TEXT) AS balance_raw,
+  CAST(SUM(CASE WHEN t.delta_amount > 0 THEN t.delta_amount ELSE 0 END) AS TEXT) AS inflow_raw,
+  CAST(ABS(SUM(CASE WHEN t.delta_amount < 0 THEN t.delta_amount ELSE 0 END)) AS TEXT) AS outflow_raw
+FROM (
+  SELECT ce.addresses->>0 AS address, -CAST(ce.amount_raw AS NUMERIC(65, 0)) AS delta_amount
+  FROM contract_events ce
+  WHERE ce.contract_id = :contract_id AND ce.event_type = 'transfer' AND ce.amount_raw IS NOT NULL AND ce.amount_raw ~ '^-?[0-9]+$'
+    AND ce.addresses->>0 IS NOT NULL AND ce.addresses->>0 <> ''
+  UNION ALL
+  SELECT ce.addresses->>1 AS address, CAST(ce.amount_raw AS NUMERIC(65, 0)) AS delta_amount
+  FROM contract_events ce
+  WHERE ce.contract_id = :contract_id AND ce.event_type = 'transfer' AND ce.amount_raw IS NOT NULL AND ce.amount_raw ~ '^-?[0-9]+$'
+    AND ce.addresses->>1 IS NOT NULL AND ce.addresses->>1 <> ''
+  UNION ALL
+  SELECT ce.addresses->>0 AS address, CAST(ce.amount_raw AS NUMERIC(65, 0)) AS delta_amount
+  FROM contract_events ce
+  WHERE ce.contract_id = :contract_id AND ce.event_type = 'mint' AND ce.amount_raw IS NOT NULL AND ce.amount_raw ~ '^-?[0-9]+$'
+    AND ce.addresses->>0 IS NOT NULL AND ce.addresses->>0 <> ''
+  UNION ALL
+  SELECT ce.addresses->>0 AS address, -CAST(ce.amount_raw AS NUMERIC(65, 0)) AS delta_amount
+  FROM contract_events ce
+  WHERE ce.contract_id = :contract_id AND ce.event_type = 'burn' AND ce.amount_raw IS NOT NULL AND ce.amount_raw ~ '^-?[0-9]+$'
+    AND ce.addresses->>0 IS NOT NULL AND ce.addresses->>0 <> ''
+) t
+GROUP BY t.address
+HAVING SUM(t.delta_amount) <> 0
+SQL;
+        }
+
+        return <<<'SQL'
 SELECT
   t.address AS holder_address,
   CAST(SUM(t.delta_amount) AS CHAR) AS balance_raw,
@@ -580,34 +783,7 @@ FROM (
 ) t
 GROUP BY t.address
 HAVING SUM(t.delta_amount) <> 0
-SQL,
-                ['contract_id' => $contractId],
-                ['contract_id' => ParameterType::INTEGER]
-            );
-
-            foreach ($rows as $row) {
-                $holder = $this->normalizeNullableString($row['holder_address'] ?? null);
-                if ($holder === null) {
-                    continue;
-                }
-
-                $this->connection->insert('contract_holder_balances', [
-                    'contract_id' => $contractId,
-                    'network' => $networkCode,
-                    'holder_address' => $holder,
-                    'balance_raw' => (string) ($row['balance_raw'] ?? '0'),
-                    'inflow_raw' => (string) ($row['inflow_raw'] ?? '0'),
-                    'outflow_raw' => (string) ($row['outflow_raw'] ?? '0'),
-                    'updated_at' => $now,
-                ], [
-                    'contract_id' => ParameterType::INTEGER,
-                    'network' => ParameterType::INTEGER,
-                    'updated_at' => ParameterType::STRING,
-                ]);
-            }
-        } catch (\Throwable) {
-            // Derived index is best-effort and must not block core events ingestion.
-        }
+SQL;
     }
 
     /**

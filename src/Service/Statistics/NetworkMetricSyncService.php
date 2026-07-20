@@ -7,14 +7,16 @@ namespace App\Service\Statistics;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
+use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\Persistence\ManagerRegistry;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterface
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
-        private readonly Connection $localConnection,
+        #[Autowire(service: 'doctrine.dbal.statistics_connection')]
+        private readonly Connection $statisticsConnection,
         private readonly ManagerRegistry $doctrine,
         private readonly StellarNetworkResolver $networkResolver,
         private readonly NetworkMetricCatalog $metricCatalog,
@@ -89,6 +91,9 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
             $transactions = $this->toInt($row['transactions'] ?? null, 0);
             $operations = $this->toInt($row['operations'] ?? null, 0);
             $avgLedgerSeconds = $this->toFloat($row['avg_ledger_sec'] ?? null) ?? 0.0;
+            $observedSeconds = $ledgers > 0 && $avgLedgerSeconds > 0.0
+                ? $ledgers * $avgLedgerSeconds
+                : $bucketSeconds;
 
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ledgers', (string) $ledgers);
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'transactions', (string) $transactions);
@@ -96,8 +101,8 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-success', (string) $this->toInt($row['tx_success'] ?? null, 0));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-failed', (string) $this->toInt($row['tx_failed'] ?? null, 0));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'avg-ledger-sec', $this->normalizeDecimal($avgLedgerSeconds));
-            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tps', $this->safeDivide($transactions, $avgLedgerSeconds));
-            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops', $this->safeDivide($operations, $avgLedgerSeconds));
+            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tps', $this->safeDivide($transactions, $observedSeconds));
+            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops', $this->safeDivide($operations, $observedSeconds));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'tx-ledger', $this->safeDivide($transactions, $ledgers));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'ops-ledger', $this->safeDivide($operations, $ledgers));
         }
@@ -554,22 +559,13 @@ SQL;
     {
         $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $rowsWritten = 0;
+        $sql = $this->buildUpsertSql();
 
-        $this->localConnection->beginTransaction();
+        $this->statisticsConnection->beginTransaction();
         try {
             foreach ($points as $point) {
-                $this->localConnection->executeStatement(
-                    <<<SQL
-INSERT INTO network_metric_point
-    (network, metric_group, metric_key, source, bucket_minutes, bucket_start, bucket_end, value_decimal, created_at, updated_at)
-VALUES
-    (:network, :metric_group, :metric_key, :source, :bucket_minutes, :bucket_start, :bucket_end, :value_decimal, :created_at, :updated_at)
-ON DUPLICATE KEY UPDATE
-    metric_group = VALUES(metric_group),
-    bucket_end = VALUES(bucket_end),
-    value_decimal = VALUES(value_decimal),
-    updated_at = VALUES(updated_at)
-SQL,
+                $this->statisticsConnection->executeStatement(
+                    $sql,
                     [
                         'network' => $point['network'],
                         'metric_group' => $point['metric_group'],
@@ -590,13 +586,51 @@ SQL,
                 $rowsWritten++;
             }
 
-            $this->localConnection->commit();
+            $this->statisticsConnection->commit();
         } catch (\Throwable $exception) {
-            $this->localConnection->rollBack();
+            $this->statisticsConnection->rollBack();
             throw $exception;
         }
 
         return $rowsWritten;
+    }
+
+    private function buildUpsertSql(): string
+    {
+        $platform = $this->statisticsConnection->getDatabasePlatform();
+
+        if ($platform instanceof AbstractMySQLPlatform) {
+            return <<<SQL
+INSERT INTO network_metric_point
+    (network, metric_group, metric_key, source, bucket_minutes, bucket_start, bucket_end, value_decimal, created_at, updated_at)
+VALUES
+    (:network, :metric_group, :metric_key, :source, :bucket_minutes, :bucket_start, :bucket_end, :value_decimal, :created_at, :updated_at)
+ON DUPLICATE KEY UPDATE
+    metric_group = VALUES(metric_group),
+    bucket_end = VALUES(bucket_end),
+    value_decimal = VALUES(value_decimal),
+    updated_at = VALUES(updated_at)
+SQL;
+        }
+
+        if ($platform instanceof PostgreSQLPlatform) {
+            return <<<SQL
+INSERT INTO network_metric_point
+    (network, metric_group, metric_key, source, bucket_minutes, bucket_start, bucket_end, value_decimal, created_at, updated_at)
+VALUES
+    (:network, :metric_group, :metric_key, :source, :bucket_minutes, :bucket_start, :bucket_end, :value_decimal, :created_at, :updated_at)
+ON CONFLICT (network, source, metric_key, bucket_minutes, bucket_start) DO UPDATE SET
+    metric_group = EXCLUDED.metric_group,
+    bucket_end = EXCLUDED.bucket_end,
+    value_decimal = EXCLUDED.value_decimal,
+    updated_at = EXCLUDED.updated_at
+SQL;
+        }
+
+        throw new \RuntimeException(sprintf(
+            'Unsupported statistics database platform: %s',
+            $platform::class
+        ));
     }
 
     private function parseUtcDateTime(mixed $value): ?\DateTimeImmutable

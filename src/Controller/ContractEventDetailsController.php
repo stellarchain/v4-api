@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Controller;
 
+use App\Service\ContractEvents\ContractEventPayloadFallbackResolver;
+use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -16,9 +18,10 @@ use Symfony\Component\Routing\Attribute\Route;
 final class ContractEventDetailsController
 {
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
+        private readonly ContractEventPayloadFallbackResolver $payloadFallbackResolver,
     ) {
     }
 
@@ -51,6 +54,7 @@ final class ContractEventDetailsController
              WHERE ce.id = :id
                AND c.contract_id = :contract_id
                AND c.network = :network
+               AND '.ContractVisibilitySql::confirmedPredicate('c').'
              LIMIT 1',
             [
                 'id' => $id,
@@ -67,6 +71,39 @@ final class ContractEventDetailsController
             return $this->error('Event not found.', Response::HTTP_NOT_FOUND);
         }
 
+        $topicDecoded = $this->decodeJsonValue($row['topic_decoded'] ?? null);
+        $valueDecoded = $this->decodeJsonValue($row['value_decoded'] ?? null);
+        $topicRaw = null;
+        $valueRaw = null;
+        $addresses = $this->decodeJsonValue($row['addresses'] ?? null);
+        $amountRaw = $row['amount_raw'] !== null ? (string) $row['amount_raw'] : null;
+        $eventType = (string) ($row['event_type'] ?? 'unknown');
+
+        if ($topicDecoded === null && $valueDecoded === null && $addresses === null) {
+            $fallback = $this->payloadFallbackResolver->resolve(
+                (string) ($row['contract_id'] ?? ''),
+                $network,
+                (string) ($row['tx_hash'] ?? ''),
+                (int) ($row['event_idx'] ?? 0),
+                $row['ledger'] !== null ? (int) $row['ledger'] : null,
+            );
+            if (is_array($fallback)) {
+                $topicDecoded = $fallback['topicDecoded'] ?? $topicDecoded;
+                $valueDecoded = $fallback['valueDecoded'] ?? $valueDecoded;
+                $topicRaw = $fallback['topicRaw'] ?? $topicRaw;
+                $valueRaw = (is_string($fallback['valueRaw'] ?? null) && $fallback['valueRaw'] !== '')
+                    ? $fallback['valueRaw']
+                    : $valueRaw;
+                $addresses = $fallback['addresses'] ?? $addresses;
+                $amountRaw = (is_string($fallback['amountRaw'] ?? null) && $fallback['amountRaw'] !== '')
+                    ? $fallback['amountRaw']
+                    : $amountRaw;
+                if (is_string($fallback['eventType'] ?? null) && trim((string) $fallback['eventType']) !== '') {
+                    $eventType = (string) $fallback['eventType'];
+                }
+            }
+        }
+
         return new JsonResponse([
             '@context' => '/v1/contexts/ContractEvent',
             '@id' => sprintf('/v1/contracts/%s/events/%d', (string) $row['contract_id'], (int) $row['id']),
@@ -77,11 +114,15 @@ final class ContractEventDetailsController
             'eventIndex' => (int) ($row['event_idx'] ?? 0),
             'ledger' => $row['ledger'] !== null ? (int) $row['ledger'] : null,
             'ledgerClosedAt' => $this->toAtom($row['ledger_closed_at'] ?? null),
-            'eventType' => (string) ($row['event_type'] ?? 'unknown'),
-            'topicDecoded' => $this->decodeJsonValue($row['topic_decoded'] ?? null),
-            'valueDecoded' => $this->decodeJsonValue($row['value_decoded'] ?? null),
-            'addresses' => $this->decodeJsonValue($row['addresses'] ?? null),
-            'amountRaw' => $row['amount_raw'] !== null ? (string) $row['amount_raw'] : null,
+            'eventType' => $eventType,
+            'topicDecoded' => $topicDecoded,
+            'valueDecoded' => $valueDecoded,
+            'raw' => [
+                'topic' => $topicRaw,
+                'value' => $valueRaw,
+            ],
+            'addresses' => $addresses,
+            'amountRaw' => $amountRaw,
             'createdAt' => $this->toAtom($row['created_at'] ?? null),
         ]);
     }

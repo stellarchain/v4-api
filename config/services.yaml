@@ -10,6 +10,8 @@ parameters:
     app.empty_string: ''
     app.true_string: '1'
     app.false_string: '0'
+    app.default_statistics_database_url: '%env(resolve:DATABASE_URL)%'
+    app.default_contracts_database_url: '%env(resolve:DATABASE_URL)%'
     app.default_mailer_from: 'support@stellarchain.io'
     app.default_mailer_from_name: 'Stellarchain.io Explorer'
     app.default_order_verification_admin_email: 'support@stellarchain.io'
@@ -49,6 +51,9 @@ services:
         resource: '../src/'
 
     App\Service\Statistics\NetworkMetricSyncServiceInterface: '@App\Service\Statistics\NetworkMetricSyncService'
+    App\Service\Statistics\NetworkStatisticsReadServiceInterface: '@App\Service\Statistics\NetworkStatisticsReadService'
+    App\Service\Trace\PaymentFlowAccountMetadataReadServiceInterface: '@App\Service\Trace\PaymentFlowAccountMetadataReadService'
+    App\Service\Trace\PaymentFlowInvestigationReadServiceInterface: '@App\Service\Trace\PaymentFlowInvestigationReadService'
 
     App\Service\Orders\OrderMonitorAccountResolver:
         arguments:

@@ -3,13 +3,12 @@
 namespace App\Command\Soroban;
 
 use App\Command\Support\NetworkOptionTrait;
-use App\Entity\Contract;
 use App\Service\Stellar\Soroban\SorobanContractInspector;
 use App\Service\Stellar\Soroban\SorobanServerFactory;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
-use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Soneso\StellarSDK\Crypto\StrKey;
 use Soneso\StellarSDK\Soroban\Requests\EventFilter;
 use Soneso\StellarSDK\Soroban\Requests\EventFilters;
@@ -39,11 +38,10 @@ final class ScanSorobanContractsCommand extends Command
     private const PROGRESS_EVERY_PAGES = 20;
 
     public function __construct(
-        private readonly EntityManagerInterface $entityManager,
         private readonly SorobanServerFactory $sorobanServerFactory,
         private readonly SorobanContractInspector $sorobanContractInspector,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
     ) {
         parent::__construct();
@@ -490,23 +488,40 @@ final class ScanSorobanContractsCommand extends Command
 
     private function persistDiscoveredContract(string $contractId, int $networkCode): void
     {
-        $contract = (new Contract())
-            ->setContractId($contractId)
-            ->setNetwork($networkCode)
-            ->setCreatedAt(new \DateTimeImmutable());
-
         $hex = $this->decodeContractIdHexOrNull($contractId);
-        if ($hex !== null) {
-            $contract->setContractIdHex($hex);
-        }
 
-        $this->entityManager->persist($contract);
+        $this->connection->executeStatement(
+            $this->buildInsertContractIgnoreSql(),
+            [
+                'contract_id' => $contractId,
+                'contract_id_hex' => $hex,
+                'network' => $networkCode,
+                'created_at' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+            ],
+            [
+                'contract_id_hex' => $hex !== null ? ParameterType::STRING : ParameterType::NULL,
+                'network' => ParameterType::INTEGER,
+                'created_at' => ParameterType::STRING,
+            ]
+        );
     }
 
     private function flushAndClear(): void
     {
-        $this->entityManager->flush();
-        $this->entityManager->clear();
+        // No-op: contracts are inserted immediately through DBAL for the dedicated contracts DB.
+    }
+
+    private function buildInsertContractIgnoreSql(): string
+    {
+        if ($this->connection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                    VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                    ON CONFLICT (contract_id, network) DO NOTHING';
+        }
+
+        return 'INSERT INTO contracts (contract_id, contract_id_hex, network, created_at)
+                VALUES (:contract_id, :contract_id_hex, :network, :created_at)
+                ON DUPLICATE KEY UPDATE contract_id = contract_id';
     }
 
     private function isMaxContractsReached(?int $maxContracts, int $uniqueSeen): bool

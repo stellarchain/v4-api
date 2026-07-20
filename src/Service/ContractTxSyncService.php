@@ -14,7 +14,7 @@ final class ContractTxSyncService
     private const DEFAULT_LEDGER_OVERLAP = 64;
 
     public function __construct(
-        #[Autowire(service: 'doctrine.dbal.default_connection')]
+        #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
         private readonly SorobanRpcService $sorobanRpcService,
         private readonly ContractTxUpsertService $txUpsertService,
@@ -184,7 +184,7 @@ final class ContractTxSyncService
             return $startLedger;
         }
 
-        $maxSeenLedger = $this->fetchLocalMaxSeenLedger($localContractId);
+        $maxSeenLedger = $this->fetchLocalResumeLedger($localContractId);
         if ($maxSeenLedger === null || $maxSeenLedger < 1) {
             return $startLedger;
         }
@@ -199,13 +199,14 @@ final class ContractTxSyncService
         return $effectiveStart;
     }
 
-    private function fetchLocalMaxSeenLedger(int $localContractId): ?int
+    private function fetchLocalResumeLedger(int $localContractId): ?int
     {
         try {
             $value = $this->connection->fetchOne(
                 'SELECT GREATEST(
                     COALESCE((SELECT MAX(ledger) FROM contract_transactions WHERE contract_id = :contract_id), 0),
-                    COALESCE((SELECT MAX(ledger) FROM contract_events WHERE contract_id = :contract_id), 0)
+                    COALESCE((SELECT MAX(ledger) FROM contract_events WHERE contract_id = :contract_id), 0),
+                    COALESCE((SELECT MAX(last_modified_ledger_seq) FROM contract_storage_entries WHERE contract_id = :contract_id), 0)
                 ) AS max_ledger',
                 ['contract_id' => $localContractId],
                 ['contract_id' => ParameterType::INTEGER]
