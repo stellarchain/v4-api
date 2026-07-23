@@ -6,6 +6,52 @@ namespace App\Service\Statistics;
 
 final class NetworkMetricCatalog
 {
+    public const AVAILABLE_METRIC_KEYS = [
+        'trades',
+        'dex-vol-xlm',
+        'xlm-total-pay',
+        'ledgers',
+        'tps',
+        'ops',
+        'tx-ledger',
+        'tx-success',
+        'tx-failed',
+        'ops-ledger',
+        'transactions',
+        'operations',
+        'avg-ledger-sec',
+        'output-value',
+        'invocations',
+        'contracts',
+        'fee-charged',
+        'max-fee',
+        'active-addresses',
+        'accounts-created',
+        'accounts-merged',
+    ];
+
+    public const DISABLED_METRIC_KEYS = [
+        'price-usd',
+        'rank',
+        'market-cap',
+        'volume-24h',
+        'circulating-supply',
+        'market-cap-dominance',
+        'dex-vol',
+        'accounts',
+        'assets',
+        'top-accounts',
+        'inactive-addresses',
+        'top-payers',
+        'top-receivers',
+        'top-contract-callers',
+    ];
+
+    public const METRIC_KEYS = [
+        ...self::AVAILABLE_METRIC_KEYS,
+        ...self::DISABLED_METRIC_KEYS,
+    ];
+
     /**
      * @var array<string,string>
      */
@@ -42,7 +88,20 @@ final class NetworkMetricCatalog
         'inactive-addresses' => 'network',
         'accounts-created' => 'network',
         'accounts-merged' => 'network',
+        'top-payers' => 'network',
+        'top-receivers' => 'network',
+        'top-contract-callers' => 'network',
     ];
+
+    public function hasMetric(string $metricKey): bool
+    {
+        return in_array(strtolower(trim($metricKey)), self::METRIC_KEYS, true);
+    }
+
+    public function isAvailableMetric(string $metricKey): bool
+    {
+        return in_array(strtolower(trim($metricKey)), self::AVAILABLE_METRIC_KEYS, true);
+    }
 
     public function groupForMetric(string $metricKey): string
     {
