@@ -13,6 +13,8 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 
 final class MarketSnapshotSyncService
 {
+    private const MAINNET_MAX_SOURCE_LAG_SECONDS = 3600;
+
     public function __construct(
         #[Autowire(service: 'doctrine.dbal.default_connection')]
         private readonly Connection $localConnection,
@@ -39,6 +41,10 @@ final class MarketSnapshotSyncService
         $horizonConnection = $this->resolveHorizonConnection($normalizedNetwork);
         $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
         $topLimit = ($top !== null && $top > 0) ? $top : null;
+
+        if ($normalizedNetwork === 'mainnet') {
+            $this->assertCurrentMainnetSource($horizonConnection, $now);
+        }
 
         $localAssetsBefore = $this->countLocalAssets($networkCode);
         $horizonNativeAssetId = $this->loadHorizonNativeAssetId($horizonConnection);
@@ -557,6 +563,37 @@ SQL,
             ($tradesScore * 0.25) +
             ($trustlinesScore * 0.20) +
             ($momentumScore * 0.05);
+    }
+
+    private function assertCurrentMainnetSource(Connection $horizonConnection, \DateTimeImmutable $now): void
+    {
+        $latestClosedAt = $horizonConnection->fetchOne('SELECT MAX(closed_at) FROM history_ledgers');
+        if (!is_string($latestClosedAt) || trim($latestClosedAt) === '') {
+            throw new \RuntimeException(
+                'Refusing to update mainnet market snapshots: Horizon has no ledger close timestamp.'
+            );
+        }
+
+        try {
+            $latestLedgerAt = new \DateTimeImmutable($latestClosedAt, new \DateTimeZone('UTC'));
+        } catch (\Throwable $exception) {
+            throw new \RuntimeException(
+                sprintf(
+                    'Refusing to update mainnet market snapshots: invalid Horizon ledger close timestamp "%s".',
+                    $latestClosedAt
+                ),
+                previous: $exception
+            );
+        }
+
+        $sourceLagSeconds = $now->getTimestamp() - $latestLedgerAt->getTimestamp();
+        if ($sourceLagSeconds > self::MAINNET_MAX_SOURCE_LAG_SECONDS) {
+            throw new \RuntimeException(sprintf(
+                'Refusing to update mainnet market snapshots: Horizon is stale by %d seconds (latest ledger: %s).',
+                $sourceLagSeconds,
+                $latestLedgerAt->setTimezone(new \DateTimeZone('UTC'))->format(\DateTimeInterface::ATOM)
+            ));
+        }
     }
 
     private function readTrustlinesTotal(mixed $accountsJson): ?int

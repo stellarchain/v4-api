@@ -14,6 +14,7 @@ HORIZON_MODE="${HORIZON_MODE:-reingest-range}"
 HORIZON_WORKERS="${HORIZON_WORKERS:-4}"
 HORIZON_DATABASE_URL="${HORIZON_DATABASE_URL:-}"
 HORIZON_NETWORK="${HORIZON_NETWORK:-}"
+HORIZON_APP_DATABASE_URL="${HORIZON_APP_DATABASE_URL:-$HORIZON_DATABASE_URL}"
 
 APP_MODE="${APP_MODE:-docker}"
 CONSOLE_BIN="${CONSOLE_BIN:-bin/console-no-debug}"
@@ -28,7 +29,7 @@ APP_ENV_PASSTHROUGH_VARS=(
     DATABASE_HORIZON_URL_MAINNET
 )
 
-RUN_CONTRACT_SCAN="${RUN_CONTRACT_SCAN:-1}"
+RUN_CONTRACT_SCAN="${RUN_CONTRACT_SCAN:-0}"
 CONTRACT_BATCH_SIZE="${CONTRACT_BATCH_SIZE:-5000}"
 RUN_NETWORK_METRICS="${RUN_NETWORK_METRICS:-1}"
 NETWORK_METRICS_BUCKET_MINUTES="${NETWORK_METRICS_BUCKET_MINUTES:-10}"
@@ -37,10 +38,10 @@ PAYMENT_FLOW_BATCH_SIZE="${PAYMENT_FLOW_BATCH_SIZE:-5000}"
 RUN_ASSET_MARKET_HISTORY="${RUN_ASSET_MARKET_HISTORY:-0}"
 ASSET_MARKET_BUCKET_MINUTES="${ASSET_MARKET_BUCKET_MINUTES:-$NETWORK_METRICS_BUCKET_MINUTES}"
 RUN_ACCOUNT_ACTIVITY_SUMMARY="${RUN_ACCOUNT_ACTIVITY_SUMMARY:-0}"
-RUN_COINGECKO_WARM="${RUN_COINGECKO_WARM:-1}"
-RUN_MARKET_SNAPSHOTS="${RUN_MARKET_SNAPSHOTS:-1}"
+RUN_COINGECKO_WARM="${RUN_COINGECKO_WARM:-0}"
+RUN_MARKET_SNAPSHOTS="${RUN_MARKET_SNAPSHOTS:-0}"
 MARKET_TOP="${MARKET_TOP:-0}"
-RUN_MARKET_OVERVIEW="${RUN_MARKET_OVERVIEW:-1}"
+RUN_MARKET_OVERVIEW="${RUN_MARKET_OVERVIEW:-0}"
 
 RUN_LOCAL_RESET="${RUN_LOCAL_RESET:-0}"
 ALLOW_MAINNET_RESET="${ALLOW_MAINNET_RESET:-0}"
@@ -60,13 +61,14 @@ Environment:
   END_LEDGER=...
   HORIZON_BIN=stellar-horizon
   HORIZON_DATABASE_URL=postgresql://.../horizon
+  HORIZON_APP_DATABASE_URL=postgresql://.../horizon
   HORIZON_NETWORK=pubnet|testnet|futurenet|passphrase
   HORIZON_MODE=reingest-range|ingest-range
   HORIZON_WORKERS=4
   DATABASE_CONTRACTS_URL=postgresql://.../horizon_contracts
   APP_MODE=docker|host
   CONSOLE_BIN=bin/console-no-debug
-  RUN_CONTRACT_SCAN=1
+  RUN_CONTRACT_SCAN=0
   CONTRACT_BATCH_SIZE=5000
   RUN_NETWORK_METRICS=1
   NETWORK_METRICS_BUCKET_MINUTES=10
@@ -75,10 +77,10 @@ Environment:
   RUN_ASSET_MARKET_HISTORY=0
   ASSET_MARKET_BUCKET_MINUTES=10
   RUN_ACCOUNT_ACTIVITY_SUMMARY=0
-  RUN_COINGECKO_WARM=1
-  RUN_MARKET_SNAPSHOTS=1
+  RUN_COINGECKO_WARM=0
+  RUN_MARKET_SNAPSHOTS=0
   MARKET_TOP=0
-  RUN_MARKET_OVERVIEW=1
+  RUN_MARKET_OVERVIEW=0
   RUN_LOCAL_RESET=0
   ALLOW_MAINNET_RESET=0
   HORIZON_RETENTION_MODE=none|processed-range|truncate-history
@@ -87,7 +89,8 @@ Environment:
 Notes:
   - The script only runs statistics that exist today in v4.
   - It does not recreate all historical charts from v3 (TPS, OPS, ledgers, tx-success, tx-failed, dex-vol, etc.).
-  - XLM/USD is loaded through app:warm-coingecko-cache.
+  - HORIZON_APP_DATABASE_URL defaults to HORIZON_DATABASE_URL for Symfony history readers.
+  - Contract scan, live CoinGecko and market snapshots are disabled by default and use separate pipelines.
 EOF
 }
 
@@ -117,6 +120,18 @@ require_positive_int() {
 }
 
 build_app_cmd() {
+    local horizon_app_env_name=""
+    if [[ -n "$HORIZON_APP_DATABASE_URL" ]]; then
+        case "$NETWORK" in
+            mainnet)
+                horizon_app_env_name="DATABASE_HORIZON_URL_MAINNET"
+                ;;
+            testnet|futurenet)
+                horizon_app_env_name="DATABASE_HORIZON_URL_TESTNET"
+                ;;
+        esac
+    fi
+
     case "$APP_MODE" in
         docker)
             APP_CMD=(docker compose exec -T)
@@ -125,10 +140,17 @@ build_app_cmd() {
                     APP_CMD+=(-e "$env_name=${!env_name}")
                 fi
             done
+            if [[ -n "$horizon_app_env_name" ]]; then
+                APP_CMD+=(-e "$horizon_app_env_name=$HORIZON_APP_DATABASE_URL")
+            fi
             APP_CMD+=(php php)
             ;;
         host)
-            APP_CMD=(php)
+            APP_CMD=(env)
+            if [[ -n "$horizon_app_env_name" ]]; then
+                APP_CMD+=("$horizon_app_env_name=$HORIZON_APP_DATABASE_URL")
+            fi
+            APP_CMD+=(php)
             ;;
         *)
             echo "Unsupported APP_MODE: $APP_MODE" >&2
