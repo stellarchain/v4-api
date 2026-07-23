@@ -4,15 +4,13 @@ declare(strict_types=1);
 
 namespace App\Entity;
 
-use ApiPlatform\Doctrine\Orm\Filter\DateFilter;
-use ApiPlatform\Doctrine\Orm\Filter\OrderFilter;
-use ApiPlatform\Doctrine\Orm\Filter\SearchFilter;
-use ApiPlatform\Metadata\ApiFilter;
 use ApiPlatform\Metadata\ApiResource;
 use ApiPlatform\Metadata\GetCollection;
 use ApiPlatform\OpenApi\Model\Operation as OpenApiOperation;
 use ApiPlatform\OpenApi\Model\Parameter as OpenApiParameter;
+use App\Controller\NetworkMetricCollectionController;
 use App\Repository\NetworkMetricPointRepository;
+use App\Service\Statistics\NetworkMetricCatalog;
 use Doctrine\ORM\Mapping as ORM;
 
 #[ORM\Entity(repositoryClass: NetworkMetricPointRepository::class)]
@@ -24,6 +22,10 @@ use Doctrine\ORM\Mapping as ORM;
     operations: [
         new GetCollection(
             uriTemplate: '/network-metrics',
+            controller: NetworkMetricCollectionController::class,
+            read: false,
+            serialize: false,
+            paginationEnabled: false,
             openapi: new OpenApiOperation(
                 tags: ['Statistics'],
                 summary: 'Get paginated network metric time-series points.',
@@ -38,30 +40,33 @@ use Doctrine\ORM\Mapping as ORM;
                     new OpenApiParameter(
                         name: 'metricKey',
                         in: 'query',
-                        description: 'Exact metric key filter (example: ledgers, transactions, tps).',
-                        required: false,
-                        schema: ['type' => 'string']
-                    ),
-                    new OpenApiParameter(
-                        name: 'metricGroup',
-                        in: 'query',
-                        description: 'Exact metric group filter (market|blockchain|network).',
-                        required: false,
-                        schema: ['type' => 'string', 'enum' => ['market', 'blockchain', 'network']]
-                    ),
-                    new OpenApiParameter(
-                        name: 'source',
-                        in: 'query',
-                        description: 'Exact source filter (example: horizon_db, coingecko).',
-                        required: false,
-                        schema: ['type' => 'string']
+                        description: 'Select a populated metric key.',
+                        required: true,
+                        schema: [
+                            'type' => 'string',
+                            'enum' => NetworkMetricCatalog::AVAILABLE_METRIC_KEYS,
+                        ]
                     ),
                     new OpenApiParameter(
                         name: 'bucketMinutes',
                         in: 'query',
-                        description: 'Exact bucket size filter in minutes.',
+                        description: 'Requested bucket size. Source 5-minute points are aggregated dynamically.',
                         required: false,
-                        schema: ['type' => 'integer']
+                        schema: ['type' => 'integer', 'minimum' => 5, 'maximum' => 1440, 'multipleOf' => 5]
+                    ),
+                    new OpenApiParameter(
+                        name: 'page',
+                        in: 'query',
+                        description: 'Collection page number. Default: 1.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1]
+                    ),
+                    new OpenApiParameter(
+                        name: 'itemsPerPage',
+                        in: 'query',
+                        description: 'Items per page. Default: 100, maximum: 500.',
+                        required: false,
+                        schema: ['type' => 'integer', 'minimum' => 1, 'maximum' => 500]
                     ),
                 ]
             )
@@ -73,14 +78,7 @@ use Doctrine\ORM\Mapping as ORM;
         'shared_max_age' => 300,
         'vary' => ['Accept', 'Content-Type', 'Origin'],
     ],
-    paginationEnabled: true,
-    paginationItemsPerPage: 100,
-    paginationMaximumItemsPerPage: 500,
-    paginationClientItemsPerPage: true,
 )]
-#[ApiFilter(SearchFilter::class, properties: ['metricKey' => 'exact', 'metricGroup' => 'exact', 'source' => 'exact', 'bucketMinutes' => 'exact'])]
-#[ApiFilter(OrderFilter::class, properties: ['bucketStart', 'bucketEnd', 'valueDecimal', 'id'])]
-#[ApiFilter(DateFilter::class, properties: ['bucketStart', 'bucketEnd'])]
 final class NetworkMetricPoint
 {
     #[ORM\Id]
