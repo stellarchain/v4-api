@@ -58,7 +58,11 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
    ```
 4. Historical unattended backfill:
    ```bash
-   NETWORK=testnet LATEST_LEDGER=12345678 bin/horizon-history-backfill.sh
+   NETWORK=testnet \
+   LATEST_LEDGER=12345678 \
+   DATABASE_HORIZON_URL=postgresql://history-host/horizon_history \
+   DATABASE_STATISTICS_URL=postgresql://history-host/horizon_statistics \
+   bin/horizon-history-backfill.sh
    ```
 4. Open API docs:
    - `https://api.stellarchain.dev/v1`
@@ -69,8 +73,12 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 ## Statistics Database
 
 - `DATABASE_STATISTICS_URL` controls where `app:horizon:sync-network-metrics` and `app:horizon:sync-payment-flow-events` write historical rows.
-- By default it falls back to `DATABASE_URL`, preserving the existing app behavior.
-- For an isolated historical backfill worker, point it at a separate MySQL or PostgreSQL database, then run `app:statistics:init-schema` before starting the backfill.
+- `DATABASE_HORIZON_URL` is the isolated Horizon database reingested and read by the historical worker.
+- Both variables are required. Inside the worker, `DATABASE_URL` and `DATABASE_CONTRACTS_URL` are replaced with `DATABASE_STATISTICS_URL`, so the operational database is not reachable as a write target.
+- Historical statistics backfill always disables contract scanning, CoinGecko warming, market snapshots, market overview and local application resets.
+- Contract history uses a separate pipeline and `DATABASE_CONTRACTS_URL`; it is not part of `horizon-history-backfill.sh`.
+- The DigitalOcean operational database is updated only by the live cron commands (`app:warm-coingecko-cache`, `app:market:sync-snapshots`, `app:horizon:sync-market-overview`) reading the current mainnet Horizon database.
+- Run `app:statistics:init-schema` against the dedicated statistics database before starting the backfill.
 - `RUN_PAYMENT_FLOW_EVENTS=1` can be added to `bin/horizon-history-backfill.sh` to preserve direct payment/path-payment/create-account/account-merge flow events before Horizon history tables are truncated.
 - `RUN_ASSET_MARKET_HISTORY=1` preserves per-asset XLM market buckets and active asset state snapshots.
 - `RUN_ACCOUNT_ACTIVITY_SUMMARY=1` preserves compact per-range account summaries for later account ranking/statistics imports.
