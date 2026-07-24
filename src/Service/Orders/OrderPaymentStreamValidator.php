@@ -5,17 +5,17 @@ declare(strict_types=1);
 namespace App\Service\Orders;
 
 use App\Entity\Order;
+use App\Service\Market\XlmUsdPriceProvider;
 use App\Service\Stellar\StellarNetworkResolver;
-use Doctrine\Persistence\ManagerRegistry;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 final class OrderPaymentStreamValidator
 {
     public function __construct(
         private readonly HttpClientInterface $httpClient,
-        private readonly ManagerRegistry $doctrine,
         private readonly OrderMonitorAccountResolver $orderMonitorAccountResolver,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
+        private readonly XlmUsdPriceProvider $xlmUsdPriceProvider,
     ) {
     }
 
@@ -88,7 +88,7 @@ final class OrderPaymentStreamValidator
 
     private function requiredAmountInXlm(): ?float
     {
-        $price = $this->loadLatestXlmUsdPrice();
+        $price = $this->xlmUsdPriceProvider->latest();
         if ($price === null || $price <= 0.0) {
             return null;
         }
@@ -96,29 +96,6 @@ final class OrderPaymentStreamValidator
         $effectiveUsdAmount = max(0.0, self::REQUIRED_USD_AMOUNT - self::REQUIRED_USD_DISCOUNT);
 
         return $effectiveUsdAmount / $price;
-    }
-
-    private function loadLatestXlmUsdPrice(): ?float
-    {
-        $connection = $this->doctrine->getConnection();
-        $value = $connection->fetchOne(
-            <<<'SQL'
-SELECT amh.value_decimal
-FROM asset_metric_history amh
-INNER JOIN asset a ON a.id = amh.asset_id
-WHERE amh.source = 'coingecko_stellar'
-  AND amh.metric_key = 'market_data.current_price.usd'
-  AND a.is_native = 1
-ORDER BY amh.recorded_at DESC
-LIMIT 1
-SQL
-        );
-
-        if ($value === false || $value === null || !is_numeric($value)) {
-            return null;
-        }
-
-        return (float) $value;
     }
 
     private function fetchHorizonOperation(string $network, int $operationId): ?array

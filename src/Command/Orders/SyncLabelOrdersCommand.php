@@ -4,6 +4,7 @@ namespace App\Command\Orders;
 
 use App\Command\Support\NetworkOptionTrait;
 use App\Entity\Order;
+use App\Service\Market\XlmUsdPriceProvider;
 use App\Service\Orders\OrderEmailNotifier;
 use App\Service\Orders\OrderMonitorAccountResolver;
 use App\Service\Stellar\StellarNetworkResolver;
@@ -37,6 +38,7 @@ final class SyncLabelOrdersCommand extends Command
         private readonly OrderEmailNotifier $orderEmailNotifier,
         private readonly OrderMonitorAccountResolver $orderMonitorAccountResolver,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
+        private readonly XlmUsdPriceProvider $xlmUsdPriceProvider,
     ) {
         parent::__construct();
     }
@@ -83,7 +85,7 @@ final class SyncLabelOrdersCommand extends Command
             return Command::FAILURE;
         }
         if ($requiredAmountUsd !== null) {
-            $xlmUsdPrice = $this->loadLatestXlmUsdPrice();
+            $xlmUsdPrice = $this->xlmUsdPriceProvider->latest();
             if ($xlmUsdPrice === null || $xlmUsdPrice <= 0.0) {
                 $io->error('Cannot resolve XLM/USD price from local DB. Run app:warm-coingecko-cache first.');
 
@@ -431,28 +433,6 @@ SQL,
             ],
             $rows
         );
-    }
-
-    private function loadLatestXlmUsdPrice(): ?float
-    {
-        $value = $this->connection->fetchOne(
-            <<<SQL
-SELECT amh.value_decimal
-FROM asset_metric_history amh
-INNER JOIN asset a ON a.id = amh.asset_id
-WHERE amh.source = 'coingecko_stellar'
-  AND amh.metric_key = 'market_data.current_price.usd'
-  AND a.is_native = 1
-ORDER BY amh.recorded_at DESC
-LIMIT 1
-SQL
-        );
-
-        if ($value === false || $value === null || !is_numeric($value)) {
-            return null;
-        }
-
-        return (float) $value;
     }
 
 }

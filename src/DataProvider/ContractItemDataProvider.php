@@ -8,6 +8,7 @@ use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
 use App\Service\ContractTransparency\ContractVisibilitySql;
+use App\Service\Stellar\Soroban\ContractRpcFallbackResolverInterface;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -22,6 +23,7 @@ final class ContractItemDataProvider implements ProviderInterface
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
+        private readonly ContractRpcFallbackResolverInterface $contractRpcFallbackResolver,
     ) {
     }
 
@@ -81,10 +83,73 @@ final class ContractItemDataProvider implements ProviderInterface
         );
 
         if (!is_array($row)) {
-            return null;
+            $rpcContract = $this->contractRpcFallbackResolver->resolve($contractId, $network);
+            if ($rpcContract === null) {
+                return null;
+            }
+
+            $row = $this->buildRpcFallbackRow($rpcContract);
         }
 
         return $this->toResponseObject($this->formatContractRow($row, $network));
+    }
+
+    /**
+     * @param array{
+     *     contractId:string,
+     *     contractIdHex:string,
+     *     wasmId:?string,
+     *     executableType:int,
+     *     isSac:bool
+     * } $contract
+     * @return array<string,mixed>
+     */
+    private function buildRpcFallbackRow(array $contract): array
+    {
+        return [
+            'id' => null,
+            'contract_id' => $contract['contractId'],
+            'contract_id_hex' => $contract['contractIdHex'],
+            'asset_code' => null,
+            'asset_address' => $contract['isSac'] ? $contract['contractId'] : null,
+            'asset_issuer' => null,
+            'created_at' => null,
+            'deployed_at' => null,
+            'deployed_ledger' => null,
+            'deploy_tx_hash' => null,
+            'deploy_source_account' => null,
+            'deployment_kind' => null,
+            'source_code_verified' => false,
+            'sep55_verified' => false,
+            'contract_type' => null,
+            'wasm_id' => $contract['wasmId'],
+            'executable_type' => $contract['executableType'],
+            'is_sac' => $contract['isSac'],
+            'total_transactions' => 0,
+            'total_operations' => 0,
+            'total_events' => 0,
+            'total_effects' => 0,
+            'total_storage_entries' => 0,
+            'total_invokes' => 0,
+            'verified_display_name' => null,
+            'verified_metadata_type' => null,
+            'verified_is_sep41' => null,
+            'verified_symbol' => null,
+            'verified_decimals' => null,
+            'verified_metadata_is_verified' => null,
+            'verified_website' => null,
+            'verified_description' => null,
+            'verified_icon_url' => null,
+            'verified_added_at' => null,
+            'verified_raw_payload' => null,
+            'verified_source_name' => null,
+            'source_code' => null,
+            'source_code_sha256' => null,
+            'wasm_blob_sha256' => null,
+            'source_status' => null,
+            'source_error_message' => null,
+            'source_decompiled_at' => null,
+        ];
     }
 
     /**
