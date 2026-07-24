@@ -51,6 +51,7 @@ services:
     App\Service\Statistics\NetworkStatisticsReadServiceInterface: '@App\Service\Statistics\NetworkStatisticsReadService'
     App\Service\Trace\PaymentFlowAccountMetadataReadServiceInterface: '@App\Service\Trace\PaymentFlowAccountMetadataReadService'
     App\Service\Trace\PaymentFlowInvestigationReadServiceInterface: '@App\Service\Trace\PaymentFlowInvestigationReadService'
+    App\Service\Stellar\Soroban\ContractRpcFallbackResolverInterface: '@App\Service\Stellar\Soroban\ContractRpcFallbackResolver'
 
     App\Service\Orders\OrderMonitorAccountResolver:
         arguments:
