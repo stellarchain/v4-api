@@ -34,6 +34,7 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
   - `app:horizon:sync-asset-market-history` (extracts asset/XLM market buckets and active asset state snapshots from a Horizon DB chunk)
   - `app:horizon:sync-account-activity-summary` (extracts compact account activity summaries from a Horizon DB chunk)
   - `app:statistics:init-schema` (creates the historical statistics storage tables on the configured statistics database)
+  - `app:directory:sync-stellar-expert` (imports missing Stellar Expert directory accounts and only updates existing accounts when Stellar Expert marks them `malicious`)
 - API docs UI tweaks (logo/header removed, top margin removed, footer hidden).
 - PHP extensions enabled: `bcmath`, `pcntl`, `gmp`, `pdo_mysql`, `intl`, `opcache`, `zip`, `apcu`.
 
@@ -55,6 +56,7 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
    docker compose exec php php bin/console app:statistics:init-schema --no-debug
    docker compose exec php php bin/console app:market:sync-snapshots --network=testnet --top=1000 --no-debug
    docker compose exec php php bin/console app:horizon:sync-network-metrics --network=testnet --bucket-minutes=10 --no-debug
+   docker compose exec php php bin/console app:directory:sync-stellar-expert --network=mainnet --no-debug
    ```
 4. Historical unattended backfill:
    ```bash

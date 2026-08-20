@@ -117,7 +117,7 @@ final class ImportKnownAccountsCommand extends Command
             }
 
             $nativeBalanceXlm = $this->toXlmDecimal((string) ($row['native_balance_stroops'] ?? '0'), $balanceUnit);
-            if (bccomp($nativeBalanceXlm, $minBalanceXlm, 7) < 0) {
+            if (!isset($csvLabels[$address]) && bccomp($nativeBalanceXlm, $minBalanceXlm, 7) < 0) {
                 $skipped++;
                 continue;
             }

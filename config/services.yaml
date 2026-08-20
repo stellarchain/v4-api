@@ -36,6 +36,12 @@ parameters:
     app.order_monitor_account_futurenet: '%env(default:app.order_monitor_account_default:STELLAR_ORDER_MONITOR_ACCOUNT_FUTURENET)%'
     app.scam_report_api_token: '%env(default:app.empty_string:SCAM_REPORT_API_TOKEN)%'
     app.scam_report_audit_log_file: '%kernel.logs_dir%/scam_reports.log'
+    app.tracked_asset_toml_sources:
+        mainnet:
+            -
+                code: 'USDT0'
+                issuer: 'GATISXX6BZ6NC7IKQBY37CJD4SOZL3CYZJWXEDG6JVIY4WBS6KXJHN6Q'
+                home_domain: 'usdt0.to'
 
 services:
     # default configuration for services in *this* file
@@ -54,6 +60,10 @@ services:
     App\Service\Trace\PaymentFlowAccountMetadataReadServiceInterface: '@App\Service\Trace\PaymentFlowAccountMetadataReadService'
     App\Service\Trace\PaymentFlowInvestigationReadServiceInterface: '@App\Service\Trace\PaymentFlowInvestigationReadService'
     App\Service\Stellar\Soroban\ContractRpcFallbackResolverInterface: '@App\Service\Stellar\Soroban\ContractRpcFallbackResolver'
+
+    App\Service\AssetTomlEnrichmentService:
+        arguments:
+            $trackedAssetSources: '%app.tracked_asset_toml_sources%'
 
     App\Service\Orders\OrderMonitorAccountResolver:
         arguments:

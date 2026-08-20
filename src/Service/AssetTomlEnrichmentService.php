@@ -18,12 +18,16 @@ final class AssetTomlEnrichmentService
     private const TOML_FETCH_TIMEOUT_SECONDS = 2.0;
     private const IMAGE_FETCH_TIMEOUT_SECONDS = 1.0;
 
+    /**
+     * @param array<string,list<array{code:string,issuer:string,home_domain:string}>> $trackedAssetSources
+     */
     public function __construct(
         #[Autowire(service: 'doctrine.dbal.default_connection')]
         private readonly Connection $connection,
         private readonly ManagerRegistry $doctrine,
         private readonly HttpClientInterface $httpClient,
         private readonly StellarNetworkResolver $networkResolver,
+        private readonly array $trackedAssetSources = [],
     ) {
     }
 
@@ -58,7 +62,16 @@ final class AssetTomlEnrichmentService
         $failed = 0;
         $lastId = 0;
         $imageReachabilityCache = [];
+        $trackedAssetIds = $this->ensureTrackedAssetRows(
+            $normalizedNetwork,
+            $networkCode,
+            $dryRun,
+            $now
+        );
         $targetAssetIds = $marketTop !== null ? $this->loadTopMarketAssetIds($networkCode, $marketTop) : null;
+        if (is_array($targetAssetIds)) {
+            $targetAssetIds = array_values(array_unique(array_merge($targetAssetIds, $trackedAssetIds)));
+        }
 
         if (is_array($targetAssetIds)) {
             foreach (array_chunk($targetAssetIds, $batchSize) as $idChunk) {
@@ -76,6 +89,7 @@ final class AssetTomlEnrichmentService
                 $this->processRows(
                     $rows,
                     $horizonConnection,
+                    $normalizedNetwork,
                     $onlyMissing,
                     $dryRun,
                     $now,
@@ -138,6 +152,7 @@ SQL,
             $this->processRows(
                 $rows,
                 $horizonConnection,
+                $normalizedNetwork,
                 $onlyMissing,
                 $dryRun,
                 $now,
@@ -222,6 +237,7 @@ SQL,
     private function processRows(
         array $rows,
         Connection $horizonConnection,
+        string $network,
         bool $onlyMissing,
         bool $dryRun,
         \DateTimeImmutable $now,
@@ -232,13 +248,18 @@ SQL,
         int &$skipped,
         int &$failed
     ): void {
-        $issuerToDomain = $this->loadIssuerHomeDomains(
-            $horizonConnection,
-            array_values(array_unique(array_filter(array_map(
-                static fn (array $row): ?string => is_string($row['issuer'] ?? null) ? trim((string) $row['issuer']) : null,
-                $rows
-            ))))
-        );
+        $issuers = array_values(array_unique(array_filter(array_map(
+            static fn (array $row): ?string => is_string($row['issuer'] ?? null) ? trim((string) $row['issuer']) : null,
+            $rows
+        ))));
+        $issuerToDomain = $this->loadIssuerHomeDomains($horizonConnection, $issuers);
+        $configuredFallbacks = $this->configuredHomeDomainFallbacks($network);
+        foreach ($issuers as $issuer) {
+            $fallback = $configuredFallbacks[$issuer] ?? null;
+            if (!isset($issuerToDomain[$issuer]) && is_string($fallback) && trim($fallback) !== '') {
+                $issuerToDomain[$issuer] = trim($fallback);
+            }
+        }
         $tomlByDomain = [];
 
         foreach ($rows as $row) {
@@ -317,6 +338,115 @@ SQL,
                 $failed++;
             }
         }
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function ensureTrackedAssetRows(
+        string $network,
+        int $networkCode,
+        bool $dryRun,
+        \DateTimeImmutable $now
+    ): array {
+        $assetIds = [];
+
+        foreach ($this->configuredAssetSources($network) as $source) {
+            $assetId = $this->connection->fetchOne(
+                'SELECT id FROM asset WHERE network = :network AND code = :code AND issuer = :issuer ORDER BY id ASC LIMIT 1',
+                [
+                    'network' => $networkCode,
+                    'code' => $source['code'],
+                    'issuer' => $source['issuer'],
+                ],
+                ['network' => ParameterType::INTEGER]
+            );
+            if (is_numeric($assetId)) {
+                $assetIds[] = (int) $assetId;
+                continue;
+            }
+            if ($dryRun) {
+                continue;
+            }
+
+            $this->connection->executeStatement(
+                <<<SQL
+INSERT INTO asset (asset_key, network, code, issuer, is_native, created_at, updated_at, rating_average, toml_info)
+VALUES (:asset_key, :network, :code, :issuer, 0, :created_at, :updated_at, NULL, NULL)
+SQL,
+                [
+                    'asset_key' => sprintf('%s-%s', $source['code'], $source['issuer']),
+                    'network' => $networkCode,
+                    'code' => $source['code'],
+                    'issuer' => $source['issuer'],
+                    'created_at' => $now->format('Y-m-d H:i:s'),
+                    'updated_at' => $now->format('Y-m-d H:i:s'),
+                ],
+                ['network' => ParameterType::INTEGER]
+            );
+
+            $assetId = $this->connection->fetchOne(
+                'SELECT id FROM asset WHERE network = :network AND code = :code AND issuer = :issuer ORDER BY id ASC LIMIT 1',
+                [
+                    'network' => $networkCode,
+                    'code' => $source['code'],
+                    'issuer' => $source['issuer'],
+                ],
+                ['network' => ParameterType::INTEGER]
+            );
+            if (is_numeric($assetId)) {
+                $assetIds[] = (int) $assetId;
+            }
+        }
+
+        return array_values(array_unique($assetIds));
+    }
+
+    /**
+     * @return list<array{code:string,issuer:string,home_domain:string}>
+     */
+    private function configuredAssetSources(string $network): array
+    {
+        $sources = $this->trackedAssetSources[$network] ?? [];
+        if (!is_array($sources)) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($sources as $source) {
+            if (!is_array($source)) {
+                continue;
+            }
+            $code = is_string($source['code'] ?? null) ? trim((string) $source['code']) : '';
+            $issuer = is_string($source['issuer'] ?? null) ? trim((string) $source['issuer']) : '';
+            $homeDomain = is_string($source['home_domain'] ?? null) ? strtolower(trim((string) $source['home_domain'])) : '';
+            if (preg_match('/^[A-Za-z0-9]{1,12}$/', $code) !== 1
+                || preg_match('/^G[A-Z2-7]{55}$/', $issuer) !== 1
+                || preg_match('/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/', $homeDomain) !== 1
+            ) {
+                continue;
+            }
+            $result[] = [
+                'code' => $code,
+                'issuer' => $issuer,
+                'home_domain' => $homeDomain,
+            ];
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    private function configuredHomeDomainFallbacks(string $network): array
+    {
+        $fallbacks = [];
+        foreach ($this->configuredAssetSources($network) as $source) {
+            $fallbacks[$source['issuer']] = $source['home_domain'];
+        }
+
+        return $fallbacks;
     }
 
     /**
