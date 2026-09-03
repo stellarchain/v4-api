@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Service\Market;
 
+use App\Service\Stellar\HorizonAssetSupplyCalculator;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -20,6 +21,7 @@ final class MarketSnapshotSyncService
         private readonly Connection $localConnection,
         private readonly ManagerRegistry $doctrine,
         private readonly StellarNetworkResolver $networkResolver,
+        private readonly HorizonAssetSupplyCalculator $assetSupplyCalculator,
     ) {
     }
 
@@ -91,7 +93,7 @@ final class MarketSnapshotSyncService
             $stats = $expStatsMap[$statsKey] ?? [];
 
             $trustlinesTotal = $this->readTrustlinesTotal($stats['accounts'] ?? null);
-            $supply = $this->readSupply($stats['balances'] ?? null);
+            $supply = $this->readSupply($stats['balances'] ?? null, $stats['contracts'] ?? null);
             $volume24h = $this->toFloat($tradeMetrics['volume_xlm_24h'] ?? null);
             $trades24h = $this->toInt($tradeMetrics['trades_24h'] ?? null);
             $priceChange24h = $this->toFloat($tradeMetrics['price_change_24h'] ?? null);
@@ -123,7 +125,7 @@ final class MarketSnapshotSyncService
 
         $nativeStats = $this->loadNativeExpStats($horizonConnection);
         $nativeTrustlines = $this->readTrustlinesTotal($nativeStats['accounts'] ?? null);
-        $nativeSupply = $this->readSupply($nativeStats['balances'] ?? null);
+        $nativeSupply = $this->readSupply($nativeStats['balances'] ?? null, $nativeStats['contracts'] ?? null);
         $nativeScore = $this->computeScore(
             0.0,
             0,
@@ -287,7 +289,7 @@ SQL,
     }
 
     /**
-     * @return list<array{asset_type:int,asset_type_name:string,asset_code:string,asset_issuer:string,accounts:mixed,balances:mixed}>
+     * @return list<array{asset_type:int,asset_type_name:string,asset_code:string,asset_issuer:string,accounts:mixed,balances:mixed,contracts:mixed}>
      */
     private function loadHorizonAssets(Connection $horizonConnection, ?array $assetIds = null): array
     {
@@ -302,7 +304,8 @@ SELECT
     eas.asset_code,
     eas.asset_issuer,
     eas.accounts,
-    eas.balances
+    eas.balances,
+    cas.stat AS contracts
 FROM exp_asset_stats eas
 JOIN history_assets ha
   ON ha.asset_code = eas.asset_code
@@ -311,6 +314,11 @@ JOIN history_assets ha
     (eas.asset_type = 1 AND ha.asset_type = 'credit_alphanum4')
  OR (eas.asset_type = 2 AND ha.asset_type = 'credit_alphanum12')
  )
+LEFT JOIN asset_contracts ac
+  ON ac.asset_type = eas.asset_type
+ AND ac.asset_code = eas.asset_code
+ AND ac.asset_issuer = eas.asset_issuer
+LEFT JOIN contract_asset_stats cas ON cas.contract_id = ac.contract_id
 WHERE eas.asset_type IN (1, 2)
   AND eas.asset_code <> ''
   AND eas.asset_issuer <> ''
@@ -337,12 +345,22 @@ SQL;
     }
 
     /**
-     * @return array{accounts:mixed,balances:mixed}|null
+     * @return array{accounts:mixed,balances:mixed,contracts:mixed}|null
      */
     private function loadNativeExpStats(Connection $horizonConnection): ?array
     {
         $row = $horizonConnection->fetchAssociative(
-            'SELECT accounts, balances FROM exp_asset_stats WHERE asset_type = 0 LIMIT 1'
+            <<<SQL
+SELECT eas.accounts, eas.balances, cas.stat AS contracts
+FROM exp_asset_stats eas
+LEFT JOIN asset_contracts ac
+  ON ac.asset_type = eas.asset_type
+ AND ac.asset_code = eas.asset_code
+ AND ac.asset_issuer = eas.asset_issuer
+LEFT JOIN contract_asset_stats cas ON cas.contract_id = ac.contract_id
+WHERE eas.asset_type = 0
+LIMIT 1
+SQL
         );
         if (!is_array($row)) {
             return null;
@@ -351,6 +369,7 @@ SQL;
         return [
             'accounts' => $row['accounts'] ?? null,
             'balances' => $row['balances'] ?? null,
+            'contracts' => $row['contracts'] ?? null,
         ];
     }
 
@@ -417,8 +436,8 @@ SQL,
     }
 
     /**
-     * @param list<array{asset_type:int,asset_type_name:string,asset_code:string,asset_issuer:string,accounts:mixed,balances:mixed}> $horizonAssets
-     * @return array<string,array{accounts:mixed,balances:mixed}>
+     * @param list<array{asset_type:int,asset_type_name:string,asset_code:string,asset_issuer:string,accounts:mixed,balances:mixed,contracts:mixed}> $horizonAssets
+     * @return array<string,array{accounts:mixed,balances:mixed,contracts:mixed}>
      */
     private function buildExpStatsMap(array $horizonAssets): array
     {
@@ -427,6 +446,7 @@ SQL,
             $map[$this->buildStatsMapKey((int) $row['asset_type'], (string) $row['asset_code'], (string) $row['asset_issuer'])] = [
                 'accounts' => $row['accounts'],
                 'balances' => $row['balances'],
+                'contracts' => $row['contracts'],
             ];
         }
 
@@ -610,18 +630,18 @@ SQL,
         return $authorized + $maintain + $unauthorized;
     }
 
-    private function readSupply(mixed $balancesJson): ?string
+    private function readSupply(mixed $balancesJson, mixed $contractsJson): ?string
     {
         $decoded = $this->decodeJsonObject($balancesJson);
         if ($decoded === null) {
             return null;
         }
+        $contracts = $this->decodeJsonObject($contractsJson);
 
-        $authorized = (string) ($decoded['authorized'] ?? '0');
-        $maintain = (string) ($decoded['authorized_to_maintain_liabilities'] ?? '0');
-        $unauthorized = (string) ($decoded['unauthorized'] ?? '0');
-
-        return bcadd(bcadd($authorized, $maintain, 0), $unauthorized, 0);
+        return $this->assetSupplyCalculator->calculateStroops(
+            $decoded,
+            $contracts['balance'] ?? null
+        );
     }
 
     /**

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Service\Statistics;
 
+use App\Service\Stellar\HorizonAssetSupplyCalculator;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -19,6 +20,7 @@ final class AssetMarketHistorySyncService
         private readonly Connection $statisticsConnection,
         private readonly ManagerRegistry $doctrine,
         private readonly StellarNetworkResolver $networkResolver,
+        private readonly HorizonAssetSupplyCalculator $assetSupplyCalculator,
     ) {
     }
 
@@ -358,7 +360,8 @@ SELECT
     aa.asset_code,
     aa.asset_issuer,
     eas.accounts,
-    eas.balances
+    eas.balances,
+    cas.stat AS contracts
 FROM active_assets aa
 LEFT JOIN exp_asset_stats eas
   ON eas.asset_code = aa.asset_code
@@ -367,6 +370,11 @@ LEFT JOIN exp_asset_stats eas
     (aa.asset_type = 'credit_alphanum4' AND eas.asset_type = 1)
  OR (aa.asset_type = 'credit_alphanum12' AND eas.asset_type = 2)
  )
+LEFT JOIN asset_contracts ac
+  ON ac.asset_type = eas.asset_type
+ AND ac.asset_code = eas.asset_code
+ AND ac.asset_issuer = eas.asset_issuer
+LEFT JOIN contract_asset_stats cas ON cas.contract_id = ac.contract_id
 WHERE aa.asset_type IN ('credit_alphanum4', 'credit_alphanum12')
   AND aa.asset_code IS NOT NULL
   AND aa.asset_code <> ''
@@ -394,6 +402,7 @@ SQL,
         foreach ($rows as $row) {
             $accounts = $this->decodeJsonObject($row['accounts'] ?? null);
             $balances = $this->decodeJsonObject($row['balances'] ?? null);
+            $contracts = $this->decodeJsonObject($row['contracts'] ?? null);
             $authorized = $this->toInt($accounts['authorized'] ?? null, 0) ?? 0;
             $maintain = $this->toInt($accounts['authorized_to_maintain_liabilities'] ?? null, 0) ?? 0;
             $unauthorized = $this->toInt($accounts['unauthorized'] ?? null, 0) ?? 0;
@@ -410,7 +419,10 @@ SQL,
                 'trustlines_authorized_to_maintain_liabilities' => $maintain,
                 'trustlines_unauthorized' => $unauthorized,
                 'trustlines_total' => $authorized + $maintain + $unauthorized,
-                'supply' => $this->sumBalanceParts($balances),
+                'supply' => $this->assetSupplyCalculator->calculateStroops(
+                    $balances,
+                    $contracts['balance'] ?? null
+                ),
             ];
         }
 
@@ -683,22 +695,6 @@ SQL;
         $decoded = json_decode($value, true);
 
         return is_array($decoded) ? $decoded : [];
-    }
-
-    /**
-     * @param array<string,mixed> $balances
-     */
-    private function sumBalanceParts(array $balances): string
-    {
-        $authorized = $this->normalizeNumericString($balances['authorized'] ?? null) ?? '0';
-        $maintain = $this->normalizeNumericString($balances['authorized_to_maintain_liabilities'] ?? null) ?? '0';
-        $unauthorized = $this->normalizeNumericString($balances['unauthorized'] ?? null) ?? '0';
-
-        if (function_exists('bcadd')) {
-            return bcadd(bcadd($authorized, $maintain, 14), $unauthorized, 14);
-        }
-
-        return rtrim(rtrim(number_format(((float) $authorized) + ((float) $maintain) + ((float) $unauthorized), 14, '.', ''), '0'), '.') ?: '0';
     }
 
     private function toInt(mixed $value, ?int $default = null): ?int

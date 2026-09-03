@@ -3,6 +3,7 @@
 namespace App\Command\Horizon;
 
 use App\Command\Support\NetworkOptionTrait;
+use App\Service\Stellar\HorizonAssetSupplyCalculator;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\ParameterType;
@@ -35,6 +36,7 @@ final class SyncAssetHorizonMetricsCommand extends Command
         #[Autowire(service: 'doctrine.dbal.default_connection')]
         private readonly Connection $connection,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
+        private readonly HorizonAssetSupplyCalculator $assetSupplyCalculator,
     ) {
         parent::__construct();
     }
@@ -171,10 +173,15 @@ final class SyncAssetHorizonMetricsCommand extends Command
                 $accountsMaintain = $accountStats->getAuthorizedToMaintainLiabilities();
                 $accountsUnauthorized = $accountStats->getUnauthorized();
                 $trustlinesTotal = $accountsAuthorized + $accountsMaintain + $accountsUnauthorized;
-                $supply = bcadd(
-                    bcadd((string) $balanceStats->getAuthorized(), (string) $balanceStats->getAuthorizedToMaintainLiabilities(), 7),
-                    (string) $balanceStats->getUnauthorized(),
-                    7
+                $supply = $this->assetSupplyCalculator->calculateStroopsFromDecimalUnits(
+                    [
+                        'authorized' => $balanceStats->getAuthorized(),
+                        'authorized_to_maintain_liabilities' => $balanceStats->getAuthorizedToMaintainLiabilities(),
+                        'unauthorized' => $balanceStats->getUnauthorized(),
+                        'claimable_balances' => $assetResponse->getClaimableBalancesAmount(),
+                        'liquidity_pools' => $assetResponse->getLiquidityPoolsAmount(),
+                    ],
+                    $assetResponse->getContractsAmount()
                 );
 
                 $ageDays = $this->ageDaysFromCreatedAt($asset['created_at'] ?? null, $now);
