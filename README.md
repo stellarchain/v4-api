@@ -2,6 +2,8 @@
 
 Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 
+Forward-only history ingestion and preview-first SQL repairs: [operational runbook](docs/forwardfill.md). Deployment and remote writes are separate approval gates.
+
 ## Implemented
 
 - API Platform with `/v1` docs and `/v1/accounts` collection.
@@ -31,7 +33,7 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
   - `app:market:sync-snapshots` (reads Horizon DB with direct `SELECT` queries and persists local market snapshots)
   - `app:horizon:sync-network-metrics` (reads the currently ingested Horizon DB chunk and persists paginated network metric points)
   - `app:horizon:sync-payment-flow-events` (extracts compact payment/create/merge flow events from a Horizon DB chunk)
-  - `app:horizon:sync-asset-market-history` (extracts asset/XLM market buckets and active asset state snapshots from a Horizon DB chunk)
+  - `app:horizon:sync-asset-market-history` (extracts complete asset/XLM market buckets; historical asset-state snapshots are disabled until a historical state source is available)
   - `app:horizon:sync-account-activity-summary` (extracts compact account activity summaries from a Horizon DB chunk)
   - `app:statistics:init-schema` (creates the historical statistics storage tables on the configured statistics database)
   - `app:directory:sync-stellar-expert` (imports missing Stellar Expert directory accounts and only updates existing accounts when Stellar Expert marks them `malicious`)
@@ -82,8 +84,29 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 - The DigitalOcean operational database is updated only by the live cron commands (`app:warm-coingecko-cache`, `app:market:sync-snapshots`, `app:horizon:sync-market-overview`) reading the current mainnet Horizon database.
 - Run `app:statistics:init-schema` against the dedicated statistics database before starting the backfill.
 - `RUN_PAYMENT_FLOW_EVENTS=1` can be added to `bin/horizon-history-backfill.sh` to preserve direct payment/path-payment/create-account/account-merge flow events before Horizon history tables are truncated.
-- `RUN_ASSET_MARKET_HISTORY=1` preserves per-asset XLM market buckets and active asset state snapshots.
+- `RUN_ASSET_MARKET_HISTORY=1` preserves per-asset XLM market buckets, not historical supply/holder snapshots.
 - `RUN_ACCOUNT_ACTIVITY_SUMMARY=1` preserves compact per-range account summaries for later account ranking/statistics imports.
+
+### Historical statistics correctness
+
+- Account activity dates come from `history_ledgers.closed_at`, never transaction ingestion timestamps. Missing ledger timestamps fail the sync before writing summaries.
+- Explicit network/market ranges expand to the complete UTC time buckets intersecting the requested ledgers. A preceding and following ledger must prove the time boundaries, and the ledger sequence must be contiguous. Genesis history starting at ledger 2 is supported. Missing ranges or insufficient context fail rather than reporting a successful partial sync.
+- `bin/horizon-range-stats.sh` ingests `HORIZON_CONTEXT_LEDGERS=1000` extra ledgers on each side when network or asset-market metrics are enabled. Account summaries and payment events still use the original requested range. Metric command output reports the expanded ledger range.
+- The context size is a starting allowance, not proof of completeness. If validation fails, increase context and retry the same chunk. The padded end must already be available in the history source; do not use this historical worker as a live follower.
+- Upserts replace complete bucket values; they do not increment partial totals. Adjacent chunks and retries therefore preserve counts, distinct active accounts and market volumes. Average ledger duration includes the predecessor ledger, and minute trade aggregates use a half-open `[bucket_start, bucket_end)` window.
+- Network sync without explicit ledger bounds processes only proven complete inner buckets; it skips the unproven first/last buckets. No synthetic zeros are inserted for time periods without ledgers.
+- Historical market sync no longer reads current `exp_asset_stats` or contract state as if it were historical. `asset_state_snapshots=0` means no snapshots were written, not that historical supply/holders were zero. Existing snapshot rows and schema remain unchanged.
+- Use an isolated Horizon working database and a single range worker. Concurrent reingestion/cleanup of that database is unsupported. Any extraction failure stops the script before cleanup; retry does not advance the historical backfill checkpoint. Never apply its cleanup mode to the live Horizon database.
+- These changes prevent new incorrect writes. Previously stored bucket values, account dates and asset snapshots still require a separately approved repair. They do not start catch-up or change the backfill direction/state.
+
+Regression checks (no application kernel or `.env` is loaded):
+
+```bash
+php vendor/bin/simple-phpunit --do-not-cache-result tests/Command/HorizonRangeStatsScriptTest.php
+STELLARCHAIN_TEST_PG_PORT=55439 php vendor/bin/simple-phpunit --do-not-cache-result tests/Service/Statistics/HistoricalStatisticsSyncTest.php
+```
+
+The integration suite requires an isolated PostgreSQL instance at `127.0.0.1:55439`, database/user `postgres`, configured for local test authentication. It creates only session-local TEMP tables with synthetic data and skips when the explicit test port is not set. Never point it at an application database. The shell suite uses stub executables, not Horizon or PostgreSQL cleanup commands.
 
 ## Sorting Examples
 

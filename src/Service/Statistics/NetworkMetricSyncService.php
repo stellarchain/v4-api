@@ -20,6 +20,7 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
         private readonly ManagerRegistry $doctrine,
         private readonly StellarNetworkResolver $networkResolver,
         private readonly NetworkMetricCatalog $metricCatalog,
+        private readonly HistoricalBucketWindowResolver $bucketWindowResolver,
     ) {
     }
 
@@ -57,7 +58,7 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
         $this->assertRequiredLedgerColumns($ledgerColumns);
         $transactionLedgerColumn = $this->resolveTransactionLedgerColumn($transactionColumns);
 
-        $window = $this->loadLedgerWindow($horizonConnection, $startLedger, $endLedger);
+        $window = $this->bucketWindowResolver->resolve($horizonConnection, $bucketMinutes, $startLedger, $endLedger);
         if ($window === null) {
             return [
                 'network' => $normalizedNetwork,
@@ -153,8 +154,8 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
         $tradeRows = $this->loadTradeMetricRows(
             $horizonConnection,
             $bucketSeconds,
-            $window['min_closed_at'],
-            $window['max_closed_at']
+            $window['bucket_start'],
+            $window['bucket_end']
         );
         foreach ($tradeRows as $row) {
             $bucketStart = $this->parseUtcDateTime($row['bucket_start'] ?? null);
@@ -255,58 +256,6 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
     }
 
     /**
-     * @return array{
-     *   start_ledger:int,
-     *   end_ledger:int,
-     *   min_closed_at:string,
-     *   max_closed_at:string
-     * }|null
-     */
-    private function loadLedgerWindow(Connection $connection, ?int $startLedger, ?int $endLedger): ?array
-    {
-        $sql = <<<SQL
-SELECT
-    MIN(sequence) AS start_ledger,
-    MAX(sequence) AS end_ledger,
-    MIN(closed_at) AS min_closed_at,
-    MAX(closed_at) AS max_closed_at
-FROM history_ledgers
-SQL;
-
-        $params = [];
-        $types = [];
-
-        if ($startLedger !== null && $endLedger !== null) {
-            $sql .= ' WHERE sequence BETWEEN :start_ledger AND :end_ledger';
-            $params['start_ledger'] = min($startLedger, $endLedger);
-            $params['end_ledger'] = max($startLedger, $endLedger);
-            $types['start_ledger'] = ParameterType::INTEGER;
-            $types['end_ledger'] = ParameterType::INTEGER;
-        }
-
-        $row = $connection->fetchAssociative($sql, $params, $types);
-        if (!is_array($row)) {
-            return null;
-        }
-
-        $resolvedStart = $this->toInt($row['start_ledger'] ?? null);
-        $resolvedEnd = $this->toInt($row['end_ledger'] ?? null);
-        $minClosedAt = trim((string) ($row['min_closed_at'] ?? ''));
-        $maxClosedAt = trim((string) ($row['max_closed_at'] ?? ''));
-
-        if ($resolvedStart === null || $resolvedEnd === null || $minClosedAt === '' || $maxClosedAt === '') {
-            return null;
-        }
-
-        return [
-            'start_ledger' => $resolvedStart,
-            'end_ledger' => $resolvedEnd,
-            'min_closed_at' => $minClosedAt,
-            'max_closed_at' => $maxClosedAt,
-        ];
-    }
-
-    /**
      * @param array<string,bool> $ledgerColumns
      * @return list<array<string,mixed>>
      */
@@ -324,6 +273,7 @@ SQL;
         $sql = <<<SQL
 WITH ledger_rows AS (
     SELECT
+        hl.sequence,
         to_timestamp(floor(extract(epoch FROM hl.closed_at) / :bucket_seconds) * :bucket_seconds) AS bucket_start,
         (COALESCE(hl.transaction_count, 0) + COALESCE(hl.failed_transaction_count, 0)) AS total_transactions,
         {$successExpr} AS successful_transactions,
@@ -331,7 +281,7 @@ WITH ledger_rows AS (
         COALESCE(hl.operation_count, 0) AS operation_count,
         EXTRACT(EPOCH FROM (hl.closed_at - LAG(hl.closed_at) OVER (ORDER BY hl.sequence))) AS ledger_gap_seconds
     FROM history_ledgers hl
-    WHERE hl.sequence BETWEEN :start_ledger AND :end_ledger
+    WHERE hl.sequence BETWEEN :context_start_ledger AND :end_ledger
 )
 SELECT
     bucket_start,
@@ -342,6 +292,7 @@ SELECT
     COALESCE(SUM(operation_count), 0) AS operations,
     AVG(CASE WHEN ledger_gap_seconds IS NOT NULL AND ledger_gap_seconds >= 0 THEN ledger_gap_seconds END) AS avg_ledger_sec
 FROM ledger_rows
+WHERE sequence >= :start_ledger
 GROUP BY bucket_start
 ORDER BY bucket_start ASC
 SQL;
@@ -351,11 +302,13 @@ SQL;
             [
                 'bucket_seconds' => $bucketSeconds,
                 'start_ledger' => $startLedger,
+                'context_start_ledger' => max(1, $startLedger - 1),
                 'end_ledger' => $endLedger,
             ],
             [
                 'bucket_seconds' => ParameterType::INTEGER,
                 'start_ledger' => ParameterType::INTEGER,
+                'context_start_ledger' => ParameterType::INTEGER,
                 'end_ledger' => ParameterType::INTEGER,
             ]
         );
@@ -467,8 +420,8 @@ SQL;
     private function loadTradeMetricRows(
         Connection $connection,
         int $bucketSeconds,
-        string $minClosedAt,
-        string $maxClosedAt
+        string $bucketStartUtc,
+        string $bucketEndUtc
     ): array {
         if (!$this->tableExists($connection, 'history_trades_60000') || !$this->tableExists($connection, 'history_assets')) {
             return [];
@@ -481,8 +434,8 @@ SQL;
             return [];
         }
 
-        $from = new \DateTimeImmutable($minClosedAt, new \DateTimeZone('UTC'));
-        $to = new \DateTimeImmutable($maxClosedAt, new \DateTimeZone('UTC'));
+        $from = new \DateTimeImmutable($bucketStartUtc, new \DateTimeZone('UTC'));
+        $to = new \DateTimeImmutable($bucketEndUtc, new \DateTimeZone('UTC'));
 
         $sql = <<<SQL
 SELECT
@@ -497,7 +450,7 @@ SELECT
     ), 0) AS dex_volume_xlm_raw
 FROM history_trades_60000
 WHERE timestamp >= :from_ts_ms
-  AND timestamp <= :to_ts_ms
+  AND timestamp < :to_ts_ms
   AND (base_asset_id = :native_asset_id OR counter_asset_id = :native_asset_id)
 GROUP BY bucket_start
 ORDER BY bucket_start ASC
@@ -645,7 +598,7 @@ SQL;
             return null;
         }
 
-        return new \DateTimeImmutable(trim($value), new \DateTimeZone('UTC'));
+        return (new \DateTimeImmutable(trim($value), new \DateTimeZone('UTC')))->setTimezone(new \DateTimeZone('UTC'));
     }
 
     private function toInt(mixed $value, ?int $default = null): ?int

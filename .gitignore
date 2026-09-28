@@ -14,3 +14,8 @@ resources/projects/.DS_Store
 resources/projects/images/.DS_Store
 .DS_Store
 .vscode
+
+# Forwardfill runtime state and stable single-host lock files.
+/.tmp/horizon-forwardfill-*.json
+/.tmp/forwardfill-*.lock
+/.tmp/.forwardfill-*
