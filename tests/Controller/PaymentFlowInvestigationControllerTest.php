@@ -28,7 +28,9 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 ?int $ledgerFrom,
                 ?int $ledgerTo,
                 string $direction,
-                int $limit
+                int $limit,
+                ?string $cursor = null,
+                ?string $operationType = null
             ): array {
                 $this->calls[] = [$network, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $limit];
 
@@ -89,7 +91,9 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 ?int $ledgerFrom,
                 ?int $ledgerTo,
                 string $direction,
-                int $limit
+                int $limit,
+                ?string $cursor = null,
+                ?string $operationType = null
             ): array {
                 throw new StatisticsUnavailableException('No table.');
             }
@@ -102,6 +106,26 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
         self::assertSame('statistics_unavailable', json_decode((string) $response->getContent(), true)['error']['type']);
     }
 
+    public function testMalformedOrOverflowingLedgerFiltersAreRejected(): void
+    {
+        $controller = new PaymentFlowInvestigationController($this->unusedService());
+        foreach (['abc', '0', '-1', '2147483648', '9999999999999999999999', ''] as $value) {
+            $response = $controller(Request::create('/v1/payment-flow/investigation', 'GET', [
+                'txHash' => str_repeat('a', 64), 'ledgerFrom' => $value,
+            ]));
+            self::assertSame(400, $response->getStatusCode());
+        }
+    }
+
+    public function testUnsupportedOperationIsRejected(): void
+    {
+        $controller = new PaymentFlowInvestigationController($this->unusedService());
+        $response = $controller(Request::create('/v1/payment-flow/investigation', 'GET', [
+            'txHash' => str_repeat('a', 64), 'operationType' => 'invoke_host_function',
+        ]));
+        self::assertSame(400, $response->getStatusCode());
+    }
+
     private function unusedService(): PaymentFlowInvestigationReadServiceInterface
     {
         return new class implements PaymentFlowInvestigationReadServiceInterface {
@@ -112,7 +136,9 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 ?int $ledgerFrom,
                 ?int $ledgerTo,
                 string $direction,
-                int $limit
+                int $limit,
+                ?string $cursor = null,
+                ?string $operationType = null
             ): array {
                 throw new \LogicException('The service should not be called.');
             }

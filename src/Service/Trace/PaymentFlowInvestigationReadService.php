@@ -35,14 +35,24 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         ?int $ledgerFrom,
         ?int $ledgerTo,
         string $direction,
-        int $limit
+        int $limit,
+        ?string $cursor = null,
+        ?string $operationType = null
     ): array {
         $normalizedNetwork = $this->networkResolver->normalizeNetwork($network, 'mainnet');
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
         $address = $this->normalizeNullableString($address);
         $txHash = $this->normalizeNullableString($txHash);
+        $scope = hash('sha256', json_encode([$normalizedNetwork, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $operationType], JSON_THROW_ON_ERROR));
+        $position = $this->decodeCursor($cursor, $scope);
+        $ownsTransaction = !$this->statisticsConnection->isTransactionActive();
 
         try {
+            if ($ownsTransaction) {
+                $this->statisticsConnection->beginTransaction();
+                $this->statisticsConnection->executeStatement('SET TRANSACTION READ ONLY');
+                $this->statisticsConnection->executeStatement("SET LOCAL statement_timeout = '8s'");
+            }
             foreach (self::REQUIRED_TABLES as $table) {
                 if (!$this->tableExists($table)) {
                     throw new StatisticsUnavailableException(sprintf('Statistics table %s is not available.', $table));
@@ -51,18 +61,30 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
 
             $addressId = $address !== null ? $this->loadAddressId($networkCode, $address) : null;
             $txId = $txHash !== null ? $this->loadTransactionId($networkCode, $txHash) : null;
-
+            $latest = $this->statisticsConnection->fetchAssociative(
+                'SELECT ledger, closed_at FROM payment_flow_transaction WHERE network = :network ORDER BY ledger DESC, id DESC LIMIT 1',
+                ['network' => $networkCode], ['network' => ParameterType::INTEGER]
+            );
+            $anchorLedger = $position['anchor'] ?? ($latest ? (int) $latest['ledger'] : null);
+            $effectiveTo = $anchorLedger === null ? $ledgerTo : min($ledgerTo ?? $anchorLedger, $anchorLedger);
             if (($address !== null && $addressId === null) || ($txHash !== null && $txId === null)) {
-                [$accounts, $accountMetadataUnavailable] = $this->loadAccountMetadata($networkCode, $address !== null ? [$address] : []);
-
-                return $this->emptyPayload($normalizedNetwork, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $limit, $accounts, $accountMetadataUnavailable);
+                $rows = [];
+            } else {
+                $rows = $this->loadEvents($networkCode, $addressId, $txId, $ledgerFrom, $effectiveTo, $direction, $limit + 1, $position, $operationType);
             }
-
-            $rows = $this->loadEvents($networkCode, $addressId, $txId, $ledgerFrom, $ledgerTo, $direction, $limit + 1);
         } catch (StatisticsUnavailableException $exception) {
             throw $exception;
         } catch (Exception $exception) {
             throw new StatisticsUnavailableException('Payment flow statistics database is unavailable.', 0, $exception);
+        } finally {
+            if ($ownsTransaction && $this->statisticsConnection->isTransactionActive()) {
+                try {
+                    $this->statisticsConnection->rollBack();
+                } catch (Exception) {
+                    // Preserve the availability error if the server disconnected before rollback.
+                    $this->statisticsConnection->close();
+                }
+            }
         }
 
         $hasMore = count($rows) > $limit;
@@ -70,7 +92,10 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
             array_pop($rows);
         }
 
-        $events = array_map(fn (array $row): array => $this->normalizeEvent($row, $address), $rows);
+        $events = [];
+        foreach ($rows as $row) {
+            $events[] = $this->normalizeEvent($row, $address);
+        }
         [$accounts, $accountMetadataUnavailable] = $this->loadAccountMetadata($networkCode, $this->collectAccountAddresses($events, $address));
         $events = $this->enrichEventsWithAccountMetadata($events, $accounts);
         $summary = $this->buildSummary($events, $address);
@@ -85,6 +110,8 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'ledgerTo' => $ledgerTo,
                 'direction' => $direction,
                 'limit' => $limit,
+                'cursor' => $cursor,
+                'operationType' => $operationType,
             ],
             'coverage' => [
                 'rowsReturned' => count($events),
@@ -93,7 +120,13 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'lastLedger' => $summary['lastLedger'],
                 'firstClosedAt' => $summary['firstClosedAt'],
                 'lastClosedAt' => $summary['lastClosedAt'],
-                'isPartial' => $hasMore,
+                'isPartial' => $hasMore || $position !== null,
+                'scope' => 'page',
+                'nextCursor' => $hasMore ? $this->encodeCursor($rows[count($rows) - 1], $anchorLedger ?? (int) $rows[0]['ledger'], $scope) : null,
+                'latestObservedLedger' => $latest ? (int) $latest['ledger'] : null,
+                'latestObservedClosedAt' => $latest ? $this->formatAtom($latest['closed_at']) : null,
+                'completeHistoryVerified' => false,
+                'note' => 'Successful classic payment-flow operations only. Page summaries are not account totals; the latest observed ledger is not proof of gap-free ingestion.',
             ],
             'summary' => $summary,
             'riskContext' => $riskContext,
@@ -103,6 +136,31 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
             'counterparties' => $this->buildCounterparties($events, $address, $accounts),
             'events' => $events,
         ];
+    }
+
+    private function decodeCursor(?string $cursor, string $scope): ?array
+    {
+        if ($cursor === null) {
+            return null;
+        }
+        $decoded = strlen($cursor) <= 512 ? base64_decode(strtr($cursor, '-_', '+/'), true) : false;
+        $value = $decoded === false ? null : json_decode($decoded, true);
+        if (!is_array($value) || ($value['v'] ?? null) !== 1 || ($value['scope'] ?? null) !== $scope
+            || !is_int($value['ledger'] ?? null) || $value['ledger'] < 1 || $value['ledger'] > 2147483647
+            || !is_int($value['anchor'] ?? null) || $value['anchor'] < $value['ledger'] || $value['anchor'] > 2147483647
+            || !is_string($value['id'] ?? null) || !ctype_digit($value['id'])
+            || strlen($value['id']) > 19 || (int) $value['id'] < 1 || (string) (int) $value['id'] !== $value['id']) {
+            throw new \InvalidArgumentException('Invalid cursor or cursor does not match the current filters.');
+        }
+        return $value;
+    }
+
+    private function encodeCursor(array $row, int $anchor, string $scope): string
+    {
+        return rtrim(strtr(base64_encode(json_encode([
+            'v' => 1, 'ledger' => (int) $row['ledger'], 'id' => (string) $row['id'],
+            'anchor' => $anchor, 'scope' => $scope,
+        ], JSON_THROW_ON_ERROR)), '+/', '-_'), '=');
     }
 
     private function tableExists(string $table): bool
@@ -157,7 +215,9 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         ?int $ledgerFrom,
         ?int $ledgerTo,
         string $direction,
-        int $limit
+        int $limit,
+        ?array $position,
+        ?string $operationType
     ): array {
         $where = ['e.network = :network'];
         $params = [
@@ -177,8 +237,6 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 $where[] = 'e.to_address_id = :address_id';
             } elseif ($direction === 'outgoing') {
                 $where[] = 'e.from_address_id = :address_id';
-            } else {
-                $where[] = '(e.from_address_id = :address_id OR e.to_address_id = :address_id)';
             }
         }
 
@@ -198,6 +256,32 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
             $where[] = 'e.ledger <= :ledger_to';
             $params['ledger_to'] = $ledgerTo;
             $types['ledger_to'] = ParameterType::INTEGER;
+        }
+
+        if ($position !== null) {
+            $where[] = '(e.ledger, e.id) < (:cursor_ledger, CAST(:cursor_id AS BIGINT))';
+            $params['cursor_ledger'] = $position['ledger'];
+            $params['cursor_id'] = $position['id'];
+            $types['cursor_ledger'] = ParameterType::INTEGER;
+            $types['cursor_id'] = ParameterType::STRING;
+        }
+        if ($operationType !== null) {
+            $where[] = 'e.operation_type = :operation_type';
+            $params['operation_type'] = $operationType;
+            $types['operation_type'] = ParameterType::STRING;
+        }
+        $predicate = implode(' AND ', $where);
+        // Exclude orphaned/mismatched transaction references before each branch limit.
+        $candidateSource = 'SELECT e.* FROM payment_flow_event e INNER JOIN payment_flow_transaction candidate_tx'
+            . ' ON candidate_tx.id = e.tx_id AND candidate_tx.network = e.network WHERE ' . $predicate;
+        $selection = $candidateSource . ' ORDER BY e.ledger DESC, e.id DESC LIMIT :limit';
+        if ($addressId !== null && $direction === 'both') {
+            // Bound both index walks before merging; self-transfers appear only once.
+            $selection = '(' . $candidateSource
+                . ' AND e.from_address_id = :address_id ORDER BY e.ledger DESC, e.id DESC LIMIT :limit) UNION ALL '
+                . '(' . $candidateSource
+                . ' AND e.to_address_id = :address_id AND e.from_address_id IS DISTINCT FROM :address_id'
+                . ' ORDER BY e.ledger DESC, e.id DESC LIMIT :limit)';
         }
 
         $sql = sprintf(
@@ -224,18 +308,17 @@ SELECT
     destination_asset.asset_type AS destination_asset_type,
     destination_asset.asset_code AS destination_asset_code,
     destination_asset.asset_issuer AS destination_asset_issuer
-FROM payment_flow_event e
-INNER JOIN payment_flow_transaction t ON t.id = e.tx_id
+FROM (%s) e
+INNER JOIN payment_flow_transaction t ON t.id = e.tx_id AND t.network = e.network
 LEFT JOIN payment_flow_address source_account ON source_account.id = e.source_account_id
 LEFT JOIN payment_flow_address from_address ON from_address.id = e.from_address_id
 LEFT JOIN payment_flow_address to_address ON to_address.id = e.to_address_id
 LEFT JOIN payment_flow_asset source_asset ON source_asset.id = e.source_asset_id
 LEFT JOIN payment_flow_asset destination_asset ON destination_asset.id = e.destination_asset_id
-WHERE %s
 ORDER BY e.ledger DESC, e.id DESC
 LIMIT :limit
 SQL,
-            implode(' AND ', $where)
+            $selection
         );
 
         return $this->statisticsConnection->fetchAllAssociative($sql, $params, $types);
@@ -311,8 +394,8 @@ SQL,
         $accountMerges = 0;
         $createAccounts = 0;
         $memoCount = 0;
-        $nativeReceived = 0.0;
-        $nativeSent = 0.0;
+        $nativeReceived = '0';
+        $nativeSent = '0';
 
         foreach ($events as $event) {
             $ledgerValues[] = (int) $event['ledger'];
@@ -324,12 +407,12 @@ SQL,
             if ($event['direction'] === 'incoming') {
                 $incoming++;
                 if (($event['destinationAsset']['type'] ?? '') === 'native') {
-                    $nativeReceived += (float) ((string) ($event['destinationAmount'] ?? '0'));
+                    $nativeReceived = $this->addDecimal($nativeReceived, $event['destinationAmount']);
                 }
             } elseif ($event['direction'] === 'outgoing') {
                 $outgoing++;
                 if (($event['sourceAsset']['type'] ?? '') === 'native') {
-                    $nativeSent += (float) ((string) ($event['sourceAmount'] ?? '0'));
+                    $nativeSent = $this->addDecimal($nativeSent, $event['sourceAmount']);
                 }
             }
 
@@ -534,7 +617,7 @@ SQL,
                 'source' => $from,
                 'target' => $to,
                 'count' => 0,
-                'totalXlm' => 0.0,
+                'totalXlm' => '0',
                 'assets' => [],
                 'latestLedger' => 0,
                 'latestClosedAt' => null,
@@ -545,7 +628,7 @@ SQL,
             if (is_array($asset)) {
                 $edges[$edgeKey]['assets'][(string) $asset['display']] = true;
                 if (($asset['type'] ?? '') === 'native') {
-                    $edges[$edgeKey]['totalXlm'] += (float) ((string) ($event['destinationAmount'] ?? '0'));
+                    $edges[$edgeKey]['totalXlm'] = $this->addDecimal($edges[$edgeKey]['totalXlm'], $event['destinationAmount']);
                 }
             }
             if ((int) $event['ledger'] > (int) $edges[$edgeKey]['latestLedger']) {
@@ -555,17 +638,17 @@ SQL,
         }
 
         $edgeRows = array_values($edges);
-        usort($edgeRows, static fn (array $a, array $b): int => $b['count'] <=> $a['count']);
+        usort($edgeRows, [self::class, 'compareByEventCount']);
         $edgeRows = array_slice($edgeRows, 0, 60);
+        foreach ($edgeRows as &$edge) {
+            $edge['totalXlm'] = $this->normalizeNumber($edge['totalXlm']);
+            $edge['assets'] = array_keys($edge['assets']);
+        }
+        unset($edge);
 
         return [
             'nodes' => array_values($nodes),
-            'edges' => array_map(function (array $edge): array {
-                $edge['totalXlm'] = $this->normalizeNumber((float) $edge['totalXlm']);
-                $edge['assets'] = array_keys($edge['assets']);
-
-                return $edge;
-            }, $edgeRows),
+            'edges' => $edgeRows,
         ];
     }
 
@@ -595,8 +678,8 @@ SQL,
                 'lastLedger' => null,
                 'firstClosedAt' => null,
                 'lastClosedAt' => null,
-                'nativeReceived' => 0.0,
-                'nativeSent' => 0.0,
+                'nativeReceived' => '0',
+                'nativeSent' => '0',
                 'assets' => [],
             ];
 
@@ -614,12 +697,12 @@ SQL,
             if ($event['direction'] === 'incoming') {
                 $counterparties[$address]['incoming']++;
                 if (($event['destinationAsset']['type'] ?? '') === 'native') {
-                    $counterparties[$address]['nativeReceived'] += (float) ((string) ($event['destinationAmount'] ?? '0'));
+                    $counterparties[$address]['nativeReceived'] = $this->addDecimal($counterparties[$address]['nativeReceived'], $event['destinationAmount']);
                 }
             } elseif ($event['direction'] === 'outgoing') {
                 $counterparties[$address]['outgoing']++;
                 if (($event['sourceAsset']['type'] ?? '') === 'native') {
-                    $counterparties[$address]['nativeSent'] += (float) ((string) ($event['sourceAmount'] ?? '0'));
+                    $counterparties[$address]['nativeSent'] = $this->addDecimal($counterparties[$address]['nativeSent'], $event['sourceAmount']);
                 }
             }
 
@@ -632,16 +715,17 @@ SQL,
         }
 
         $rows = array_values($counterparties);
-        usort($rows, static fn (array $a, array $b): int => $b['events'] <=> $a['events']);
-
-        return array_map(function (array $row) use ($accounts): array {
-            $row['nativeReceived'] = $this->normalizeNumber((float) $row['nativeReceived']);
-            $row['nativeSent'] = $this->normalizeNumber((float) $row['nativeSent']);
+        usort($rows, [self::class, 'compareCounterpartiesByEventCount']);
+        $rows = array_slice($rows, 0, 25);
+        foreach ($rows as &$row) {
+            $row['nativeReceived'] = $this->normalizeNumber($row['nativeReceived']);
+            $row['nativeSent'] = $this->normalizeNumber($row['nativeSent']);
             $row['assets'] = array_slice(array_keys($row['assets']), 0, 8);
             $row['account'] = $this->accountMetadataFor((string) $row['address'], $accounts);
+        }
+        unset($row);
 
-            return $row;
-        }, array_slice($rows, 0, 25));
+        return $rows;
     }
 
     /**
@@ -873,15 +957,32 @@ SQL,
             return null;
         }
 
-        return $this->normalizeNumber((float) (string) $value);
+        return $this->normalizeNumber((string) $value);
     }
 
-    private function normalizeNumber(float $value): string
+    private function addDecimal(string $total, ?string $amount): string
     {
-        $normalized = number_format($value, 14, '.', '');
-        $normalized = rtrim($normalized, '0');
+        // Payment flow amounts are stored as NUMERIC(36, 14); never round them through a float.
+        return bcadd($total, $amount ?? '0', 14);
+    }
 
-        return rtrim($normalized, '.') ?: '0';
+    private function normalizeNumber(string $value): string
+    {
+        if (!str_contains($value, '.')) {
+            return $value;
+        }
+
+        return rtrim(rtrim($value, '0'), '.');
+    }
+
+    private static function compareByEventCount(array $a, array $b): int
+    {
+        return $b['count'] <=> $a['count'];
+    }
+
+    private static function compareCounterpartiesByEventCount(array $a, array $b): int
+    {
+        return $b['events'] <=> $a['events'];
     }
 
     private function formatAtom(mixed $value): ?string

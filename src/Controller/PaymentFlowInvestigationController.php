@@ -19,6 +19,7 @@ final class PaymentFlowInvestigationController
     private const MAX_LIMIT = 200;
     private const ALLOWED_DIRECTIONS = ['both', 'incoming', 'outgoing'];
     private const ALLOWED_NETWORKS = ['mainnet', 'public', 'testnet', 'test', 'futurenet', 'future'];
+    private const OPERATION_TYPES = ['create_account', 'payment', 'path_payment_strict_receive', 'path_payment_strict_send', 'account_merge'];
 
     public function __construct(
         private readonly PaymentFlowInvestigationReadServiceInterface $paymentFlowInvestigationReadService,
@@ -58,9 +59,20 @@ final class PaymentFlowInvestigationController
 
         $ledgerFrom = $this->queryPositiveInt($request, 'ledgerFrom', null);
         $ledgerTo = $this->queryPositiveInt($request, 'ledgerTo', null);
+        foreach (['ledgerFrom' => $ledgerFrom, 'ledgerTo' => $ledgerTo] as $key => $value) {
+            if ($request->query->has($key) && $value === null) {
+                return $this->error($key . ' must be a positive 32-bit integer.', Response::HTTP_BAD_REQUEST, 'invalid_ledger_range');
+            }
+        }
         if ($ledgerFrom !== null && $ledgerTo !== null && $ledgerFrom > $ledgerTo) {
             return $this->error('ledgerFrom must be lower than or equal to ledgerTo.', Response::HTTP_BAD_REQUEST, 'invalid_ledger_range');
         }
+
+        $operationType = $this->queryString($request, 'operationType', '');
+        if ($operationType !== '' && !in_array($operationType, self::OPERATION_TYPES, true)) {
+            return $this->error('Invalid payment-flow operation type.', Response::HTTP_BAD_REQUEST, 'invalid_operation_type');
+        }
+        $cursor = $this->queryString($request, 'cursor', '');
 
         try {
             $payload = $this->paymentFlowInvestigationReadService->read(
@@ -70,8 +82,12 @@ final class PaymentFlowInvestigationController
                 $ledgerFrom,
                 $ledgerTo,
                 $direction,
-                $limit
+                $limit,
+                $cursor === '' ? null : $cursor,
+                $operationType === '' ? null : $operationType
             );
+        } catch (\InvalidArgumentException) {
+            return $this->error('Invalid cursor. Restart pagination after changing filters.', Response::HTTP_BAD_REQUEST, 'invalid_cursor');
         } catch (StatisticsUnavailableException) {
             return $this->error('Payment flow statistics are temporarily unavailable.', Response::HTTP_SERVICE_UNAVAILABLE, 'statistics_unavailable');
         }
@@ -132,12 +148,12 @@ final class PaymentFlowInvestigationController
             return $default;
         }
         if (is_int($value)) {
-            return $value > 0 ? $value : null;
+            return $value > 0 && $value <= 2147483647 ? $value : null;
         }
         if (is_string($value) && preg_match('/^[0-9]+$/', trim($value)) === 1) {
             $parsed = (int) trim($value);
 
-            return $parsed > 0 ? $parsed : null;
+            return $parsed > 0 && $parsed <= 2147483647 ? $parsed : null;
         }
 
         return null;

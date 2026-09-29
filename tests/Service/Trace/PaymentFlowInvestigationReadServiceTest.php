@@ -116,6 +116,46 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         self::assertSame(0, $payload['riskContext']['score']);
     }
 
+    public function testItPreservesExactAmountsInEventsAndPageAggregates(): void
+    {
+        $first = $this->paymentFlowRow();
+        $first['source_amount_decimal'] = '12345678901234567890.12345678901234';
+        $first['destination_amount_decimal'] = '12345678901234567890.12345678901234';
+
+        $second = $this->paymentFlowRow();
+        $second['id'] = 1002;
+        $second['operation_id'] = '268341957822431234';
+        $second['source_amount_decimal'] = '0.00000000000001';
+        $second['destination_amount_decimal'] = '0.00000000000001';
+
+        $outgoing = $this->paymentFlowRow();
+        $outgoing['id'] = 1003;
+        $outgoing['operation_id'] = '268341957822431235';
+        $outgoing['from_address'] = self::FOCUS_ADDRESS;
+        $outgoing['to_address'] = self::COUNTERPARTY_ADDRESS;
+        $outgoing['source_amount_decimal'] = '0.5';
+        $outgoing['destination_amount_decimal'] = '0.5';
+
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows([$first, $second, $outgoing]),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $payload = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 50);
+
+        self::assertSame('12345678901234567890.12345678901234', $payload['events'][0]['sourceAmount']);
+        self::assertSame('12345678901234567890.12345678901234', $payload['events'][0]['destinationAmount']);
+        self::assertSame('0.00000000000001', $payload['events'][1]['destinationAmount']);
+        self::assertSame('12345678901234567890.12345678901235', $payload['summary']['nativeReceived']);
+        self::assertSame('0.5', $payload['summary']['nativeSent']);
+        self::assertSame('12345678901234567890.12345678901235', $payload['graph']['edges'][0]['totalXlm']);
+        self::assertSame('12345678901234567890.12345678901235', $payload['counterparties'][0]['nativeReceived']);
+        self::assertSame('0.5', $payload['counterparties'][0]['nativeSent']);
+    }
+
     /**
      * @param list<array<string,mixed>> $rows
      */
