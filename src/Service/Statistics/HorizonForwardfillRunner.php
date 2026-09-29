@@ -304,12 +304,15 @@ final class HorizonForwardfillRunner
     /** @param resource $lock */
     private function runRangeWithRetries(int $start, int $end, $lock): void
     {
+        $statisticsUrl = $this->withDoctrineCharset($this->environment['DATABASE_STATISTICS_URL']);
+        $horizonUrl = $this->withDoctrineCharset($this->environment['HORIZON_DATABASE_URL']);
         $environment = array_replace($this->environment, [
             'START_LEDGER' => (string) $start, 'END_LEDGER' => (string) $end,
-            'DATABASE_URL' => $this->environment['DATABASE_STATISTICS_URL'],
-            'DATABASE_CONTRACTS_URL' => $this->environment['DATABASE_STATISTICS_URL'],
-            'DATABASE_HORIZON_URL' => $this->environment['HORIZON_DATABASE_URL'],
-            'HORIZON_APP_DATABASE_URL' => $this->environment['HORIZON_DATABASE_URL'],
+            'DATABASE_URL' => $statisticsUrl,
+            'DATABASE_STATISTICS_URL' => $statisticsUrl,
+            'DATABASE_CONTRACTS_URL' => $statisticsUrl,
+            'DATABASE_HORIZON_URL' => $horizonUrl,
+            'HORIZON_APP_DATABASE_URL' => $horizonUrl,
         ]);
         for ($attempt = 1; $attempt <= $this->positiveInt('MAX_ATTEMPTS'); ++$attempt) {
             if ($this->stopping) {
@@ -330,6 +333,23 @@ final class HorizonForwardfillRunner
             }
             $this->pause(min(300, $this->positiveInt('RETRY_SECONDS') * $attempt));
         }
+    }
+
+    private function withDoctrineCharset(string $url): string
+    {
+        parse_str(parse_url($url, PHP_URL_QUERY) ?? '', $query);
+        if (array_key_exists('charset', $query)) {
+            return $url;
+        }
+
+        // DoctrineBundle 3.2.2 requires charset or serverVersion before it can connect.
+        // Add metadata only to Symfony URLs; keep the native Horizon URL unchanged.
+        $fragmentPosition = strpos($url, '#');
+        $baseUrl = $fragmentPosition === false ? $url : substr($url, 0, $fragmentPosition);
+        $fragment = $fragmentPosition === false ? '' : substr($url, $fragmentPosition);
+        $separator = str_contains($baseUrl, '?') ? '&' : '?';
+
+        return $baseUrl . $separator . 'charset=utf8' . $fragment;
     }
 
     private function pause(int $seconds): void

@@ -19,6 +19,8 @@ The runner consumes exported environment variables, **not `.env`**. Keep secrets
 - `ARCHIVE_STATE_URL`: HTTPS `.well-known/stellar-history.json` for that network. Mainnet: `https://history.stellar.org/prd/core-live/core_live_001/.well-known/stellar-history.json`.
 - `START_LEDGER`: first unprocessed logical ledger; required only for a new forward checkpoint.
 
+Keep `HORIZON_DATABASE_URL` compatible with native Horizon/libpq: do not add Doctrine-only `serverVersion` or `charset` parameters. The runner adds `charset=utf8` only to the Symfony connection URLs when missing, preserving existing options and explicit charsets. This avoids DoctrineBundle 3.2.2 initializing the platform with an empty version; PostgreSQL version detection remains available on connection. The native Horizon URL and checkpoint identity are unchanged.
+
 Defaults: `NETWORK=mainnet`, `FORWARDFILL_MODE=once`, `APP_MODE=docker` (existing worker convention), `LEDGERS_PER_RANGE=10000`, `HORIZON_CONTEXT_LEDGERS=128`, `MIN_RANGE_LEDGERS=64`, `POLL_SECONDS=30`, `MAX_ATTEMPTS=3`, `RETRY_SECONDS=30`; metric buckets **5 minutes**. Use `APP_MODE=host` when Symfony runs on the host. Retain the deployment's existing `HORIZON_BIN`, `HORIZON_WORKERS`, captive-core and archive configuration.
 
 Mainnet/testnet only; the archive's passphrase must match. Testnet resets require a reviewed state/DB transition. `ARCHIVE_HEAD_FILE` permits a local archive JSON for offline testing, not continuous follow.

@@ -44,6 +44,63 @@ final class HorizonForwardfillRunnerTest extends TestCase
         self::assertStringNotContainsString('password', file_get_contents($this->directory . '/state.json'));
     }
 
+    public function testNativeUrlsInitializeDoctrineWithoutChangingTheHorizonUrl(): void
+    {
+        $horizonUrl = 'postgresql://user:p%40ss%23word@127.0.0.1:1/horizon?sslmode=disable';
+        $statisticsUrl = 'postgresql://user:p%40ss%23word@127.0.0.1:1/statistics';
+        $result = $this->runScript([
+            'HORIZON_DATABASE_URL' => $horizonUrl,
+            'DATABASE_STATISTICS_URL' => $statisticsUrl,
+            'STATISTICS_TEST_DOCTRINE_CONNECTIONS' => '1',
+            'STATISTICS_TEST_EXPECT_HORIZON_URL' => $horizonUrl,
+            'STATISTICS_TEST_EXPECT_HORIZON_APP_URL' => $horizonUrl . '&charset=utf8',
+            'STATISTICS_TEST_EXPECT_STATISTICS_APP_URL' => $statisticsUrl . '?charset=utf8',
+        ]);
+
+        self::assertSame(0, $result['exit'], $result['output']);
+        self::assertSame(4, substr_count($this->calls(), 'doctrine connections initialized'));
+        self::assertSame(2020, $this->state()['next_ledger']);
+        self::assertNull($this->state()['pending_end']);
+        self::assertSame(hash('sha256', '127.0.0.1:1/horizon|127.0.0.1:1/statistics'), $this->state()['identity']);
+    }
+
+    public function testTestnetDoctrineUrlsPreserveConfiguredCharsetAndServerVersion(): void
+    {
+        $this->head(2100, 'Test SDF Network ; September 2015');
+        $horizonUrl = 'postgresql://user:password@127.0.0.1:1/horizon?sslmode=require&application_name=forwardfill';
+        $statisticsUrl = 'postgresql://user:password@127.0.0.1:1/statistics?sslmode=require&serverVersion=14.24.0&charset=UTF8';
+        $result = $this->runScript([
+            'NETWORK' => 'testnet',
+            'HORIZON_DATABASE_URL' => $horizonUrl,
+            'DATABASE_STATISTICS_URL' => $statisticsUrl,
+            'STATISTICS_TEST_DOCTRINE_CONNECTIONS' => '1',
+            'STATISTICS_TEST_EXPECT_HORIZON_URL' => $horizonUrl,
+            'STATISTICS_TEST_EXPECT_HORIZON_APP_URL' => $horizonUrl . '&charset=utf8',
+            'STATISTICS_TEST_EXPECT_STATISTICS_APP_URL' => $statisticsUrl,
+        ]);
+
+        self::assertSame(0, $result['exit'], $result['output']);
+        self::assertSame(4, substr_count($this->calls(), 'doctrine connections initialized'));
+        self::assertSame(2020, $this->state()['next_ledger']);
+    }
+
+    public function testDoctrineCharsetIsAddedBeforeTheUrlFragment(): void
+    {
+        $horizonUrl = 'postgresql://user:password@127.0.0.1:1/horizon';
+        $statisticsUrl = 'postgresql://user:password@127.0.0.1:1/statistics?sslmode=disable&serverVersion=14.24.0';
+        $result = $this->runScript([
+            'HORIZON_DATABASE_URL' => $horizonUrl,
+            'DATABASE_STATISTICS_URL' => $statisticsUrl . '#statistics',
+            'STATISTICS_TEST_DOCTRINE_CONNECTIONS' => '1',
+            'STATISTICS_TEST_EXPECT_HORIZON_URL' => $horizonUrl,
+            'STATISTICS_TEST_EXPECT_HORIZON_APP_URL' => $horizonUrl . '?charset=utf8',
+            'STATISTICS_TEST_EXPECT_STATISTICS_APP_URL' => $statisticsUrl . '&charset=utf8#statistics',
+        ]);
+
+        self::assertSame(0, $result['exit'], $result['output']);
+        self::assertSame(4, substr_count($this->calls(), 'doctrine connections initialized'));
+    }
+
     public function testFailedRangeIsRetriedExactlyAfterHeadGrowsAndChunkSizeChanges(): void
     {
         $result = $this->runScript(['STATISTICS_TEST_FAIL_COMMAND' => 'app:horizon:sync-account-activity-summary']);
