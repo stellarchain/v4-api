@@ -10,7 +10,7 @@ Example: `/v1/network-metrics?network=mainnet&metricKey=transactions&bucketMinut
 
 Reader-owned PostgreSQL transactions use a repeatable-read, read-only snapshot and an 8-second per-statement timeout. A caller-owned transaction is not modified. This is a query safety bound, not a measured latency guarantee; multiple statements may take longer in total. A DB timeout is returned as `503 statistics_unavailable`. Before public rollout, notify external API consumers and check bounded count/page queries with a low-load, read-only plan and representative runtime samples. Do not run unbounded `EXPLAIN ANALYZE` on the historical tables.
 
-QA still required: import/export and failure recovery in Investigator; chart empty/error/older-page behavior; narrow viewport and keyboard flows; exact CSV/JSON parity with the visible page; independent historical value reconciliation. A local 200 response or populated chart is not a correctness signoff.
+QA still required: manual case-queue import and controlled failure recovery in Investigator, representative depth-2 runtime checks, broader chart error-state coverage, and independent historical value reconciliation. Local browser QA has covered queue save/export/remove, Advanced JSON/CSV/HTML export inspection, chart empty/older-page behavior, a 390 px viewport, keyboard tooltip/navigation flows, and current-page export row counts. Those sampled workflows and a local 200 response are not a correctness or production-latency signoff.
 
 ## 2. Investigator V2
 
