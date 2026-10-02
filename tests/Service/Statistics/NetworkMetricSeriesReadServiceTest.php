@@ -102,6 +102,34 @@ final class NetworkMetricSeriesReadServiceTest extends TestCase
         self::assertTrue($result['window']['isLatest']);
     }
 
+    public function testVersionedTransactionFeeUsesMaximumWhenResampled(): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $connection->expects(self::exactly(3))
+            ->method('fetchOne')
+            ->willReturnOnConsecutiveCalls('2026-05-20 12:03:00', false, '1');
+        $connection->expects(self::once())
+            ->method('fetchAllAssociative')
+            ->with(
+                self::stringContains("WHEN metric_key IN ('max-fee', 'max-transaction-fee') THEN MAX(value_decimal)"),
+                self::callback([$this, 'hasVersionedFeeQueryParams']),
+                self::isType('array')
+            )
+            ->willReturn([]);
+
+        $service = new NetworkMetricSeriesReadService(
+            $connection, new StellarNetworkResolver(), new NetworkMetricCatalog()
+        );
+
+        self::assertSame(1, $service->read('mainnet', 'max-transaction-fee', 60, 1, 100, 1)['totalItems']);
+    }
+
+    public function hasVersionedFeeQueryParams(array $params): bool
+    {
+        return $params['metric_key'] === 'max-transaction-fee'
+            && $params['target_interval'] === '60 minutes';
+    }
+
     public function testItRejectsOversizedWindowsBeforeDatabaseAccess(): void
     {
         $connection = $this->createMock(Connection::class);

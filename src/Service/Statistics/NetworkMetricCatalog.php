@@ -31,6 +31,7 @@ final class NetworkMetricCatalog
     ];
 
     public const DISABLED_METRIC_KEYS = [
+        'max-transaction-fee',
         'price-usd',
         'rank',
         'market-cap',
@@ -84,6 +85,7 @@ final class NetworkMetricCatalog
         'contracts' => 'network',
         'fee-charged' => 'network',
         'max-fee' => 'network',
+        'max-transaction-fee' => 'network',
         'active-addresses' => 'network',
         'inactive-addresses' => 'network',
         'accounts-created' => 'network',

@@ -32,14 +32,21 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         'transactions' => ['label' => 'Transactions', 'section' => 'blockchain', 'aggregation' => 'sum', 'format' => 'integer'],
         'operations' => ['label' => 'Operations', 'section' => 'blockchain', 'aggregation' => 'sum', 'format' => 'integer'],
         'tps' => ['label' => 'TPS', 'section' => 'blockchain', 'aggregation' => 'avg', 'format' => 'decimal', 'suffix' => 'tx/s'],
+        'ops' => ['label' => 'Operations per second', 'section' => 'blockchain', 'aggregation' => 'avg', 'format' => 'decimal', 'suffix' => 'ops/s'],
+        'tx-ledger' => ['label' => 'Transactions per ledger', 'section' => 'blockchain', 'aggregation' => 'avg', 'format' => 'decimal'],
+        'ops-ledger' => ['label' => 'Operations per ledger', 'section' => 'blockchain', 'aggregation' => 'avg', 'format' => 'decimal'],
         'avg-ledger-sec' => ['label' => 'Ledger close', 'section' => 'blockchain', 'aggregation' => 'avg', 'format' => 'seconds', 'suffix' => 'sec'],
+        'fee-charged' => ['label' => 'Fees charged (raw)', 'section' => 'blockchain', 'aggregation' => 'sum', 'format' => 'decimal'],
+        'max-fee' => ['label' => 'Peak summed fee limit (raw)', 'section' => 'blockchain', 'aggregation' => 'max', 'format' => 'decimal'],
         'trades' => ['label' => 'DEX trades', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'integer'],
         'dex-vol-xlm' => ['label' => 'DEX volume', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'xlm', 'suffix' => 'XLM'],
         'xlm-total-pay' => ['label' => 'XLM payments', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'xlm', 'suffix' => 'XLM'],
+        'output-value' => ['label' => 'Payment amount field (mixed assets)', 'section' => 'dex-payments', 'aggregation' => 'unavailable', 'format' => 'decimal'],
         'tx-success' => ['label' => 'Successful tx', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'integer'],
         'tx-failed' => ['label' => 'Failed tx', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'integer'],
         'accounts-created' => ['label' => 'Accounts created', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
         'accounts-merged' => ['label' => 'Accounts merged', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
+        'active-addresses' => ['label' => 'Active transaction sources', 'section' => 'accounts-contracts', 'aggregation' => 'latest', 'format' => 'integer'],
         'contracts' => ['label' => 'Contract creation matches', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
         'invocations' => ['label' => 'Contract invocation matches', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
     ];
@@ -50,7 +57,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
     private const SECTIONS = [
         'blockchain' => [
             'label' => 'Blockchain',
-            'description' => 'Ledger throughput, transaction volume, and close-time health.',
+            'description' => 'Ledger throughput, rates, close times, and raw fee fields.',
         ],
         'dex-payments' => [
             'label' => 'DEX & Payments',
@@ -58,7 +65,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         ],
         'accounts-contracts' => [
             'label' => 'Accounts & Contracts',
-            'description' => 'Account lifecycle events and indexed contract-detail matches. Period-unique active accounts are unavailable.',
+            'description' => 'Account lifecycle, five-minute active sources, and indexed contract-detail matches. Period-unique active accounts are unavailable.',
         ],
     ];
 
@@ -141,7 +148,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
             'range' => $range,
             'bucketMinutes' => $bucketMinutes,
             'coverage' => $coverage,
-            'sections' => $this->buildSections($seriesByMetric),
+            'sections' => $this->buildSections($seriesByMetric, $bucketMinutes),
             'chart' => $this->buildChart($seriesByMetric),
         ];
     }
@@ -229,6 +236,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         \DateTimeImmutable $rangeStart,
         \DateTimeImmutable $rangeEnd
     ): array {
+        $metricKeys = $this->queryMetricKeys($targetBucketMinutes);
         if ($targetBucketMinutes === $sourceBucketMinutes) {
             return $this->statisticsConnection->fetchAllAssociative(
                 'SELECT metric_key, bucket_start, bucket_end, value_decimal, updated_at
@@ -242,7 +250,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 [
                     'network' => $networkCode,
                     'bucket_minutes' => $sourceBucketMinutes,
-                    'metric_keys' => array_keys(self::METRICS),
+                    'metric_keys' => $metricKeys,
                     'range_start' => $rangeStart->format('Y-m-d H:i:s'),
                     'range_end' => $rangeEnd->format('Y-m-d H:i:s'),
                 ],
@@ -256,9 +264,12 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
 
         $targetInterval = sprintf('%d minutes', $targetBucketMinutes);
         $avgMetricKeys = [];
+        $maxMetricKeys = [];
         foreach (self::METRICS as $metricKey => $metricConfig) {
             if (($metricConfig['aggregation'] ?? 'sum') === 'avg') {
                 $avgMetricKeys[] = $metricKey;
+            } elseif (($metricConfig['aggregation'] ?? 'sum') === 'max') {
+                $maxMetricKeys[] = $metricKey;
             }
         }
 
@@ -282,6 +293,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                  grouped_bucket_start + CAST(:target_interval AS interval) AS bucket_end,
                  CASE
                      WHEN metric_key IN (:avg_metric_keys) THEN AVG(value_decimal)
+                     WHEN metric_key IN (:max_metric_keys) THEN MAX(value_decimal)
                      ELSE SUM(value_decimal)
                  END AS value_decimal,
                  MAX(updated_at) AS updated_at
@@ -292,8 +304,9 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 'network' => $networkCode,
                 'source_bucket_minutes' => $sourceBucketMinutes,
                 'target_interval' => $targetInterval,
-                'metric_keys' => array_keys(self::METRICS),
+                'metric_keys' => $metricKeys,
                 'avg_metric_keys' => $avgMetricKeys,
+                'max_metric_keys' => $maxMetricKeys,
                 'range_start' => $rangeStart->format('Y-m-d H:i:s'),
                 'range_end' => $rangeEnd->format('Y-m-d H:i:s'),
             ],
@@ -303,8 +316,28 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 'target_interval' => ParameterType::STRING,
                 'metric_keys' => ArrayParameterType::STRING,
                 'avg_metric_keys' => ArrayParameterType::STRING,
+                'max_metric_keys' => ArrayParameterType::STRING,
             ]
         );
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function queryMetricKeys(int $targetBucketMinutes): array
+    {
+        $keys = [];
+        foreach (array_keys(self::METRICS) as $metricKey) {
+            if ($metricKey === 'output-value') {
+                continue;
+            }
+            if ($metricKey === 'active-addresses' && $targetBucketMinutes !== self::SOURCE_BUCKET_MINUTES) {
+                continue;
+            }
+            $keys[] = $metricKey;
+        }
+
+        return $keys;
     }
 
     /**
@@ -396,7 +429,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
      * @param array<string,list<array{bucketStart:\DateTimeImmutable,bucketEnd:\DateTimeImmutable,value:float,updatedAt:?\DateTimeImmutable}>> $seriesByMetric
      * @return list<array<string,mixed>>
      */
-    private function buildSections(array $seriesByMetric): array
+    private function buildSections(array $seriesByMetric, int $bucketMinutes): array
     {
         $sections = [];
         foreach (self::SECTIONS as $sectionId => $sectionConfig) {
@@ -405,7 +438,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 if (($metricConfig['section'] ?? '') !== $sectionId) {
                     continue;
                 }
-                $cards[] = $this->buildCard($metricKey, $metricConfig, $seriesByMetric[$metricKey] ?? []);
+                $cards[] = $this->buildCard($metricKey, $metricConfig, $seriesByMetric[$metricKey] ?? [], $bucketMinutes);
             }
 
             $sections[] = [
@@ -424,9 +457,33 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
      * @param list<array{bucketStart:\DateTimeImmutable,bucketEnd:\DateTimeImmutable,value:float,updatedAt:?\DateTimeImmutable}> $series
      * @return array<string,mixed>
      */
-    private function buildCard(string $metricKey, array $metricConfig, array $series): array
+    private function buildCard(string $metricKey, array $metricConfig, array $series, int $bucketMinutes): array
     {
         $aggregation = (string) ($metricConfig['aggregation'] ?? 'latest');
+        $unavailableReason = null;
+        if ($metricKey === 'output-value') {
+            $unavailableReason = 'Mixed asset amounts have no comparable total.';
+        } elseif ($metricKey === 'active-addresses' && $bucketMinutes !== self::SOURCE_BUCKET_MINUTES) {
+            $unavailableReason = 'Available only in five-minute buckets.';
+        } elseif ($metricKey === 'active-addresses' && $series === []) {
+            $unavailableReason = 'No indexed five-minute buckets in this window.';
+        }
+
+        if ($unavailableReason !== null) {
+            return [
+                'metricKey' => $metricKey,
+                'label' => (string) $metricConfig['label'],
+                'value' => null,
+                'valueDecimal' => null,
+                'aggregation' => 'unavailable',
+                'format' => (string) ($metricConfig['format'] ?? 'decimal'),
+                'suffix' => $metricConfig['suffix'] ?? null,
+                'changePercent' => null,
+                'sparkline' => [],
+                'unavailableReason' => $unavailableReason,
+            ];
+        }
+
         $value = $this->aggregateSeries($series, $aggregation);
         $first = $series[0]['value'] ?? null;
         $last = $series !== [] ? $series[array_key_last($series)]['value'] : null;
@@ -451,6 +508,15 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
     {
         if ($series === []) {
             return 0.0;
+        }
+
+        if ($aggregation === 'max') {
+            $maximum = $series[0]['value'];
+            foreach ($series as $point) {
+                $maximum = max($maximum, $point['value']);
+            }
+
+            return $maximum;
         }
 
         if ($aggregation !== 'sum' && $aggregation !== 'avg') {
@@ -551,7 +617,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
                 'limitBuckets' => $limitBuckets,
                 'hasMore' => false,
             ],
-            'sections' => $this->buildSections([]),
+            'sections' => $this->buildSections([], $bucketMinutes),
             'chart' => [
                 'title' => 'Network activity',
                 'series' => [

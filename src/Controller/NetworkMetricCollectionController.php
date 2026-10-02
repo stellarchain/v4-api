@@ -45,7 +45,7 @@ final class NetworkMetricCollectionController
         }
         if (!$this->metricCatalog->isAvailableMetric($metricKey)) {
             return $this->error(
-                sprintf('Metric "%s" is documented but is not currently populated.', $metricKey),
+                sprintf('Metric "%s" is not currently available in the public API.', $metricKey),
                 Response::HTTP_UNPROCESSABLE_ENTITY,
                 'metric_not_available'
             );

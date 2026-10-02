@@ -27,6 +27,7 @@ final class NetworkMetricSeriesReadService implements NetworkMetricSeriesReadSer
 
     private const MAX_METRICS = [
         'max-fee',
+        'max-transaction-fee',
     ];
 
     public function __construct(

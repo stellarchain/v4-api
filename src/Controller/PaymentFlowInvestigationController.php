@@ -34,9 +34,11 @@ final class PaymentFlowInvestigationController
             return $this->error('Invalid network. Use mainnet, testnet, or futurenet.', Response::HTTP_BAD_REQUEST, 'invalid_network');
         }
 
-        [$address, $txHash] = $this->resolveSearchTarget($request);
-        if ($address === null && $txHash === null) {
-            return $this->error('Provide an address or txHash.', Response::HTTP_BAD_REQUEST, 'missing_target');
+        [$address, $txHash, $queryAsset] = $this->resolveSearchTarget($request);
+
+        $asset = $this->queryString($request, 'asset', $queryAsset ?? '');
+        if ($address === null && $txHash === null && $asset === '') {
+            return $this->error('Provide an address, txHash, or exact asset key.', Response::HTTP_BAD_REQUEST, 'missing_target');
         }
 
         if ($address !== null && !$this->isValidAddress($address)) {
@@ -72,7 +74,6 @@ final class PaymentFlowInvestigationController
         if ($operationType !== '' && !in_array($operationType, self::OPERATION_TYPES, true)) {
             return $this->error('Invalid payment-flow operation type.', Response::HTTP_BAD_REQUEST, 'invalid_operation_type');
         }
-        $asset = $this->queryString($request, 'asset', '');
         if ($asset !== '' && !$this->isValidAsset($asset)) {
             return $this->error('Invalid asset. Use native:XLM or credit_alphanum4/12:CODE:ISSUER.', Response::HTTP_BAD_REQUEST, 'invalid_asset');
         }
@@ -85,6 +86,22 @@ final class PaymentFlowInvestigationController
         if (($dateFrom !== '' && !$this->isValidUtcDate($dateFrom)) || ($dateTo !== '' && !$this->isValidUtcDate($dateTo))
             || ($dateFrom !== '' && $dateTo !== '' && $dateFrom > $dateTo)) {
             return $this->error('Invalid UTC date range. Use YYYY-MM-DD with dateFrom <= dateTo.', Response::HTTP_BAD_REQUEST, 'invalid_date_range');
+        }
+        $depth = $this->queryPositiveInt($request, 'depth', 1);
+        if ($depth === null || $depth > 2) {
+            return $this->error('Invalid depth. Use 1 or 2.', Response::HTTP_UNPROCESSABLE_ENTITY, 'invalid_depth');
+        }
+        if ($depth === 2 && $address === null) {
+            return $this->error('Two-hop tracing currently requires an account address target.', Response::HTTP_UNPROCESSABLE_ENTITY, 'depth_target_not_available');
+        }
+        $hasBoundedLedgerRange = $ledgerFrom !== null && $ledgerTo !== null;
+        $hasBoundedDateRange = $dateFrom !== '' && $dateTo !== '';
+        if ($depth === 2 && !$hasBoundedLedgerRange && !$hasBoundedDateRange) {
+            return $this->error(
+                'Two-hop tracing requires both ledger bounds or both UTC date bounds.',
+                Response::HTTP_UNPROCESSABLE_ENTITY,
+                'depth_range_required'
+            );
         }
         $cursor = $this->queryString($request, 'cursor', '');
 
@@ -102,7 +119,8 @@ final class PaymentFlowInvestigationController
                 $asset === '' ? null : $asset,
                 $dateFrom === '' ? null : $dateFrom,
                 $dateTo === '' ? null : $dateTo,
-                $minAssetAmount === '' ? null : $minAssetAmount
+                $minAssetAmount === '' ? null : $minAssetAmount,
+                $depth
             );
         } catch (\InvalidArgumentException) {
             return $this->error('Invalid cursor. Restart pagination after changing filters.', Response::HTTP_BAD_REQUEST, 'invalid_cursor');
@@ -119,9 +137,6 @@ final class PaymentFlowInvestigationController
     #[Route('/v1/trace/address/{id}', name: 'payment_flow_trace_address', methods: ['GET'])]
     public function traceAddress(Request $request, string $id): JsonResponse
     {
-        if ($this->queryPositiveInt($request, 'depth', 1) !== 1) {
-            return $this->error('Only one-hop classic payment-flow tracing is currently supported.', Response::HTTP_UNPROCESSABLE_ENTITY, 'depth_not_available');
-        }
         $request->query->remove('q');
         $request->query->remove('txHash');
         $request->query->set('address', $id);
@@ -132,9 +147,6 @@ final class PaymentFlowInvestigationController
     #[Route('/v1/trace/tx/{hash}', name: 'payment_flow_trace_tx', methods: ['GET'])]
     public function traceTransaction(Request $request, string $hash): JsonResponse
     {
-        if ($this->queryPositiveInt($request, 'depth', 1) !== 1) {
-            return $this->error('Only one-hop classic payment-flow tracing is currently supported.', Response::HTTP_UNPROCESSABLE_ENTITY, 'depth_not_available');
-        }
         $request->query->remove('q');
         $request->query->remove('address');
         $request->query->set('txHash', $hash);
@@ -143,7 +155,7 @@ final class PaymentFlowInvestigationController
     }
 
     /**
-     * @return array{0:?string,1:?string}
+     * @return array{0:?string,1:?string,2:?string}
      */
     private function resolveSearchTarget(Request $request): array
     {
@@ -154,6 +166,8 @@ final class PaymentFlowInvestigationController
         if ($address === '' && $txHash === '' && $query !== '') {
             if ($this->isValidTxHash($query)) {
                 $txHash = strtolower($query);
+            } elseif ($this->isValidAsset($query)) {
+                return [null, null, $query];
             } else {
                 $address = strtoupper($query);
             }
@@ -162,6 +176,7 @@ final class PaymentFlowInvestigationController
         return [
             $address === '' ? null : strtoupper($address),
             $txHash === '' ? null : strtolower($txHash),
+            null,
         ];
     }
 

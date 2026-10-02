@@ -19,6 +19,14 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         'payment_flow_address',
         'payment_flow_asset',
     ];
+    private const ASSET_SEARCH_TABLES = [
+        'payment_flow_asset_side',
+        'payment_flow_asset_side_build_ledger',
+    ];
+    private const MAX_TRACE_FRONTIER_ACCOUNTS = 12;
+    private const MAX_TRACE_EVENTS_PER_FRONTIER = 20;
+    private const MAX_TRACE_EVENTS = 200;
+    private const MAX_TRACE_PATHS = 200;
 
     public function __construct(
         #[Autowire(service: 'doctrine.dbal.statistics_connection')]
@@ -41,12 +49,14 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         ?string $asset = null,
         ?string $dateFrom = null,
         ?string $dateTo = null,
-        ?string $minAssetAmount = null
+        ?string $minAssetAmount = null,
+        int $depth = 1
     ): array {
         $normalizedNetwork = $this->networkResolver->normalizeNetwork($network, 'mainnet');
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
         $address = $this->normalizeNullableString($address);
         $txHash = $this->normalizeNullableString($txHash);
+        $assetOnly = $address === null && $txHash === null && $asset !== null;
         $scopeFilters = [$normalizedNetwork, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $operationType];
         if ($asset !== null) {
             $scopeFilters[] = $asset;
@@ -58,9 +68,17 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         if ($minAssetAmount !== null) {
             $scopeFilters[] = $minAssetAmount;
         }
+        $scopeFilters[] = $depth;
         $scope = hash('sha256', json_encode($scopeFilters, JSON_THROW_ON_ERROR));
         $position = $this->decodeCursor($cursor, $scope);
         $ownsTransaction = !$this->statisticsConnection->isTransactionActive();
+        $traceRows = [];
+        $traceRead = [
+            'frontierAccounts' => 0,
+            'frontierTruncated' => false,
+            'truncatedBranches' => 0,
+            'eventsTruncated' => false,
+        ];
 
         try {
             if ($ownsTransaction) {
@@ -73,6 +91,13 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                     throw new StatisticsUnavailableException(sprintf('Statistics table %s is not available.', $table));
                 }
             }
+            if ($assetOnly) {
+                foreach (self::ASSET_SEARCH_TABLES as $table) {
+                    if (!$this->tableExists($table)) {
+                        throw new StatisticsUnavailableException(sprintf('Asset investigation table %s is not available.', $table));
+                    }
+                }
+            }
 
             $addressId = $address !== null ? $this->loadAddressId($networkCode, $address) : null;
             $txId = $txHash !== null ? $this->loadTransactionId($networkCode, $txHash) : null;
@@ -81,7 +106,14 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'SELECT ledger, closed_at FROM payment_flow_transaction WHERE network = :network ORDER BY ledger DESC, id DESC LIMIT 1',
                 ['network' => $networkCode], ['network' => ParameterType::INTEGER]
             );
-            $anchorLedger = $position['anchor'] ?? ($latest ? (int) $latest['ledger'] : null);
+            $assetBuildBounds = $assetOnly ? $this->loadAssetBuildBounds($networkCode) : null;
+            if ($assetOnly && $assetBuildBounds === null) {
+                throw new StatisticsUnavailableException('Asset investigation index has no built coverage.');
+            }
+            $firstAssetBuildLedger = $assetBuildBounds['first'] ?? null;
+            $latestAssetBuildLedger = $assetBuildBounds['latest'] ?? null;
+            $latestAvailableLedger = $assetOnly ? $latestAssetBuildLedger : ($latest ? (int) $latest['ledger'] : null);
+            $anchorLedger = $position['anchor'] ?? $latestAvailableLedger;
             $effectiveFrom = $ledgerFrom;
             $effectiveTo = $anchorLedger === null ? $ledgerTo : min($ledgerTo ?? $anchorLedger, $anchorLedger);
             if ($anchorLedger !== null && $dateFrom !== null) {
@@ -95,12 +127,39 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                     $effectiveTo = min($effectiveTo ?? $anchorLedger, $afterDateLedger - 1);
                 }
             }
+            if ($assetOnly && $firstAssetBuildLedger !== null) {
+                $effectiveFrom = max($effectiveFrom ?? $firstAssetBuildLedger, $firstAssetBuildLedger);
+            }
             if (($address !== null && $addressId === null) || ($txHash !== null && $txId === null) || ($asset !== null && $assetId === null)) {
                 $rows = [];
             } elseif ($effectiveFrom !== null && $effectiveTo !== null && $effectiveFrom > $effectiveTo) {
                 $rows = [];
+            } elseif ($assetOnly) {
+                $rows = $this->loadAssetEvents(
+                    $networkCode,
+                    $assetId,
+                    $effectiveFrom,
+                    $effectiveTo,
+                    $direction,
+                    $limit + 1,
+                    $position,
+                    $operationType,
+                    $minAssetAmount
+                );
             } else {
                 $rows = $this->loadEvents($networkCode, $addressId, $txId, $effectiveFrom, $effectiveTo, $direction, $limit + 1, $position, $operationType, $assetId, $minAssetAmount);
+            }
+            if ($depth === 2 && $address !== null && $addressId !== null && $rows !== []) {
+                [$traceRows, $traceRead] = $this->loadSecondHopEvents(
+                    $networkCode,
+                    $address,
+                    array_slice($rows, 0, $limit),
+                    $effectiveFrom,
+                    $effectiveTo,
+                    $operationType,
+                    $assetId,
+                    $minAssetAmount
+                );
             }
         } catch (StatisticsUnavailableException $exception) {
             throw $exception;
@@ -124,16 +183,31 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
 
         $events = [];
         foreach ($rows as $row) {
-            $events[] = $this->normalizeEvent($row, $address);
+            $events[] = $this->normalizeEvent($row, $address, $assetOnly ? $asset : null);
         }
-        [$accounts, $accountMetadataUnavailable] = $this->loadAccountMetadata($networkCode, $this->collectAccountAddresses($events, $address));
+        $secondHopEvents = [];
+        foreach ($traceRows as $traceRow) {
+            $secondHopEvents[] = $this->normalizeEvent($traceRow, null);
+        }
+        [$candidatePaths, $pathEvents, $pathExclusions, $pathsTruncated] = $this->buildCandidatePaths(
+            $events,
+            $secondHopEvents,
+            $address
+        );
+        $graphEvents = array_merge($events, $pathEvents);
+        [$accounts, $accountMetadataUnavailable] = $this->loadAccountMetadata(
+            $networkCode,
+            $this->collectAccountAddresses($graphEvents, $address)
+        );
         $events = $this->enrichEventsWithAccountMetadata($events, $accounts);
+        $graphEvents = $this->enrichEventsWithAccountMetadata($graphEvents, $accounts);
         $summary = $this->buildSummary($events, $address);
         $riskContext = $this->buildRiskContext($summary, $events, $address !== null, $accountMetadataUnavailable);
 
         return [
             'network' => $normalizedNetwork,
             'query' => [
+                'targetType' => $assetOnly ? 'asset' : ($txHash !== null ? 'transaction' : 'address'),
                 'address' => $address,
                 'txHash' => $txHash,
                 'ledgerFrom' => $ledgerFrom,
@@ -146,6 +220,7 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'dateFrom' => $dateFrom,
                 'dateTo' => $dateTo,
                 'minAssetAmount' => $minAssetAmount,
+                'depth' => $depth,
             ],
             'coverage' => [
                 'rowsReturned' => count($events),
@@ -159,14 +234,34 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'nextCursor' => $hasMore ? $this->encodeCursor($rows[count($rows) - 1], $anchorLedger ?? (int) $rows[0]['ledger'], $scope) : null,
                 'latestObservedLedger' => $latest ? (int) $latest['ledger'] : null,
                 'latestObservedClosedAt' => $latest ? $this->formatAtom($latest['closed_at']) : null,
+                'assetIndexFirstBuiltLedger' => $firstAssetBuildLedger,
+                'assetIndexLatestBuiltLedger' => $latestAssetBuildLedger,
                 'completeHistoryVerified' => false,
-                'note' => 'Successful classic payment-flow operations only. Page summaries are not account totals; the latest observed ledger is not proof of gap-free ingestion.',
+                'note' => $assetOnly
+                    ? 'Successful indexed classic payment and path-payment sides inside the displayed asset-index bounds only. Coverage may contain gaps; page results are not complete asset history.'
+                    : 'Successful classic payment-flow operations only. Page summaries are not account totals; the latest observed ledger is not proof of gap-free ingestion.',
             ],
             'summary' => $summary,
             'riskContext' => $riskContext,
             'accounts' => $accounts,
             'accountContext' => $this->buildAccountContext($address, $accounts, $accountMetadataUnavailable),
-            'graph' => $this->buildGraph($events, $address, $accounts),
+            'graph' => $this->buildGraph($graphEvents, $address, $accounts),
+            'trace' => [
+                'depthRequested' => $depth,
+                'depthReturned' => $depth === 2 && $address !== null ? 2 : 1,
+                'candidatePaths' => $candidatePaths,
+                'frontierAccounts' => $traceRead['frontierAccounts'],
+                'frontierLimit' => self::MAX_TRACE_FRONTIER_ACCOUNTS,
+                'eventLimitPerFrontier' => self::MAX_TRACE_EVENTS_PER_FRONTIER,
+                'secondHopEvents' => count($pathEvents),
+                'truncated' => $hasMore || $traceRead['frontierTruncated'] || $traceRead['truncatedBranches'] > 0
+                    || $traceRead['eventsTruncated'] || $pathsTruncated,
+                'truncatedBranches' => $traceRead['truncatedBranches'],
+                'exclusions' => $pathExclusions,
+                'note' => $depth === 2
+                    ? 'Candidate paths from bounded indexed classic operations. They do not prove funds continuity, control, or beneficial ownership.'
+                    : 'One-hop page graph only.',
+            ],
             'counterparties' => $this->buildCounterparties($events, $address, $accounts),
             'flowGroups' => $this->buildFlowGroups($events),
             'events' => $events,
@@ -251,6 +346,27 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         );
 
         return $id === false || $id === null ? null : (int) $id;
+    }
+
+    /** @return array{first:int,latest:int}|null */
+    private function loadAssetBuildBounds(int $networkCode): ?array
+    {
+        $first = $this->statisticsConnection->fetchOne(
+            'SELECT ledger FROM payment_flow_asset_side_build_ledger WHERE network = :network ORDER BY ledger ASC LIMIT 1',
+            ['network' => $networkCode],
+            ['network' => ParameterType::INTEGER]
+        );
+        $latest = $this->statisticsConnection->fetchOne(
+            'SELECT ledger FROM payment_flow_asset_side_build_ledger WHERE network = :network ORDER BY ledger DESC LIMIT 1',
+            ['network' => $networkCode],
+            ['network' => ParameterType::INTEGER]
+        );
+
+        if ($first === false || $first === null || $latest === false || $latest === null) {
+            return null;
+        }
+
+        return ['first' => (int) $first, 'latest' => (int) $latest];
     }
 
     private function firstLedgerAtOrAfterUtc(int $networkCode, string $boundary, int $lastLedger): ?int
@@ -384,6 +500,8 @@ SELECT
     e.operation_index,
     e.operation_type,
     e.successful,
+    e.from_address_id,
+    e.to_address_id,
     e.source_amount_decimal,
     e.destination_amount_decimal,
     t.closed_at,
@@ -416,9 +534,444 @@ SQL,
     }
 
     /**
+     * Reads asset-only evidence through the additive side index. Each branch is
+     * independently bounded so a same-asset transfer is de-duplicated without
+     * falling back to an OR scan over payment_flow_event.
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function loadAssetEvents(
+        int $networkCode,
+        int $assetId,
+        ?int $ledgerFrom,
+        ?int $ledgerTo,
+        string $direction,
+        int $limit,
+        ?array $position,
+        ?string $operationType,
+        ?string $minAssetAmount
+    ): array {
+        $where = ['s.network = :network', 's.asset_id = :asset_id'];
+        $params = [
+            'network' => $networkCode,
+            'asset_id' => $assetId,
+            'limit' => $limit,
+        ];
+        $types = [
+            'network' => ParameterType::INTEGER,
+            'asset_id' => ParameterType::INTEGER,
+            'limit' => ParameterType::INTEGER,
+        ];
+
+        if ($ledgerFrom !== null) {
+            $where[] = 's.ledger >= :ledger_from';
+            $params['ledger_from'] = $ledgerFrom;
+            $types['ledger_from'] = ParameterType::INTEGER;
+        }
+        if ($ledgerTo !== null) {
+            $where[] = 's.ledger <= :ledger_to';
+            $params['ledger_to'] = $ledgerTo;
+            $types['ledger_to'] = ParameterType::INTEGER;
+        }
+        if ($position !== null) {
+            $where[] = '(s.ledger, s.event_id) < (:cursor_ledger, CAST(:cursor_id AS BIGINT))';
+            $params['cursor_ledger'] = $position['ledger'];
+            $params['cursor_id'] = $position['id'];
+            $types['cursor_ledger'] = ParameterType::INTEGER;
+            $types['cursor_id'] = ParameterType::STRING;
+        }
+        if ($minAssetAmount !== null) {
+            $where[] = 's.amount_decimal >= CAST(:min_asset_amount AS NUMERIC)';
+            $params['min_asset_amount'] = $minAssetAmount;
+            $types['min_asset_amount'] = ParameterType::STRING;
+        }
+
+        $eventJoin = '';
+        if ($operationType !== null) {
+            $eventJoin = ' INNER JOIN payment_flow_event filtered_event'
+                . ' ON filtered_event.id = s.event_id AND filtered_event.network = s.network'
+                . ' AND filtered_event.operation_type = :operation_type';
+            $params['operation_type'] = $operationType;
+            $types['operation_type'] = ParameterType::STRING;
+        }
+
+        $baseWhere = implode(' AND ', $where);
+        $branch = 'SELECT s.event_id, s.ledger FROM payment_flow_asset_side s' . $eventJoin
+            . ' WHERE ' . $baseWhere . ' AND s.side = %d'
+            . ' ORDER BY s.ledger DESC, s.event_id DESC LIMIT :limit';
+
+        if ($direction === 'incoming') {
+            $selection = sprintf($branch, 2);
+        } elseif ($direction === 'outgoing') {
+            $selection = sprintf($branch, 1);
+        } else {
+            $selection = 'SELECT candidate.event_id, candidate.ledger FROM (('
+                . sprintf($branch, 1) . ') UNION (' . sprintf($branch, 2)
+                . ')) candidate ORDER BY candidate.ledger DESC, candidate.event_id DESC LIMIT :limit';
+        }
+
+        $sql = sprintf(
+            <<<'SQL'
+SELECT
+    e.id,
+    e.ledger,
+    e.operation_id,
+    e.operation_index,
+    e.operation_type,
+    e.successful,
+    e.from_address_id,
+    e.to_address_id,
+    e.source_amount_decimal,
+    e.destination_amount_decimal,
+    t.closed_at,
+    t.tx_hash,
+    t.memo_type,
+    t.memo,
+    source_account.address AS source_account,
+    from_address.address AS from_address,
+    to_address.address AS to_address,
+    source_asset.asset_type AS source_asset_type,
+    source_asset.asset_code AS source_asset_code,
+    source_asset.asset_issuer AS source_asset_issuer,
+    destination_asset.asset_type AS destination_asset_type,
+    destination_asset.asset_code AS destination_asset_code,
+    destination_asset.asset_issuer AS destination_asset_issuer
+FROM (%s) selected
+INNER JOIN payment_flow_event e ON e.id = selected.event_id AND e.network = :network
+INNER JOIN payment_flow_transaction t ON t.id = e.tx_id AND t.network = e.network
+LEFT JOIN payment_flow_address source_account ON source_account.id = e.source_account_id
+LEFT JOIN payment_flow_address from_address ON from_address.id = e.from_address_id
+LEFT JOIN payment_flow_address to_address ON to_address.id = e.to_address_id
+LEFT JOIN payment_flow_asset source_asset ON source_asset.id = e.source_asset_id
+LEFT JOIN payment_flow_asset destination_asset ON destination_asset.id = e.destination_asset_id
+ORDER BY e.ledger DESC, e.id DESC
+LIMIT :limit
+SQL,
+            $selection
+        );
+
+        return $this->statisticsConnection->fetchAllAssociative($sql, $params, $types);
+    }
+
+    /**
+     * Expand a bounded first-hop page through address-leading indexes. Every
+     * frontier branch has its own hard cap and reports truncation.
+     *
+     * @param list<array<string,mixed>> $rootRows
+     * @return array{0:list<array<string,mixed>>,1:array<string,int|bool>}
+     */
+    private function loadSecondHopEvents(
+        int $networkCode,
+        string $focusAddress,
+        array $rootRows,
+        ?int $ledgerFrom,
+        ?int $ledgerTo,
+        ?string $operationType,
+        ?int $assetId,
+        ?string $minAssetAmount
+    ): array {
+        $frontier = [];
+        $rootIds = [];
+        foreach ($rootRows as $row) {
+            $rootIds[(string) $row['id']] = true;
+            $fromAddress = $this->normalizeNullableString($row['from_address'] ?? null);
+            $toAddress = $this->normalizeNullableString($row['to_address'] ?? null);
+            if ($fromAddress === $focusAddress && $toAddress !== null && $toAddress !== $focusAddress
+                && isset($row['to_address_id'])) {
+                $frontierId = (int) $row['to_address_id'];
+                $frontier[$frontierId] ??= ['address' => $toAddress, 'outgoingAfter' => null, 'incomingBefore' => null];
+                $rootLedger = (int) $row['ledger'];
+                $frontier[$frontierId]['outgoingAfter'] = min(
+                    $frontier[$frontierId]['outgoingAfter'] ?? $rootLedger,
+                    $rootLedger
+                );
+            }
+            if ($toAddress === $focusAddress && $fromAddress !== null && $fromAddress !== $focusAddress
+                && isset($row['from_address_id'])) {
+                $frontierId = (int) $row['from_address_id'];
+                $frontier[$frontierId] ??= ['address' => $fromAddress, 'outgoingAfter' => null, 'incomingBefore' => null];
+                $rootLedger = (int) $row['ledger'];
+                $frontier[$frontierId]['incomingBefore'] = max(
+                    $frontier[$frontierId]['incomingBefore'] ?? $rootLedger,
+                    $rootLedger
+                );
+            }
+        }
+
+        $frontierTruncated = count($frontier) > self::MAX_TRACE_FRONTIER_ACCOUNTS;
+        $frontier = array_slice($frontier, 0, self::MAX_TRACE_FRONTIER_ACCOUNTS, true);
+        $events = [];
+        $truncatedBranches = 0;
+        foreach ($frontier as $addressId => $frontierScope) {
+            if ($frontierScope['outgoingAfter'] !== null) {
+                [$branchRows, $branchTruncated] = $this->loadTraceBranch(
+                    $networkCode,
+                    $addressId,
+                    max($ledgerFrom ?? 1, (int) $frontierScope['outgoingAfter']),
+                    $ledgerTo,
+                    'outgoing',
+                    $operationType,
+                    $assetId,
+                    $minAssetAmount
+                );
+                $truncatedBranches += $branchTruncated ? 1 : 0;
+                $this->mergeTraceRows($events, $branchRows, $rootIds);
+            }
+            if ($frontierScope['incomingBefore'] !== null) {
+                [$branchRows, $branchTruncated] = $this->loadTraceBranch(
+                    $networkCode,
+                    $addressId,
+                    $ledgerFrom,
+                    min($ledgerTo ?? (int) $frontierScope['incomingBefore'], (int) $frontierScope['incomingBefore']),
+                    'incoming',
+                    $operationType,
+                    $assetId,
+                    $minAssetAmount
+                );
+                $truncatedBranches += $branchTruncated ? 1 : 0;
+                $this->mergeTraceRows($events, $branchRows, $rootIds);
+            }
+        }
+
+        $rows = array_values($events);
+        usort($rows, [self::class, 'compareEventRowsDescending']);
+        $eventsTruncated = count($rows) > self::MAX_TRACE_EVENTS;
+        if ($eventsTruncated) {
+            $rows = array_slice($rows, 0, self::MAX_TRACE_EVENTS);
+        }
+
+        return [$rows, [
+            'frontierAccounts' => count($frontier),
+            'frontierTruncated' => $frontierTruncated,
+            'truncatedBranches' => $truncatedBranches,
+            'eventsTruncated' => $eventsTruncated,
+        ]];
+    }
+
+    /**
+     * @return array{0:list<array<string,mixed>>,1:bool}
+     */
+    private function loadTraceBranch(
+        int $networkCode,
+        int $addressId,
+        ?int $ledgerFrom,
+        ?int $ledgerTo,
+        string $direction,
+        ?string $operationType,
+        ?int $assetId,
+        ?string $minAssetAmount
+    ): array {
+        $rows = $this->loadEvents(
+            $networkCode,
+            $addressId,
+            null,
+            $ledgerFrom,
+            $ledgerTo,
+            $direction,
+            self::MAX_TRACE_EVENTS_PER_FRONTIER + 1,
+            null,
+            $operationType,
+            $assetId,
+            $minAssetAmount
+        );
+        $truncated = count($rows) > self::MAX_TRACE_EVENTS_PER_FRONTIER;
+        if ($truncated) {
+            array_pop($rows);
+        }
+
+        return [$rows, $truncated];
+    }
+
+    /**
+     * @param array<string,array<string,mixed>> $events
+     * @param list<array<string,mixed>> $branchRows
+     * @param array<string,bool> $rootIds
+     */
+    private function mergeTraceRows(array &$events, array $branchRows, array $rootIds): void
+    {
+        foreach ($branchRows as $branchRow) {
+            $eventId = (string) $branchRow['id'];
+            if (!isset($rootIds[$eventId])) {
+                $events[$eventId] = $branchRow;
+            }
+        }
+    }
+
+    private static function compareEventRowsDescending(array $left, array $right): int
+    {
+        return ((int) $right['ledger'] <=> (int) $left['ledger'])
+            ?: ((int) $right['id'] <=> (int) $left['id']);
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rootEvents
+     * @param list<array<string,mixed>> $secondHopEvents
+     * @return array{0:list<array<string,mixed>>,1:list<array<string,mixed>>,2:array<string,int>,3:bool}
+     */
+    private function buildCandidatePaths(array $rootEvents, array $secondHopEvents, ?string $focusAddress): array
+    {
+        if ($focusAddress === null || $secondHopEvents === []) {
+            return [[], [], $this->emptyPathExclusions(), false];
+        }
+
+        $paths = [];
+        $pathEvents = [];
+        $exclusions = $this->emptyPathExclusions();
+        foreach ($rootEvents as $rootEvent) {
+            foreach ($secondHopEvents as $secondHopEvent) {
+                $path = $this->candidatePath($rootEvent, $secondHopEvent, $focusAddress, $exclusions);
+                if ($path === null) {
+                    continue;
+                }
+                $pathKey = implode(':', $path['eventIds']);
+                $paths[$pathKey] = $path;
+                $pathEvents[(string) $secondHopEvent['id']] = $secondHopEvent;
+            }
+        }
+
+        $pathRows = array_values($paths);
+        usort($pathRows, [self::class, 'compareCandidatePathsDescending']);
+        $truncated = count($pathRows) > self::MAX_TRACE_PATHS;
+        if ($truncated) {
+            $pathRows = array_slice($pathRows, 0, self::MAX_TRACE_PATHS);
+            $allowedEventIds = [];
+            foreach ($pathRows as $pathRow) {
+                foreach ($pathRow['eventIds'] as $eventId) {
+                    $allowedEventIds[(string) $eventId] = true;
+                }
+            }
+            foreach (array_keys($pathEvents) as $eventId) {
+                if (!isset($allowedEventIds[$eventId])) {
+                    unset($pathEvents[$eventId]);
+                }
+            }
+        }
+
+        return [$pathRows, array_values($pathEvents), $exclusions, $truncated];
+    }
+
+    /**
+     * @param array<string,int> $exclusions
+     * @return array<string,mixed>|null
+     */
+    private function candidatePath(
+        array $rootEvent,
+        array $secondHopEvent,
+        string $focusAddress,
+        array &$exclusions
+    ): ?array {
+        if (!$rootEvent['successful'] || !$secondHopEvent['successful']) {
+            $exclusions['failedOperations']++;
+
+            return null;
+        }
+        if ($rootEvent['fromAddress'] === $rootEvent['toAddress']
+            || $secondHopEvent['fromAddress'] === $secondHopEvent['toAddress']) {
+            $exclusions['selfTransfers']++;
+
+            return null;
+        }
+
+        if ($rootEvent['direction'] === 'outgoing'
+            && $secondHopEvent['fromAddress'] === $rootEvent['toAddress']) {
+            if ($secondHopEvent['toAddress'] === $focusAddress) {
+                $exclusions['cycles']++;
+
+                return null;
+            }
+            if ($this->compareEventPosition($secondHopEvent, $rootEvent) <= 0) {
+                $exclusions['timeOrder']++;
+
+                return null;
+            }
+            if ($rootEvent['destinationAsset']['key'] !== $secondHopEvent['sourceAsset']['key']) {
+                $exclusions['assetDiscontinuity']++;
+
+                return null;
+            }
+
+            return $this->formatCandidatePath('outgoing', $rootEvent, $secondHopEvent);
+        }
+
+        if ($rootEvent['direction'] === 'incoming'
+            && $secondHopEvent['toAddress'] === $rootEvent['fromAddress']) {
+            if ($secondHopEvent['fromAddress'] === $focusAddress) {
+                $exclusions['cycles']++;
+
+                return null;
+            }
+            if ($this->compareEventPosition($secondHopEvent, $rootEvent) >= 0) {
+                $exclusions['timeOrder']++;
+
+                return null;
+            }
+            if ($secondHopEvent['destinationAsset']['key'] !== $rootEvent['sourceAsset']['key']) {
+                $exclusions['assetDiscontinuity']++;
+
+                return null;
+            }
+
+            return $this->formatCandidatePath('incoming', $secondHopEvent, $rootEvent);
+        }
+
+        return null;
+    }
+
+    private function compareEventPosition(array $left, array $right): int
+    {
+        return ((int) $left['ledger'] <=> (int) $right['ledger'])
+            ?: ((int) $left['id'] <=> (int) $right['id']);
+    }
+
+    /**
      * @return array<string,mixed>
      */
-    private function normalizeEvent(array $row, ?string $focusAddress): array
+    private function formatCandidatePath(string $direction, array $firstEvent, array $secondEvent): array
+    {
+        $boundaryAsset = $firstEvent['destinationAsset'];
+
+        return [
+            'id' => (string) $firstEvent['id'] . ':' . (string) $secondEvent['id'],
+            'direction' => $direction,
+            'accounts' => [
+                $firstEvent['fromAddress'],
+                $firstEvent['toAddress'],
+                $secondEvent['toAddress'],
+            ],
+            'eventIds' => [(string) $firstEvent['id'], (string) $secondEvent['id']],
+            'asset' => $boundaryAsset,
+            'firstLedger' => (int) $firstEvent['ledger'],
+            'lastLedger' => (int) $secondEvent['ledger'],
+            'amountsKnown' => $firstEvent['destinationAmount'] !== null && $secondEvent['sourceAmount'] !== null,
+            'containsConversion' => $firstEvent['sourceAsset']['key'] !== $firstEvent['destinationAsset']['key']
+                || $secondEvent['sourceAsset']['key'] !== $secondEvent['destinationAsset']['key'],
+        ];
+    }
+
+    /**
+     * @return array<string,int>
+     */
+    private function emptyPathExclusions(): array
+    {
+        return [
+            'failedOperations' => 0,
+            'selfTransfers' => 0,
+            'cycles' => 0,
+            'timeOrder' => 0,
+            'assetDiscontinuity' => 0,
+        ];
+    }
+
+    private static function compareCandidatePathsDescending(array $left, array $right): int
+    {
+        return ((int) $right['lastLedger'] <=> (int) $left['lastLedger'])
+            ?: strcmp((string) $right['id'], (string) $left['id']);
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    private function normalizeEvent(array $row, ?string $focusAddress, ?string $focusAsset = null): array
     {
         $fromAddress = $this->normalizeNullableString($row['from_address'] ?? null);
         $toAddress = $this->normalizeNullableString($row['to_address'] ?? null);
@@ -435,6 +988,7 @@ SQL,
 
         $direction = 'related';
         $counterparty = null;
+        $assetMatch = null;
         if ($focusAddress !== null) {
             if ($toAddress === $focusAddress) {
                 $direction = 'incoming';
@@ -442,6 +996,16 @@ SQL,
             } elseif ($fromAddress === $focusAddress) {
                 $direction = 'outgoing';
                 $counterparty = $toAddress;
+            }
+        } elseif ($focusAsset !== null) {
+            $sourceMatches = $sourceAsset['key'] === $focusAsset;
+            $destinationMatches = $destinationAsset['key'] === $focusAsset;
+            $assetMatch = $sourceMatches && $destinationMatches
+                ? 'both' : ($sourceMatches ? 'source' : ($destinationMatches ? 'destination' : null));
+            if ($destinationMatches && !$sourceMatches) {
+                $direction = 'incoming';
+            } elseif ($sourceMatches && !$destinationMatches) {
+                $direction = 'outgoing';
             }
         }
 
@@ -455,6 +1019,7 @@ SQL,
             'operationType' => (string) ($row['operation_type'] ?? ''),
             'successful' => (bool) $row['successful'],
             'direction' => $direction,
+            'assetMatch' => $assetMatch,
             'counterparty' => $counterparty,
             'sourceAccount' => $this->normalizeNullableString($row['source_account'] ?? null),
             'fromAddress' => $fromAddress,
@@ -495,7 +1060,16 @@ SQL,
             }
             $transactions[(string) $event['txHash']] = true;
 
-            if ($event['direction'] === 'incoming') {
+            if (($event['assetMatch'] ?? null) === 'both') {
+                $incoming++;
+                $outgoing++;
+                if (($event['destinationAsset']['type'] ?? '') === 'native') {
+                    $nativeReceived = $this->addDecimal($nativeReceived, $event['destinationAmount']);
+                }
+                if (($event['sourceAsset']['type'] ?? '') === 'native') {
+                    $nativeSent = $this->addDecimal($nativeSent, $event['sourceAmount']);
+                }
+            } elseif ($event['direction'] === 'incoming') {
                 $incoming++;
                 if (($event['destinationAsset']['type'] ?? '') === 'native') {
                     $nativeReceived = $this->addDecimal($nativeReceived, $event['destinationAmount']);

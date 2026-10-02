@@ -22,6 +22,7 @@ interface PaymentFlowInvestigationReadServiceInterface
         ?string $asset = null,
         ?string $dateFrom = null,
         ?string $dateTo = null,
-        ?string $minAssetAmount = null
+        ?string $minAssetAmount = null,
+        int $depth = 1
     ): array;
 }

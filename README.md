@@ -24,8 +24,10 @@ Q3 bounded API compatibility, Investigator V2 and historical metric read-model g
   - query params: `network`, `metricKey`, `bucketMinutes`, `page`, `itemsPerPage`, required `windowDays` (1–30), optional bucket-aligned UTC `before`
   - response: paginated time-series rows and UTC window metadata; page totals are limited to that window
   - compatibility note: requests without `windowDays` now return `422 window_required`; update API clients before deploying this change. An implicit unbounded fallback is intentionally unavailable.
+  - `max-transaction-fee` is collected as an additive V2 key only after the new extractor is deployed; it remains unavailable in the public API until source coverage is verified. Existing `max-fee` rows and meaning are unchanged.
 - Investigator payment-flow API:
-  - `GET /v1/payment-flow/investigation` returns first-hop classic payment-flow evidence for the current page only; indexed-history completeness is not verified.
+  - `GET /v1/payment-flow/investigation` returns page-scoped classic payment-flow evidence for an account, transaction hash, or exact asset key. Asset-only reads require the separately installed/populated `payment_flow_asset_side` model; indexed-history completeness is not verified.
+  - `depth=2` is available only for account targets and requires either both `ledgerFrom`/`ledgerTo` or both `dateFrom`/`dateTo`. It returns bounded candidate paths with explicit fan-out/truncation metadata; it is not proof of funds continuity or account control.
   - `riskContext.score` and `riskContext.level` are legacy, page-dependent heuristics retained for response compatibility. Do not present them as account-level risk ratings or fraud/safety verdicts; use `signals`, `limitations`, and `coverage` as qualified evidence instead.
 - Statistics overview:
   - `GET /v1/statistics/network` omits `active-addresses` from range cards because averaging five-minute distinct source counts cannot produce period-unique active accounts. The five-minute series remains available through `/v1/network-metrics`.

@@ -55,6 +55,8 @@ final class HistoricalStatisticsSyncTest extends TestCase
         self::assertSame(5, (int) $this->metric('ledgers'));
         self::assertSame(2, (int) $this->metric('transactions'));
         self::assertSame(300, (int) $this->metric('fee-charged'));
+        self::assertSame(300, (int) $this->metric('max-fee'));
+        self::assertSame(200, (int) $this->metric('max-transaction-fee'));
         self::assertSame(1, (int) $this->metric('active-addresses'));
         self::assertSame(5, (int) $this->metric('trades'));
         self::assertSame(4.0, (float) $this->metric('dex-vol-xlm'));
@@ -137,13 +139,59 @@ final class HistoricalStatisticsSyncTest extends TestCase
 
     public function testDryRunDoesNotWriteAnyStatistics(): void
     {
-        $this->networkService()->sync('mainnet', 5, 100, 104, true);
+        $result = $this->networkService()->sync('mainnet', 5, 100, 104, true);
+        self::assertTrue($result['dry_run']);
+        self::assertGreaterThan(0, $result['metrics_written']);
+        self::assertSame(0, $result['rows_written']);
         $this->marketService()->sync('mainnet', 100, 104, 5, true);
         (new AccountActivitySummarySyncService($this->connection, $this->registry(), new StellarNetworkResolver()))
             ->sync('mainnet', 100, 104, true);
         foreach (['network_metric_point', 'asset_market_metric_point', 'asset_state_snapshot', 'account_activity_summary'] as $table) {
             self::assertSame(0, (int) $this->connection->fetchOne('SELECT COUNT(*) FROM ' . $table));
         }
+    }
+
+    public function testMissingTransactionFeeLimitRejectsTheBucketBeforeAnyWrite(): void
+    {
+        $this->connection->executeStatement('UPDATE history_transactions SET max_fee = NULL WHERE id = 2');
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Missing max_fee values');
+        try {
+            $this->networkService()->sync('mainnet', 5, 100, 104);
+        } finally {
+            self::assertSame(0, (int) $this->connection->fetchOne('SELECT COUNT(*) FROM network_metric_point'));
+        }
+    }
+
+    public function testTransactionMaximumMatchesRawTransactionsInEachCompleteBucket(): void
+    {
+        $this->networkService()->sync('mainnet', 5, 100, 109);
+
+        $rows = $this->connection->fetchAllAssociative(<<<'SQL'
+SELECT to_char(date_bin(INTERVAL '5 minutes', hl.closed_at, TIMESTAMP '2000-01-01 00:00:00'), 'YYYY-MM-DD HH24:MI:SS') AS bucket_start,
+       MAX(ht.max_fee)::text AS raw_max_fee,
+       point.value_decimal::text AS indexed_max_fee,
+       COUNT(ht.id) AS transaction_count
+FROM history_transactions ht
+JOIN history_ledgers hl ON hl.sequence = ht.ledger_sequence
+JOIN network_metric_point point
+  ON point.network = 1
+ AND point.metric_key = 'max-transaction-fee'
+ AND point.bucket_start = date_bin(INTERVAL '5 minutes', hl.closed_at, TIMESTAMP '2000-01-01 00:00:00')
+GROUP BY date_bin(INTERVAL '5 minutes', hl.closed_at, TIMESTAMP '2000-01-01 00:00:00'), point.value_decimal
+ORDER BY bucket_start
+SQL);
+
+        self::assertCount(2, $rows);
+        self::assertSame('2020-01-01 12:00:00', $rows[0]['bucket_start']);
+        self::assertSame('200', $rows[0]['raw_max_fee']);
+        self::assertSame((float) $rows[0]['raw_max_fee'], (float) $rows[0]['indexed_max_fee']);
+        self::assertSame(2, (int) $rows[0]['transaction_count']);
+        self::assertSame('2020-01-01 12:05:00', $rows[1]['bucket_start']);
+        self::assertSame('900', $rows[1]['raw_max_fee']);
+        self::assertSame((float) $rows[1]['raw_max_fee'], (float) $rows[1]['indexed_max_fee']);
+        self::assertSame(1, (int) $rows[1]['transaction_count']);
     }
 
     public function testUnboundedSyncExcludesUnprovenEdgeBuckets(): void
@@ -221,6 +269,7 @@ final class HistoricalStatisticsSyncTest extends TestCase
         self::assertSame(100, $result['start_ledger']);
         self::assertSame(109, $result['end_ledger']);
         self::assertSame(10, (int) $this->connection->fetchOne("SELECT SUM(value_decimal) FROM network_metric_point WHERE metric_key = 'ledgers'"));
+        self::assertSame(900, (int) $this->connection->fetchOne("SELECT value_decimal FROM network_metric_point WHERE metric_key = 'max-transaction-fee' AND bucket_start = '2020-01-01 12:05:00'"));
     }
 
     public function testLegacyLedgerSeqColumnRemainsSupported(): void

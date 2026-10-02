@@ -121,9 +121,14 @@ final class NetworkMetricSyncService implements NetworkMetricSyncServiceInterfac
             if ($bucketStart === null) {
                 continue;
             }
+            if (($row['max_transaction_fee'] ?? null) === null
+                || $this->toInt($row['max_fee_count'] ?? null) !== $this->toInt($row['transaction_count'] ?? null)) {
+                throw new \RuntimeException('Missing max_fee values in a transaction bucket; refusing an incomplete V2 metric.');
+            }
 
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'fee-charged', $this->normalizeNumericString($row['fee_charged'] ?? '0'));
             $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'max-fee', $this->normalizeNumericString($row['max_fee'] ?? '0'));
+            $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'max-transaction-fee', $this->normalizeNumericString($row['max_transaction_fee']));
             if (isset($transactionColumns['account'])) {
                 $this->addPoint($points, $networkCode, $bucketMinutes, $bucketStart, 'active-addresses', (string) $this->toInt($row['active_addresses'] ?? null, 0));
             }
@@ -335,6 +340,9 @@ SELECT
     to_timestamp(floor(extract(epoch FROM hl.closed_at) / :bucket_seconds) * :bucket_seconds) AS bucket_start,
     COALESCE(SUM(ht.fee_charged), 0) AS fee_charged,
     COALESCE(SUM(ht.max_fee), 0) AS max_fee,
+    MAX(ht.max_fee) AS max_transaction_fee,
+    COUNT(*) AS transaction_count,
+    COUNT(ht.max_fee) AS max_fee_count,
     {$activeAddressesExpr} AS active_addresses
 FROM history_transactions ht
 INNER JOIN history_ledgers hl ON hl.sequence = ht.{$transactionLedgerColumn}

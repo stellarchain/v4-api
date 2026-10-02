@@ -90,6 +90,15 @@ final class NetworkMetricCollectionControllerTest extends TestCase
         self::assertSame('metric_not_available', json_decode((string) $response->getContent(), true)['error']['type']);
     }
 
+    public function testItKeepsTheVersionedFeeMetricPrivateUntilCoverageIsVerified(): void
+    {
+        $controller = new NetworkMetricCollectionController($this->unusedService(), new NetworkMetricCatalog());
+        $response = $controller(Request::create('/v1/network-metrics?metricKey=max-transaction-fee&windowDays=1'));
+
+        self::assertSame(Response::HTTP_UNPROCESSABLE_ENTITY, $response->getStatusCode());
+        self::assertSame('metric_not_available', json_decode((string) $response->getContent(), true)['error']['type']);
+    }
+
     public function testItRequiresMetricKey(): void
     {
         $controller = new NetworkMetricCollectionController($this->unusedService(), new NetworkMetricCatalog());

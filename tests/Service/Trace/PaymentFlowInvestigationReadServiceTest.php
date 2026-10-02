@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Tests\Service\Trace;
 
+use App\Exception\StatisticsUnavailableException;
 use App\Service\Stellar\StellarNetworkResolver;
 use App\Service\Trace\PaymentFlowAccountMetadataReadServiceInterface;
 use App\Service\Trace\PaymentFlowInvestigationReadService;
@@ -194,6 +195,105 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         self::assertSame(1, $payload['summary']['events']);
     }
 
+    public function testAssetOnlySearchUsesTheSideIndexAndLabelsItsCoverage(): void
+    {
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows(
+                [$this->paymentFlowRow()],
+                'payment_flow_asset_side s',
+                ['network' => 1, 'asset_id' => 20, 'limit' => 51, 'ledger_from' => 90, 'ledger_to' => 100]
+            ),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $payload = $service->read('mainnet', null, null, null, null, 'both', 50, null, null, 'native:XLM');
+
+        self::assertSame('asset', $payload['query']['targetType']);
+        self::assertSame('native:XLM', $payload['query']['asset']);
+        self::assertSame('both', $payload['events'][0]['assetMatch']);
+        self::assertSame(1, $payload['summary']['incomingEvents']);
+        self::assertSame(1, $payload['summary']['outgoingEvents']);
+        self::assertSame(90, $payload['coverage']['assetIndexFirstBuiltLedger']);
+        self::assertSame(100, $payload['coverage']['assetIndexLatestBuiltLedger']);
+        self::assertStringContainsString('Coverage may contain gaps', $payload['coverage']['note']);
+    }
+
+    public function testAssetOnlySearchRefusesAnUnbuiltSideIndex(): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $connection
+            ->method('fetchOne')
+            ->willReturnCallback([self::class, 'fetchOneFixtureWithoutAssetCoverage']);
+        $connection->method('fetchAllAssociative')->willReturn([]);
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $service = new PaymentFlowInvestigationReadService(
+            $connection,
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $this->expectException(StatisticsUnavailableException::class);
+        $this->expectExceptionMessage('Asset investigation index has no built coverage.');
+
+        $service->read('mainnet', null, null, null, null, 'both', 50, null, null, 'native:XLM');
+    }
+
+    public function testBoundedTwoHopTraceReturnsAssetContinuousCandidatePath(): void
+    {
+        $root = $this->paymentFlowRow();
+        $root['ledger'] = 100;
+        $root['from_address_id'] = 10;
+        $root['to_address_id'] = 11;
+        $root['from_address'] = self::FOCUS_ADDRESS;
+        $root['to_address'] = self::COUNTERPARTY_ADDRESS;
+
+        $second = $this->paymentFlowRow();
+        $second['id'] = 1002;
+        $second['ledger'] = 101;
+        $second['operation_id'] = '268341957822431234';
+        $second['from_address_id'] = 11;
+        $second['to_address_id'] = 12;
+        $second['from_address'] = self::COUNTERPARTY_ADDRESS;
+        $second['to_address'] = 'GSECONDHOPDESTINATION';
+
+        $connection = $this->createMock(Connection::class);
+        $connection->method('fetchOne')->willReturnCallback([self::class, 'fetchOneFixture']);
+        $connection->method('fetchAllAssociative')->willReturnOnConsecutiveCalls([$root], [$second]);
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService($connection, new StellarNetworkResolver(), $metadataService);
+
+        $payload = $service->read(
+            'mainnet',
+            self::FOCUS_ADDRESS,
+            null,
+            100,
+            200,
+            'outgoing',
+            50,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            2
+        );
+
+        self::assertSame(2, $payload['query']['depth']);
+        self::assertSame(2, $payload['trace']['depthReturned']);
+        self::assertSame(1, $payload['trace']['frontierAccounts']);
+        self::assertFalse($payload['trace']['truncated']);
+        self::assertCount(1, $payload['trace']['candidatePaths']);
+        self::assertSame(['1001', '1002'], $payload['trace']['candidatePaths'][0]['eventIds']);
+        self::assertSame('native:XLM', $payload['trace']['candidatePaths'][0]['asset']['key']);
+        self::assertCount(2, $payload['graph']['edges']);
+        self::assertCount(3, $payload['graph']['nodes']);
+    }
+
     public function testMinimumAssetAmountIsAppliedBeforePaginationAndRecordedInQuery(): void
     {
         $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
@@ -344,6 +444,12 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         if (str_contains($sql, 'information_schema.tables')) {
             return 1;
         }
+        if (str_contains($sql, 'payment_flow_asset_side_build_ledger') && str_contains($sql, 'ASC')) {
+            return 90;
+        }
+        if (str_contains($sql, 'payment_flow_asset_side_build_ledger')) {
+            return 100;
+        }
         if (str_contains($sql, 'payment_flow_address')) {
             return 10;
         }
@@ -352,6 +458,15 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         }
 
         return null;
+    }
+
+    public static function fetchOneFixtureWithoutAssetCoverage(string $sql): mixed
+    {
+        if (str_contains($sql, 'payment_flow_asset_side_build_ledger')) {
+            return null;
+        }
+
+        return self::fetchOneFixture($sql);
     }
 
     /**
@@ -366,6 +481,8 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
             'operation_index' => 1,
             'operation_type' => 'payment',
             'successful' => true,
+            'from_address_id' => 11,
+            'to_address_id' => 10,
             'source_amount_decimal' => '25.0000000',
             'destination_amount_decimal' => '25.0000000',
             'closed_at' => '2026-05-15 10:38:33',
