@@ -45,6 +45,7 @@ final class AccountActivitySummarySyncService
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
         $horizonConnection = $this->resolveHorizonConnection($normalizedNetwork);
         $ledgerColumn = $this->resolveTransactionLedgerColumn($horizonConnection);
+        $this->assertLedgerTimestampsAvailable($horizonConnection, $startLedger, $endLedger, $ledgerColumn);
 
         $rows = $this->loadAccountRows($horizonConnection, $networkCode, $startLedger, $endLedger, $ledgerColumn);
         $rowsWritten = 0;
@@ -79,22 +80,23 @@ WITH tx_base AS (
         ht.id AS tx_id,
         ht.{$ledgerColumn} AS ledger,
         ht.account AS tx_account,
-        ht.created_at,
+        hl.closed_at,
         COALESCE(ht.successful, TRUE) AS successful,
         COALESCE(ht.operation_count, 0) AS operation_count,
         COALESCE(ht.fee_charged, 0) AS fee_charged,
         COALESCE(ht.max_fee, 0) AS max_fee
     FROM history_transactions ht
+    INNER JOIN history_ledgers hl ON hl.sequence = ht.{$ledgerColumn}
     WHERE ht.{$ledgerColumn} BETWEEN :start_ledger AND :end_ledger
 ),
 tx_involvement_raw AS (
-    SELECT tx_account AS account_address, tx_id, ledger, created_at, successful, operation_count, fee_charged, max_fee
+    SELECT tx_account AS account_address, tx_id, ledger, closed_at, successful, operation_count, fee_charged, max_fee
     FROM tx_base
     WHERE tx_account IS NOT NULL AND tx_account <> ''
 
     UNION ALL
 
-    SELECT ho.source_account AS account_address, tb.tx_id, tb.ledger, tb.created_at, tb.successful, tb.operation_count, tb.fee_charged, tb.max_fee
+    SELECT ho.source_account AS account_address, tb.tx_id, tb.ledger, tb.closed_at, tb.successful, tb.operation_count, tb.fee_charged, tb.max_fee
     FROM history_operations ho
     INNER JOIN tx_base tb ON tb.tx_id = ho.transaction_id
     WHERE ho.source_account IS NOT NULL AND ho.source_account <> ''
@@ -109,7 +111,7 @@ tx_involvement_raw AS (
         END AS account_address,
         tb.tx_id,
         tb.ledger,
-        tb.created_at,
+        tb.closed_at,
         tb.successful,
         tb.operation_count,
         tb.fee_charged,
@@ -128,7 +130,7 @@ tx_involvement_raw AS (
         END AS account_address,
         tb.tx_id,
         tb.ledger,
-        tb.created_at,
+        tb.closed_at,
         tb.successful,
         tb.operation_count,
         tb.fee_charged,
@@ -142,7 +144,7 @@ tx_involvement AS (
         account_address,
         tx_id,
         ledger,
-        created_at,
+        closed_at,
         successful,
         operation_count,
         fee_charged,
@@ -156,8 +158,8 @@ tx_summary AS (
         account_address,
         MIN(ledger) AS first_ledger,
         MAX(ledger) AS last_ledger,
-        MIN(created_at) AS first_activity_at,
-        MAX(created_at) AS last_activity_at,
+        MIN(closed_at) AS first_activity_at,
+        MAX(closed_at) AS last_activity_at,
         COUNT(*) AS total_transactions,
         SUM(CASE WHEN successful THEN 1 ELSE 0 END) AS successful_transactions,
         SUM(CASE WHEN successful THEN 0 ELSE 1 END) AS failed_transactions,
@@ -446,12 +448,27 @@ SQL;
         throw new \RuntimeException(sprintf('Unsupported statistics database platform: %s', $platform::class));
     }
 
+    private function assertLedgerTimestampsAvailable(Connection $connection, int $startLedger, int $endLedger, string $ledgerColumn): void
+    {
+        $missing = $connection->fetchOne(
+            "SELECT 1 FROM history_transactions ht LEFT JOIN history_ledgers hl ON hl.sequence = ht.{$ledgerColumn} WHERE ht.{$ledgerColumn} BETWEEN :start_ledger AND :end_ledger AND hl.closed_at IS NULL LIMIT 1",
+            ['start_ledger' => $startLedger, 'end_ledger' => $endLedger],
+            ['start_ledger' => ParameterType::INTEGER, 'end_ledger' => ParameterType::INTEGER]
+        );
+        if ($missing !== false) {
+            throw new \RuntimeException('Missing ledger close timestamps for account activity; refusing incomplete summaries.');
+        }
+    }
+
     private function resolveTransactionLedgerColumn(Connection $connection): string
     {
         $rows = $connection->fetchFirstColumn(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'history_transactions'"
         );
-        $columns = array_flip(array_map(static fn (mixed $value): string => strtolower((string) $value), $rows));
+        $columns = [];
+        foreach ($rows as $column) {
+            $columns[strtolower((string) $column)] = true;
+        }
 
         if (isset($columns['ledger_sequence'])) {
             return 'ledger_sequence';
@@ -507,7 +524,8 @@ SQL;
                 return null;
             }
 
-            return (new \DateTimeImmutable(trim($value), new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+            return (new \DateTimeImmutable(trim($value), new \DateTimeZone('UTC')))
+                ->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
         } catch (\Throwable) {
             return null;
         }
