@@ -30,7 +30,11 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 string $direction,
                 int $limit,
                 ?string $cursor = null,
-                ?string $operationType = null
+                ?string $operationType = null,
+                ?string $asset = null,
+                ?string $dateFrom = null,
+                ?string $dateTo = null,
+                ?string $minAssetAmount = null
             ): array {
                 $this->calls[] = [$network, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $limit];
 
@@ -93,7 +97,11 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 string $direction,
                 int $limit,
                 ?string $cursor = null,
-                ?string $operationType = null
+                ?string $operationType = null,
+                ?string $asset = null,
+                ?string $dateFrom = null,
+                ?string $dateTo = null,
+                ?string $minAssetAmount = null
             ): array {
                 throw new StatisticsUnavailableException('No table.');
             }
@@ -126,6 +134,101 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
         self::assertSame(400, $response->getStatusCode());
     }
 
+    public function testItRejectsInvalidAssetAndPassesValidAssetToReader(): void
+    {
+        $address = 'GDUY7J7A33TQWOSOQGDO776GGLM3UQERL4J3SPT56F6YS4ID7MLDERI4';
+        $controller = new PaymentFlowInvestigationController($this->unusedService());
+        $invalid = $controller(Request::create('/v1/payment-flow/investigation', 'GET', [
+            'address' => $address, 'asset' => 'credit_alphanum4:TOOLONG:' . $address,
+        ]));
+        self::assertSame(400, $invalid->getStatusCode());
+        self::assertSame('invalid_asset', json_decode((string) $invalid->getContent(), true)['error']['type']);
+
+        $service = $this->createMock(PaymentFlowInvestigationReadServiceInterface::class);
+        $service->expects(self::once())->method('read')->with(
+            'mainnet', $address, null, null, null, 'both', 100, null, null, 'native:XLM'
+        )->willReturn([]);
+        $response = (new PaymentFlowInvestigationController($service))(Request::create('/v1/payment-flow/investigation', 'GET', [
+            'address' => $address, 'asset' => 'native:XLM',
+        ]));
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    public function testMinimumAssetAmountRequiresAssetAndExactPositiveDecimal(): void
+    {
+        $address = 'GDUY7J7A33TQWOSOQGDO776GGLM3UQERL4J3SPT56F6YS4ID7MLDERI4';
+        $controller = new PaymentFlowInvestigationController($this->unusedService());
+        foreach ([
+            ['asset' => '', 'minAssetAmount' => '0.01'],
+            ['asset' => 'native:XLM', 'minAssetAmount' => '0'],
+            ['asset' => 'native:XLM', 'minAssetAmount' => '1e-7'],
+            ['asset' => 'native:XLM', 'minAssetAmount' => '0.000000000000001'],
+        ] as $filter) {
+            $response = $controller(Request::create('/v1/payment-flow/investigation', 'GET', ['address' => $address] + $filter));
+            self::assertSame(400, $response->getStatusCode());
+            self::assertSame('invalid_min_asset_amount', json_decode((string) $response->getContent(), true)['error']['type']);
+        }
+
+        $service = $this->createMock(PaymentFlowInvestigationReadServiceInterface::class);
+        $service->expects(self::once())->method('read')->with(
+            'mainnet', $address, null, null, null, 'both', 100, null, null,
+            'native:XLM', null, null, '0.0000001'
+        )->willReturn([]);
+        $response = (new PaymentFlowInvestigationController($service))(Request::create('/v1/payment-flow/investigation', 'GET', [
+            'address' => $address, 'asset' => 'native:XLM', 'minAssetAmount' => '0.0000001',
+        ]));
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    public function testItValidatesAndPassesInclusiveUtcDateRange(): void
+    {
+        $address = 'GDUY7J7A33TQWOSOQGDO776GGLM3UQERL4J3SPT56F6YS4ID7MLDERI4';
+        $controller = new PaymentFlowInvestigationController($this->unusedService());
+        foreach ([['2026-02-30', ''], ['2026-05-16', '2026-05-15'], ['', '2026-5-15']] as [$from, $to]) {
+            $response = $controller(Request::create('/v1/payment-flow/investigation', 'GET', [
+                'address' => $address, 'dateFrom' => $from, 'dateTo' => $to,
+            ]));
+            self::assertSame(400, $response->getStatusCode());
+            self::assertSame('invalid_date_range', json_decode((string) $response->getContent(), true)['error']['type']);
+        }
+
+        $service = $this->createMock(PaymentFlowInvestigationReadServiceInterface::class);
+        $service->expects(self::once())->method('read')->with(
+            'mainnet', $address, null, null, null, 'both', 100, null, null, null, '2026-05-15', '2026-05-15'
+        )->willReturn([]);
+        $response = (new PaymentFlowInvestigationController($service))(Request::create('/v1/payment-flow/investigation', 'GET', [
+            'address' => $address, 'dateFrom' => '2026-05-15', 'dateTo' => '2026-05-15',
+        ]));
+        self::assertSame(200, $response->getStatusCode());
+    }
+
+    public function testReadOnlyTraceAliasesBindPathTargetAndRejectUnsupportedDepth(): void
+    {
+        $address = 'GDUY7J7A33TQWOSOQGDO776GGLM3UQERL4J3SPT56F6YS4ID7MLDERI4';
+        $hash = str_repeat('a', 64);
+        $service = $this->createMock(PaymentFlowInvestigationReadServiceInterface::class);
+        $service->expects(self::exactly(2))->method('read')->willReturn([]);
+        $controller = new PaymentFlowInvestigationController($service);
+
+        $addressRequest = Request::create('/v1/trace/address/' . $address, 'GET', [
+            'q' => $hash, 'txHash' => $hash, 'depth' => '1', 'direction' => 'outgoing',
+        ]);
+        self::assertSame(200, $controller->traceAddress($addressRequest, $address)->getStatusCode());
+        self::assertSame($address, $addressRequest->query->get('address'));
+        self::assertFalse($addressRequest->query->has('txHash'));
+
+        $txRequest = Request::create('/v1/trace/tx/' . $hash, 'GET', [
+            'q' => $address, 'address' => $address, 'depth' => '1',
+        ]);
+        self::assertSame(200, $controller->traceTransaction($txRequest, $hash)->getStatusCode());
+        self::assertSame($hash, $txRequest->query->get('txHash'));
+        self::assertFalse($txRequest->query->has('address'));
+
+        $unsupported = $controller->traceAddress(Request::create('/v1/trace/address/' . $address, 'GET', ['depth' => '2']), $address);
+        self::assertSame(422, $unsupported->getStatusCode());
+        self::assertSame('depth_not_available', json_decode((string) $unsupported->getContent(), true)['error']['type']);
+    }
+
     private function unusedService(): PaymentFlowInvestigationReadServiceInterface
     {
         return new class implements PaymentFlowInvestigationReadServiceInterface {
@@ -138,7 +241,11 @@ final class PaymentFlowInvestigationControllerTest extends TestCase
                 string $direction,
                 int $limit,
                 ?string $cursor = null,
-                ?string $operationType = null
+                ?string $operationType = null,
+                ?string $asset = null,
+                ?string $dateFrom = null,
+                ?string $dateTo = null,
+                ?string $minAssetAmount = null
             ): array {
                 throw new \LogicException('The service should not be called.');
             }

@@ -4,6 +4,8 @@ Symfony 8 + API Platform project for StellarChain data (accounts + metrics).
 
 Forward-only history ingestion and preview-first SQL repairs: [operational runbook](docs/forwardfill.md). Deployment and remote writes are separate approval gates.
 
+Q3 bounded API compatibility, Investigator V2 and historical metric read-model gates: [Q3 read models](docs/q3-read-model-gates.md).
+
 ## Implemented
 
 - API Platform with `/v1` docs and `/v1/accounts` collection.
@@ -19,8 +21,15 @@ Forward-only history ingestion and preview-first SQL repairs: [operational runbo
   - optimized for refresh: keyset pagination + `ETag` + short cache-control
 - Network metrics API resource:
   - `GET /v1/network-metrics`
-  - query params: `network`, `metricKey`, `metricGroup`, `source`, `bucketMinutes`, `bucketStart[before|after]`, `bucketEnd[before|after]`
-  - response: paginated time-series rows for blockchain/network charts
+  - query params: `network`, `metricKey`, `bucketMinutes`, `page`, `itemsPerPage`, required `windowDays` (1–30), optional bucket-aligned UTC `before`
+  - response: paginated time-series rows and UTC window metadata; page totals are limited to that window
+  - compatibility note: requests without `windowDays` now return `422 window_required`; update API clients before deploying this change. An implicit unbounded fallback is intentionally unavailable.
+- Investigator payment-flow API:
+  - `GET /v1/payment-flow/investigation` returns first-hop classic payment-flow evidence for the current page only; indexed-history completeness is not verified.
+  - `riskContext.score` and `riskContext.level` are legacy, page-dependent heuristics retained for response compatibility. Do not present them as account-level risk ratings or fraud/safety verdicts; use `signals`, `limitations`, and `coverage` as qualified evidence instead.
+- Statistics overview:
+  - `GET /v1/statistics/network` omits `active-addresses` from range cards because averaging five-minute distinct source counts cannot produce period-unique active accounts. The five-minute series remains available through `/v1/network-metrics`.
+  - Contract creation/invocation cards count indexed detail-text matches, not verified complete contract activity.
 - Filtering:
   - `label` partial
   - `address` exact
@@ -72,7 +81,7 @@ Forward-only history ingestion and preview-first SQL repairs: [operational runbo
    - `https://api.stellarchain.dev/v1`
    - `https://api.stellarchain.dev/v1/accounts`
 - `https://api.stellarchain.dev/v1/market/assets?network=testnet&limit=50`
-- `https://api.stellarchain.dev/v1/network-metrics?network=testnet&metricKey=transactions&bucketMinutes=10`
+- `https://api.stellarchain.dev/v1/network-metrics?network=testnet&metricKey=transactions&bucketMinutes=10&windowDays=30`
 
 ## Statistics Database
 

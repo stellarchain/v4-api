@@ -68,6 +68,20 @@ use Doctrine\ORM\Mapping as ORM;
                         required: false,
                         schema: ['type' => 'integer', 'minimum' => 1, 'maximum' => 500]
                     ),
+                    new OpenApiParameter(
+                        name: 'windowDays',
+                        in: 'query',
+                        description: 'Required bounded UTC window of 1-30 days. Unbounded reads return 422. Page totals apply only to this window; bucketMinutes must divide 1440.',
+                        required: true,
+                        schema: ['type' => 'integer', 'minimum' => 1, 'maximum' => 30]
+                    ),
+                    new OpenApiParameter(
+                        name: 'before',
+                        in: 'query',
+                        description: 'Exclusive, bucket-aligned UTC end of the required window. Omit for latest indexed bucket.',
+                        required: false,
+                        schema: ['type' => 'string', 'format' => 'date-time']
+                    ),
                 ]
             )
         ),

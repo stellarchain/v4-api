@@ -15,6 +15,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class NetworkStatisticsReadService implements NetworkStatisticsReadServiceInterface
 {
     private const SOURCE_BUCKET_MINUTES = 5;
+    private const ANCHOR_METRIC_KEY = 'transactions';
 
     private const RANGE_MODIFIERS = [
         '24h' => '-24 hours',
@@ -37,11 +38,10 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         'xlm-total-pay' => ['label' => 'XLM payments', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'xlm', 'suffix' => 'XLM'],
         'tx-success' => ['label' => 'Successful tx', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'integer'],
         'tx-failed' => ['label' => 'Failed tx', 'section' => 'dex-payments', 'aggregation' => 'sum', 'format' => 'integer'],
-        'active-addresses' => ['label' => 'Active addresses', 'section' => 'accounts-contracts', 'aggregation' => 'avg', 'format' => 'integer'],
         'accounts-created' => ['label' => 'Accounts created', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
         'accounts-merged' => ['label' => 'Accounts merged', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
-        'contracts' => ['label' => 'Contracts created', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
-        'invocations' => ['label' => 'Contract invokes', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
+        'contracts' => ['label' => 'Contract creation matches', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
+        'invocations' => ['label' => 'Contract invocation matches', 'section' => 'accounts-contracts', 'aggregation' => 'sum', 'format' => 'integer'],
     ];
 
     /**
@@ -58,7 +58,7 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
         ],
         'accounts-contracts' => [
             'label' => 'Accounts & Contracts',
-            'description' => 'Address activity, account lifecycle events, and Soroban contract usage.',
+            'description' => 'Account lifecycle events and indexed contract-detail matches. Period-unique active accounts are unavailable.',
         ],
     ];
 
@@ -152,16 +152,20 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
             'SELECT 1
              FROM network_metric_point
              WHERE network = :network
+               AND metric_key = :metric_key
                AND bucket_minutes = :bucket_minutes
                AND bucket_start < :range_start
+             ORDER BY bucket_start DESC
              LIMIT 1',
             [
                 'network' => $networkCode,
+                'metric_key' => self::ANCHOR_METRIC_KEY,
                 'bucket_minutes' => $bucketMinutes,
                 'range_start' => $requestedStart->format('Y-m-d H:i:s'),
             ],
             [
                 'network' => ParameterType::INTEGER,
+                'metric_key' => ParameterType::STRING,
                 'bucket_minutes' => ParameterType::INTEGER,
             ]
         );
@@ -183,15 +187,19 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
     private function loadLatestBucket(int $networkCode, int $bucketMinutes): ?array
     {
         $row = $this->statisticsConnection->fetchAssociative(
-            'SELECT MAX(bucket_start) AS latest_bucket, MAX(updated_at) AS latest_update
+            'SELECT bucket_start AS latest_bucket, updated_at AS latest_update
              FROM network_metric_point
-             WHERE network = :network AND bucket_minutes = :bucket_minutes',
+             WHERE network = :network AND metric_key = :metric_key AND bucket_minutes = :bucket_minutes
+             ORDER BY bucket_start DESC, id DESC
+             LIMIT 1',
             [
                 'network' => $networkCode,
+                'metric_key' => self::ANCHOR_METRIC_KEY,
                 'bucket_minutes' => $bucketMinutes,
             ],
             [
                 'network' => ParameterType::INTEGER,
+                'metric_key' => ParameterType::STRING,
                 'bucket_minutes' => ParameterType::INTEGER,
             ]
         );
@@ -445,11 +453,16 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
             return 0.0;
         }
 
-        return match ($aggregation) {
-            'sum' => array_reduce($series, static fn (float $carry, array $point): float => $carry + $point['value'], 0.0),
-            'avg' => array_reduce($series, static fn (float $carry, array $point): float => $carry + $point['value'], 0.0) / count($series),
-            default => $series[array_key_last($series)]['value'],
-        };
+        if ($aggregation !== 'sum' && $aggregation !== 'avg') {
+            return $series[array_key_last($series)]['value'];
+        }
+
+        $sum = 0.0;
+        foreach ($series as $point) {
+            $sum += $point['value'];
+        }
+
+        return $aggregation === 'avg' ? $sum / count($series) : $sum;
     }
 
     /**
@@ -464,7 +477,12 @@ final class NetworkStatisticsReadService implements NetworkStatisticsReadService
 
         $maxPoints = 48;
         if (count($series) <= $maxPoints) {
-            return array_map(fn (array $point): float => $this->roundMetricValue($point['value']), $series);
+            $points = [];
+            foreach ($series as $point) {
+                $points[] = $this->roundMetricValue($point['value']);
+            }
+
+            return $points;
         }
 
         $sampled = [];

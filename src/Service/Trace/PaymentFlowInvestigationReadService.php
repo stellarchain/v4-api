@@ -37,13 +37,28 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         string $direction,
         int $limit,
         ?string $cursor = null,
-        ?string $operationType = null
+        ?string $operationType = null,
+        ?string $asset = null,
+        ?string $dateFrom = null,
+        ?string $dateTo = null,
+        ?string $minAssetAmount = null
     ): array {
         $normalizedNetwork = $this->networkResolver->normalizeNetwork($network, 'mainnet');
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
         $address = $this->normalizeNullableString($address);
         $txHash = $this->normalizeNullableString($txHash);
-        $scope = hash('sha256', json_encode([$normalizedNetwork, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $operationType], JSON_THROW_ON_ERROR));
+        $scopeFilters = [$normalizedNetwork, $address, $txHash, $ledgerFrom, $ledgerTo, $direction, $operationType];
+        if ($asset !== null) {
+            $scopeFilters[] = $asset;
+        }
+        if ($dateFrom !== null || $dateTo !== null) {
+            $scopeFilters[] = $dateFrom;
+            $scopeFilters[] = $dateTo;
+        }
+        if ($minAssetAmount !== null) {
+            $scopeFilters[] = $minAssetAmount;
+        }
+        $scope = hash('sha256', json_encode($scopeFilters, JSON_THROW_ON_ERROR));
         $position = $this->decodeCursor($cursor, $scope);
         $ownsTransaction = !$this->statisticsConnection->isTransactionActive();
 
@@ -61,16 +76,31 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
 
             $addressId = $address !== null ? $this->loadAddressId($networkCode, $address) : null;
             $txId = $txHash !== null ? $this->loadTransactionId($networkCode, $txHash) : null;
+            $assetId = $asset !== null ? $this->loadAssetId($networkCode, $asset) : null;
             $latest = $this->statisticsConnection->fetchAssociative(
                 'SELECT ledger, closed_at FROM payment_flow_transaction WHERE network = :network ORDER BY ledger DESC, id DESC LIMIT 1',
                 ['network' => $networkCode], ['network' => ParameterType::INTEGER]
             );
             $anchorLedger = $position['anchor'] ?? ($latest ? (int) $latest['ledger'] : null);
+            $effectiveFrom = $ledgerFrom;
             $effectiveTo = $anchorLedger === null ? $ledgerTo : min($ledgerTo ?? $anchorLedger, $anchorLedger);
-            if (($address !== null && $addressId === null) || ($txHash !== null && $txId === null)) {
+            if ($anchorLedger !== null && $dateFrom !== null) {
+                $dateFromLedger = $this->firstLedgerAtOrAfterUtc($networkCode, $dateFrom . ' 00:00:00', $anchorLedger);
+                $effectiveFrom = $dateFromLedger === null ? $anchorLedger + 1 : max($effectiveFrom ?? 1, $dateFromLedger);
+            }
+            if ($anchorLedger !== null && $dateTo !== null) {
+                $dayAfter = (new \DateTimeImmutable($dateTo, new \DateTimeZone('UTC')))->modify('+1 day')->format('Y-m-d 00:00:00');
+                $afterDateLedger = $this->firstLedgerAtOrAfterUtc($networkCode, $dayAfter, $anchorLedger);
+                if ($afterDateLedger !== null) {
+                    $effectiveTo = min($effectiveTo ?? $anchorLedger, $afterDateLedger - 1);
+                }
+            }
+            if (($address !== null && $addressId === null) || ($txHash !== null && $txId === null) || ($asset !== null && $assetId === null)) {
+                $rows = [];
+            } elseif ($effectiveFrom !== null && $effectiveTo !== null && $effectiveFrom > $effectiveTo) {
                 $rows = [];
             } else {
-                $rows = $this->loadEvents($networkCode, $addressId, $txId, $ledgerFrom, $effectiveTo, $direction, $limit + 1, $position, $operationType);
+                $rows = $this->loadEvents($networkCode, $addressId, $txId, $effectiveFrom, $effectiveTo, $direction, $limit + 1, $position, $operationType, $assetId, $minAssetAmount);
             }
         } catch (StatisticsUnavailableException $exception) {
             throw $exception;
@@ -112,6 +142,10 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
                 'limit' => $limit,
                 'cursor' => $cursor,
                 'operationType' => $operationType,
+                'asset' => $asset,
+                'dateFrom' => $dateFrom,
+                'dateTo' => $dateTo,
+                'minAssetAmount' => $minAssetAmount,
             ],
             'coverage' => [
                 'rowsReturned' => count($events),
@@ -134,6 +168,7 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
             'accountContext' => $this->buildAccountContext($address, $accounts, $accountMetadataUnavailable),
             'graph' => $this->buildGraph($events, $address, $accounts),
             'counterparties' => $this->buildCounterparties($events, $address, $accounts),
+            'flowGroups' => $this->buildFlowGroups($events),
             'events' => $events,
         ];
     }
@@ -205,6 +240,49 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         return $id === false || $id === null ? null : (int) $id;
     }
 
+    private function loadAssetId(int $networkCode, string $asset): ?int
+    {
+        [$type, $code, $issuer] = $asset === 'native:XLM'
+            ? ['native', '', ''] : explode(':', $asset, 3);
+        $id = $this->statisticsConnection->fetchOne(
+            'SELECT id FROM payment_flow_asset WHERE network = :network AND asset_type = :type AND asset_code = :code AND asset_issuer = :issuer',
+            ['network' => $networkCode, 'type' => $type, 'code' => $code, 'issuer' => $issuer],
+            ['network' => ParameterType::INTEGER, 'type' => ParameterType::STRING, 'code' => ParameterType::STRING, 'issuer' => ParameterType::STRING]
+        );
+
+        return $id === false || $id === null ? null : (int) $id;
+    }
+
+    private function firstLedgerAtOrAfterUtc(int $networkCode, string $boundary, int $lastLedger): ?int
+    {
+        $low = 1;
+        $high = $lastLedger;
+        $found = null;
+        while ($low <= $high) {
+            $mid = intdiv($low + $high, 2);
+            $row = $this->statisticsConnection->fetchAssociative(
+                'SELECT ledger, closed_at FROM payment_flow_transaction WHERE network = :network AND ledger >= :ledger ORDER BY ledger ASC, id ASC LIMIT 1',
+                ['network' => $networkCode, 'ledger' => $mid],
+                ['network' => ParameterType::INTEGER, 'ledger' => ParameterType::INTEGER]
+            );
+            if (!$row) {
+                $high = $mid - 1;
+                continue;
+            }
+            $rowLedger = (int) $row['ledger'];
+            $closedAt = $row['closed_at'] instanceof \DateTimeInterface
+                ? $row['closed_at']->format('Y-m-d H:i:s') : (string) $row['closed_at'];
+            if ($closedAt >= $boundary) {
+                $found = $rowLedger;
+                $high = $mid - 1;
+            } else {
+                $low = $rowLedger + 1;
+            }
+        }
+
+        return $found;
+    }
+
     /**
      * @return list<array<string,mixed>>
      */
@@ -217,7 +295,9 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
         string $direction,
         int $limit,
         ?array $position,
-        ?string $operationType
+        ?string $operationType,
+        ?int $assetId,
+        ?string $minAssetAmount
     ): array {
         $where = ['e.network = :network'];
         $params = [
@@ -269,6 +349,17 @@ final class PaymentFlowInvestigationReadService implements PaymentFlowInvestigat
             $where[] = 'e.operation_type = :operation_type';
             $params['operation_type'] = $operationType;
             $types['operation_type'] = ParameterType::STRING;
+        }
+        if ($assetId !== null) {
+            $where[] = '(e.source_asset_id = :asset_id OR e.destination_asset_id = :asset_id)';
+            $params['asset_id'] = $assetId;
+            $types['asset_id'] = ParameterType::INTEGER;
+        }
+        if ($minAssetAmount !== null && $assetId !== null) {
+            $where[] = '((e.source_asset_id = :asset_id AND e.source_amount_decimal >= CAST(:min_asset_amount AS NUMERIC))'
+                . ' OR (e.destination_asset_id = :asset_id AND e.destination_amount_decimal >= CAST(:min_asset_amount AS NUMERIC)))';
+            $params['min_asset_amount'] = $minAssetAmount;
+            $types['min_asset_amount'] = ParameterType::STRING;
         }
         $predicate = implode(' AND ', $where);
         // Exclude orphaned/mismatched transaction references before each branch limit.
@@ -465,6 +556,82 @@ SQL,
     }
 
     /**
+     * Group only the returned page; source and destination units are never mixed.
+     * Unknown amounts make that side's total unknown, rather than silently zero.
+     *
+     * @param list<array<string,mixed>> $events
+     * @return list<array<string,mixed>>
+     */
+    private function buildFlowGroups(array $events): array
+    {
+        $groups = [];
+        foreach ($events as $event) {
+            $key = json_encode([
+                $event['fromAddress'], $event['toAddress'], $event['direction'],
+                $event['sourceAsset']['key'], $event['destinationAsset']['key'],
+            ], JSON_THROW_ON_ERROR);
+            if (!isset($groups[$key])) {
+                $groups[$key] = [
+                    'fromAddress' => $event['fromAddress'],
+                    'toAddress' => $event['toAddress'],
+                    'direction' => $event['direction'],
+                    'sourceAsset' => $event['sourceAsset'],
+                    'destinationAsset' => $event['destinationAsset'],
+                    'events' => 0,
+                    'sourceAmountTotal' => '0',
+                    'destinationAmountTotal' => '0',
+                    'firstLedger' => $event['ledger'],
+                    'lastLedger' => $event['ledger'],
+                    'firstClosedAt' => $event['closedAt'],
+                    'lastClosedAt' => $event['closedAt'],
+                ];
+            }
+
+            $group = &$groups[$key];
+            $group['events']++;
+            $group['firstLedger'] = min($group['firstLedger'], $event['ledger']);
+            $group['lastLedger'] = max($group['lastLedger'], $event['ledger']);
+            foreach (['firstClosedAt', 'lastClosedAt'] as $field) {
+                if ($event['closedAt'] === null) {
+                    continue;
+                }
+                if ($group[$field] === null || ($field === 'firstClosedAt' && $event['closedAt'] < $group[$field])
+                    || ($field === 'lastClosedAt' && $event['closedAt'] > $group[$field])) {
+                    $group[$field] = $event['closedAt'];
+                }
+            }
+            foreach (['source', 'destination'] as $side) {
+                $totalField = $side . 'AmountTotal';
+                $amount = $event[$side . 'Amount'];
+                if ($amount === null) {
+                    $group[$totalField] = null;
+                } elseif ($group[$totalField] !== null) {
+                    $group[$totalField] = $this->addDecimal($group[$totalField], $amount);
+                }
+            }
+            unset($group);
+        }
+
+        $rows = array_values($groups);
+        usort($rows, [self::class, 'compareFlowGroups']);
+        foreach ($rows as &$row) {
+            foreach (['sourceAmountTotal', 'destinationAmountTotal'] as $field) {
+                if ($row[$field] !== null) {
+                    $row[$field] = $this->normalizeNumber($row[$field]);
+                }
+            }
+        }
+        unset($row);
+
+        return $rows;
+    }
+
+    private static function compareFlowGroups(array $a, array $b): int
+    {
+        return ($b['events'] <=> $a['events']) ?: ($b['lastLedger'] <=> $a['lastLedger']);
+    }
+
+    /**
      * @param array<string,mixed> $summary
      * @param list<array<string,mixed>> $events
      * @return array<string,mixed>
@@ -486,8 +653,8 @@ SQL,
                 'score' => 0,
                 'signals' => [[
                     'severity' => 'info',
-                    'label' => 'No collected payment-flow rows',
-                    'description' => 'This address or transaction is not present in the currently indexed payment-flow dataset.',
+                    'label' => 'No matching payment-flow rows',
+                    'description' => 'No indexed payment-flow rows match this target and the selected filters. This does not prove that the target has no other activity.',
                 ]],
                 'guidance' => $this->guidance(),
                 'limitations' => $this->limitations($accountMetadataUnavailable),
@@ -817,7 +984,7 @@ SQL,
     private function limitations(bool $accountMetadataUnavailable = false): array
     {
         $limitations = [
-            'Signals are heuristic and are not a final fraud determination.',
+            'Signals and the legacy score are calculated from the returned page only; they can change with filters or pagination and are not a fraud or safety verdict.',
             'Coverage depends on how much historical payment-flow data has already been backfilled.',
             'Asset values are not converted to USD in this view.',
         ];
@@ -876,14 +1043,16 @@ SQL,
      */
     private function enrichEventsWithAccountMetadata(array $events, array $accounts): array
     {
-        return array_map(function (array $event) use ($accounts): array {
+        $enrichedEvents = [];
+        foreach ($events as $event) {
             $event['sourceAccountMetadata'] = $this->accountMetadataFor($event['sourceAccount'] ?? null, $accounts);
             $event['fromAccount'] = $this->accountMetadataFor($event['fromAddress'] ?? null, $accounts);
             $event['toAccount'] = $this->accountMetadataFor($event['toAddress'] ?? null, $accounts);
             $event['counterpartyAccount'] = $this->accountMetadataFor($event['counterparty'] ?? null, $accounts);
+            $enrichedEvents[] = $event;
+        }
 
-            return $event;
-        }, $events);
+        return $enrichedEvents;
     }
 
     /**
@@ -910,7 +1079,7 @@ SQL,
             'labeledAccounts' => $labeled,
             'verifiedAccounts' => $verified,
             'focusAccount' => $this->accountMetadataFor($focusAddress, $accounts),
-            'note' => 'Account labels are directory context only and do not change the risk score.',
+            'note' => 'Account labels are directory context only; they do not determine the page-scoped patterns.',
         ];
     }
 

@@ -18,6 +18,10 @@ interface PaymentFlowInvestigationReadServiceInterface
         string $direction,
         int $limit,
         ?string $cursor = null,
-        ?string $operationType = null
+        ?string $operationType = null,
+        ?string $asset = null,
+        ?string $dateFrom = null,
+        ?string $dateTo = null,
+        ?string $minAssetAmount = null
     ): array;
 }

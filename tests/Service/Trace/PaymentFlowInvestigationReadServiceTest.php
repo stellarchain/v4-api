@@ -116,6 +116,24 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         self::assertSame(0, $payload['riskContext']['score']);
     }
 
+    public function testEmptyFilteredPageDoesNotClaimTheTargetHasNoActivity(): void
+    {
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows([]),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $payload = $service->read('mainnet', self::FOCUS_ADDRESS, null, 70000000, null, 'both', 50);
+
+        self::assertSame(0, $payload['summary']['events']);
+        self::assertSame('No matching payment-flow rows', $payload['riskContext']['signals'][0]['label']);
+        self::assertStringContainsString('selected filters', $payload['riskContext']['signals'][0]['description']);
+        self::assertStringContainsString('does not prove', $payload['riskContext']['signals'][0]['description']);
+    }
+
     public function testItPreservesExactAmountsInEventsAndPageAggregates(): void
     {
         $first = $this->paymentFlowRow();
@@ -154,31 +172,186 @@ final class PaymentFlowInvestigationReadServiceTest extends TestCase
         self::assertSame('12345678901234567890.12345678901235', $payload['graph']['edges'][0]['totalXlm']);
         self::assertSame('12345678901234567890.12345678901235', $payload['counterparties'][0]['nativeReceived']);
         self::assertSame('0.5', $payload['counterparties'][0]['nativeSent']);
+        self::assertSame('12345678901234567890.12345678901235', $payload['flowGroups'][0]['sourceAmountTotal']);
+        self::assertSame('12345678901234567890.12345678901235', $payload['flowGroups'][0]['destinationAmountTotal']);
+        self::assertSame(2, $payload['flowGroups'][0]['events']);
+        self::assertCount(2, $payload['flowGroups']);
+    }
+
+    public function testAssetFilterChecksBothSidesBeforePagination(): void
+    {
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows([$this->paymentFlowRow()], '(e.source_asset_id = :asset_id OR e.destination_asset_id = :asset_id)'),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $payload = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 50, null, null, 'native:XLM');
+
+        self::assertSame('native:XLM', $payload['query']['asset']);
+        self::assertSame(1, $payload['summary']['events']);
+    }
+
+    public function testMinimumAssetAmountIsAppliedBeforePaginationAndRecordedInQuery(): void
+    {
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows(
+                [$this->paymentFlowRow()],
+                'e.destination_amount_decimal >= CAST(:min_asset_amount AS NUMERIC)',
+                ['network' => 1, 'limit' => 51, 'address_id' => 10, 'asset_id' => 20, 'min_asset_amount' => '0.0000001']
+            ),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $payload = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 50, null, null, 'native:XLM', null, null, '0.0000001');
+
+        self::assertSame('0.0000001', $payload['query']['minAssetAmount']);
+        self::assertSame(1, $payload['summary']['events']);
+    }
+
+    public function testCursorCannotBeReusedWithDifferentMinimumAssetAmount(): void
+    {
+        $rows = [$this->paymentFlowRow(), $this->paymentFlowRow()];
+        $rows[1]['id'] = 1000;
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows($rows), new StellarNetworkResolver(), $metadataService
+        );
+        $cursor = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 1, null, null, 'native:XLM', null, null, '0.1')['coverage']['nextCursor'];
+
+        $this->expectException(\InvalidArgumentException::class);
+        $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 1, $cursor, null, 'native:XLM', null, null, '0.2');
+    }
+
+    public function testGroupedFlowMarksUnknownAmountsWithoutMixingAssetPairs(): void
+    {
+        $first = $this->paymentFlowRow();
+        $second = $this->paymentFlowRow();
+        $second['id'] = 1002;
+        $second['source_amount_decimal'] = null;
+        $third = $this->paymentFlowRow();
+        $third['id'] = 1003;
+        $third['source_asset_type'] = 'credit_alphanum4';
+        $third['source_asset_code'] = 'USD';
+        $third['source_asset_issuer'] = self::COUNTERPARTY_ADDRESS;
+
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows([$first, $second, $third]),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+
+        $groups = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 50)['flowGroups'];
+
+        self::assertCount(2, $groups);
+        self::assertSame(2, $groups[0]['events']);
+        self::assertNull($groups[0]['sourceAmountTotal']);
+        self::assertSame('50', $groups[0]['destinationAmountTotal']);
+        self::assertSame('credit_alphanum4:USD:' . self::COUNTERPARTY_ADDRESS, $groups[1]['sourceAsset']['key']);
+    }
+
+    public function testCursorCannotBeReusedWithDifferentAssetFilter(): void
+    {
+        $rows = [$this->paymentFlowRow(), $this->paymentFlowRow()];
+        $rows[1]['id'] = 1000;
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService(
+            $this->statisticsConnectionWithRows($rows),
+            new StellarNetworkResolver(),
+            $metadataService
+        );
+        $cursor = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 1)['coverage']['nextCursor'];
+        self::assertNotNull($cursor);
+
+        $this->expectException(\InvalidArgumentException::class);
+        $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 1, $cursor, null, 'native:XLM');
+    }
+
+    public function testUtcDayFiltersUseLedgerIndexBoundsBeforeEventPagination(): void
+    {
+        $row = $this->paymentFlowRow();
+        $row['ledger'] = 20;
+        $connection = $this->statisticsConnectionWithRows(
+            [$row],
+            'e.ledger >= :ledger_from',
+            ['network' => 1, 'limit' => 51, 'address_id' => 10, 'ledger_from' => 20, 'ledger_to' => 29]
+        );
+        $connection->method('fetchAssociative')->willReturnCallback([self::class, 'fetchTransactionAtOrAfterLedger']);
+        $metadataService = $this->createMock(PaymentFlowAccountMetadataReadServiceInterface::class);
+        $metadataService->method('readByAddresses')->willReturn([]);
+        $service = new PaymentFlowInvestigationReadService($connection, new StellarNetworkResolver(), $metadataService);
+
+        $payload = $service->read('mainnet', self::FOCUS_ADDRESS, null, null, null, 'both', 50, null, null, null, '2026-05-15', '2026-05-15');
+
+        self::assertSame('2026-05-15', $payload['query']['dateFrom']);
+        self::assertSame('2026-05-15', $payload['query']['dateTo']);
+        self::assertSame(1, $payload['summary']['events']);
+    }
+
+    public static function fetchTransactionAtOrAfterLedger(string $sql, array $params): array|false
+    {
+        $rows = [
+            ['ledger' => 10, 'closed_at' => '2026-05-14 23:59:59'],
+            ['ledger' => 20, 'closed_at' => '2026-05-15 10:38:33'],
+            ['ledger' => 30, 'closed_at' => '2026-05-16 00:00:00'],
+        ];
+        if (str_contains($sql, 'ORDER BY ledger DESC')) {
+            return $rows[2];
+        }
+        foreach ($rows as $row) {
+            if ($row['ledger'] >= $params['ledger']) {
+                return $row;
+            }
+        }
+
+        return false;
     }
 
     /**
      * @param list<array<string,mixed>> $rows
      */
-    private function statisticsConnectionWithRows(array $rows): Connection
+    private function statisticsConnectionWithRows(array $rows, ?string $expectedSqlFragment = null, ?array $expectedParams = null): Connection
     {
         $connection = $this->createMock(Connection::class);
         $connection
             ->method('fetchOne')
-            ->willReturnCallback(static function (string $sql, array $params = [], array $types = []): mixed {
-                if (str_contains($sql, 'information_schema.tables')) {
-                    return 1;
-                }
-                if (str_contains($sql, 'payment_flow_address')) {
-                    return 10;
-                }
-
-                return null;
-            });
-        $connection
-            ->method('fetchAllAssociative')
-            ->willReturn($rows);
+            ->willReturnCallback([self::class, 'fetchOneFixture']);
+        if ($expectedSqlFragment !== null) {
+            $expectation = $connection->expects(self::once())->method('fetchAllAssociative');
+            if ($expectedParams !== null) {
+                $expectation->with(self::stringContains($expectedSqlFragment), $expectedParams)->willReturn($rows);
+            } else {
+                $expectation->with(self::stringContains($expectedSqlFragment))->willReturn($rows);
+            }
+        } else {
+            $connection->method('fetchAllAssociative')->willReturn($rows);
+        }
 
         return $connection;
+    }
+
+    public static function fetchOneFixture(string $sql): mixed
+    {
+        if (str_contains($sql, 'information_schema.tables')) {
+            return 1;
+        }
+        if (str_contains($sql, 'payment_flow_address')) {
+            return 10;
+        }
+        if (str_contains($sql, 'payment_flow_asset')) {
+            return 20;
+        }
+
+        return null;
     }
 
     /**
