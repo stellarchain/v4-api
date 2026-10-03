@@ -15,6 +15,7 @@ interface NetworkMetricSeriesReadServiceInterface
      *   page:int,
      *   itemsPerPage:int,
      *   totalItems:int,
+     *   window:?array{start:string,end:string,olderBefore:?string,newerBefore:?string,isLatest:bool},
      *   items:list<array<string,mixed>>
      * }
      */
@@ -23,6 +24,8 @@ interface NetworkMetricSeriesReadServiceInterface
         ?string $metricKey,
         int $bucketMinutes,
         int $page,
-        int $itemsPerPage
+        int $itemsPerPage,
+        int $windowDays,
+        ?string $before = null
     ): array;
 }

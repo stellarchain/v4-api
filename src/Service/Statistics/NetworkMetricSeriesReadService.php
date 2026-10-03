@@ -14,6 +14,7 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 final class NetworkMetricSeriesReadService implements NetworkMetricSeriesReadServiceInterface
 {
     private const SOURCE_BUCKET_MINUTES = 5;
+    private const MAX_WINDOW_DAYS = 30;
 
     private const AVG_METRICS = [
         'tps',
@@ -26,6 +27,7 @@ final class NetworkMetricSeriesReadService implements NetworkMetricSeriesReadSer
 
     private const MAX_METRICS = [
         'max-fee',
+        'max-transaction-fee',
     ];
 
     public function __construct(
@@ -41,13 +43,18 @@ final class NetworkMetricSeriesReadService implements NetworkMetricSeriesReadSer
         ?string $metricKey,
         int $bucketMinutes,
         int $page,
-        int $itemsPerPage
+        int $itemsPerPage,
+        int $windowDays,
+        ?string $before = null
     ): array {
+        if ($windowDays < 1 || $windowDays > self::MAX_WINDOW_DAYS) {
+            throw new \InvalidArgumentException('windowDays must be between 1 and 30.');
+        }
+
         $normalizedNetwork = $this->networkResolver->normalizeNetwork($network, 'mainnet');
         $networkCode = $this->networkResolver->resolveNetworkCode($normalizedNetwork) ?? 1;
         $metricKey = $metricKey === null ? null : strtolower(trim($metricKey));
         $targetInterval = sprintf('%d minutes', $bucketMinutes);
-        $offset = ($page - 1) * $itemsPerPage;
 
         $params = [
             'network' => $networkCode,
@@ -66,25 +73,41 @@ final class NetworkMetricSeriesReadService implements NetworkMetricSeriesReadSer
             $types['metric_key'] = ParameterType::STRING;
         }
 
-        $groupedSql = $this->groupedSeriesSql($metricFilter);
-
+        $ownsTransaction = !$this->statisticsConnection->isTransactionActive();
         try {
+            if ($ownsTransaction) {
+                $this->statisticsConnection->beginTransaction();
+                $this->statisticsConnection->executeStatement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY');
+                $this->statisticsConnection->executeStatement("SET LOCAL statement_timeout = '8s'");
+            }
+            $window = $this->resolveWindow($networkCode, (string) $metricKey, $bucketMinutes, $windowDays, $before);
+            if ($window === null) {
+                return $this->emptyResult($normalizedNetwork, $networkCode, $metricKey, $bucketMinutes, $page, $itemsPerPage);
+            }
+            $params['window_start'] = $window['startSql'];
+            $params['window_end'] = $window['endSql'];
+            $types['window_start'] = ParameterType::STRING;
+            $types['window_end'] = ParameterType::STRING;
+
+            $groupedSql = $this->groupedSeriesSql($metricFilter);
             $totalItems = (int) $this->statisticsConnection->fetchOne(
                 $groupedSql . ' SELECT COUNT(*) FROM grouped_rows',
                 $params,
                 $types
             );
 
-            $pageParams = $params + [
-                'limit' => $itemsPerPage,
-                'offset' => $offset,
-            ];
-            $pageTypes = $types + [
-                'limit' => ParameterType::INTEGER,
-                'offset' => ParameterType::INTEGER,
-            ];
-            $rows = $this->statisticsConnection->fetchAllAssociative(
-                $groupedSql . <<<'SQL'
+            $rows = [];
+            if ($page <= (int) ceil($totalItems / $itemsPerPage)) {
+                $pageParams = $params + [
+                    'limit' => $itemsPerPage,
+                    'offset' => ($page - 1) * $itemsPerPage,
+                ];
+                $pageTypes = $types + [
+                    'limit' => ParameterType::INTEGER,
+                    'offset' => ParameterType::INTEGER,
+                ];
+                $rows = $this->statisticsConnection->fetchAllAssociative(
+                    $groupedSql . <<<'SQL'
  SELECT
     network,
     metric_group,
@@ -99,11 +122,20 @@ FROM grouped_rows
 ORDER BY bucket_start DESC, metric_key ASC, source ASC
 LIMIT :limit OFFSET :offset
 SQL,
-                $pageParams,
-                $pageTypes
-            );
+                    $pageParams,
+                    $pageTypes
+                );
+            }
         } catch (Exception $exception) {
             throw new StatisticsUnavailableException('Network metric series are unavailable.', 0, $exception);
+        } finally {
+            if ($ownsTransaction && $this->statisticsConnection->isTransactionActive()) {
+                try {
+                    $this->statisticsConnection->rollBack();
+                } catch (Exception) {
+                    $this->statisticsConnection->close();
+                }
+            }
         }
 
         $items = [];
@@ -122,6 +154,13 @@ SQL,
             'page' => $page,
             'itemsPerPage' => $itemsPerPage,
             'totalItems' => $totalItems,
+            'window' => [
+                'start' => $window['start'],
+                'end' => $window['end'],
+                'olderBefore' => $window['olderBefore'],
+                'newerBefore' => $window['newerBefore'],
+                'isLatest' => $window['isLatest'],
+            ],
             'items' => $items,
         ];
     }
@@ -149,6 +188,8 @@ WITH source_rows AS (
     FROM network_metric_point
     WHERE network = :network
       AND bucket_minutes = :source_bucket_minutes{$metricFilter}
+      AND bucket_start >= :window_start
+      AND bucket_start < :window_end
 ),
 grouped_rows AS (
     SELECT
@@ -171,14 +212,124 @@ SQL;
     }
 
     /**
+     * @return array{start:string,end:string,startSql:string,endSql:string,olderBefore:?string,newerBefore:?string,isLatest:bool}|null
+     */
+    private function resolveWindow(
+        int $networkCode,
+        string $metricKey,
+        int $bucketMinutes,
+        int $windowDays,
+        ?string $before
+    ): ?array {
+        $latestValue = $this->statisticsConnection->fetchOne(
+            <<<'SQL'
+SELECT bucket_start
+FROM network_metric_point
+WHERE network = :network AND metric_key = :metric_key AND bucket_minutes = :source_bucket_minutes
+ORDER BY bucket_start DESC
+LIMIT 1
+SQL,
+            [
+                'network' => $networkCode,
+                'metric_key' => $metricKey,
+                'source_bucket_minutes' => self::SOURCE_BUCKET_MINUTES,
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'metric_key' => ParameterType::STRING,
+                'source_bucket_minutes' => ParameterType::INTEGER,
+            ]
+        );
+        $latest = $this->parseUtcDateTime($latestValue);
+        if ($latest === null) {
+            return null;
+        }
+
+        $bucketSeconds = $bucketMinutes * 60;
+        $latestEnd = $this->utcFromTimestamp((int) (floor($latest->getTimestamp() / $bucketSeconds) + 1) * $bucketSeconds);
+        $end = $before === null ? $latestEnd : new \DateTimeImmutable($before);
+        if ($end > $latestEnd) {
+            $end = $latestEnd;
+        }
+        $start = $end->modify(sprintf('-%d days', $windowDays));
+        $olderValue = $this->statisticsConnection->fetchOne(
+            <<<'SQL'
+SELECT 1
+FROM network_metric_point
+WHERE network = :network AND metric_key = :metric_key AND bucket_minutes = :source_bucket_minutes
+  AND bucket_start < :window_start
+ORDER BY bucket_start DESC
+LIMIT 1
+SQL,
+            [
+                'network' => $networkCode,
+                'metric_key' => $metricKey,
+                'source_bucket_minutes' => self::SOURCE_BUCKET_MINUTES,
+                'window_start' => $start->format('Y-m-d H:i:s'),
+            ],
+            [
+                'network' => ParameterType::INTEGER,
+                'metric_key' => ParameterType::STRING,
+                'source_bucket_minutes' => ParameterType::INTEGER,
+                'window_start' => ParameterType::STRING,
+            ]
+        );
+        $hasOlder = $olderValue !== false && $olderValue !== null;
+        $isLatest = $end >= $latestEnd;
+        $nextEnd = $end->modify(sprintf('+%d days', $windowDays));
+        if ($nextEnd > $latestEnd) {
+            $nextEnd = $latestEnd;
+        }
+
+        return [
+            'start' => $start->format(\DateTimeInterface::ATOM),
+            'end' => $end->format(\DateTimeInterface::ATOM),
+            'startSql' => $start->format('Y-m-d H:i:s'),
+            'endSql' => $end->format('Y-m-d H:i:s'),
+            'olderBefore' => $hasOlder ? $start->format('Y-m-d\TH:i:s\Z') : null,
+            'newerBefore' => $isLatest ? null : $nextEnd->format('Y-m-d\TH:i:s\Z'),
+            'isLatest' => $isLatest,
+        ];
+    }
+
+    private function utcFromTimestamp(int $timestamp): \DateTimeImmutable
+    {
+        return (new \DateTimeImmutable('@' . $timestamp))->setTimezone(new \DateTimeZone('UTC'));
+    }
+
+    /** @return array<string,mixed> */
+    private function emptyResult(
+        string $network,
+        int $networkCode,
+        ?string $metricKey,
+        int $bucketMinutes,
+        int $page,
+        int $itemsPerPage
+    ): array {
+        return [
+            'network' => $network,
+            'networkCode' => $networkCode,
+            'metricKey' => $metricKey,
+            'bucketMinutes' => $bucketMinutes,
+            'page' => $page,
+            'itemsPerPage' => $itemsPerPage,
+            'totalItems' => 0,
+            'window' => null,
+            'items' => [],
+        ];
+    }
+
+    /**
      * @param list<string> $metrics
      */
     private function quotedMetricList(array $metrics): string
     {
-        return implode(', ', array_map(
-            static fn (string $metric): string => "'" . str_replace("'", "''", $metric) . "'",
-            $metrics
-        ));
+        $quotedMetrics = [];
+        foreach ($metrics as $metric) {
+            $quotedMetrics[] = "'" . str_replace("'", "''", $metric) . "'";
+        }
+
+        return implode(', ', $quotedMetrics);
     }
 
     /**

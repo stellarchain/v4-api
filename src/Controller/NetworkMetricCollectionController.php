@@ -20,6 +20,7 @@ final class NetworkMetricCollectionController
     private const DEFAULT_ITEMS_PER_PAGE = 100;
     private const MAX_ITEMS_PER_PAGE = 500;
     private const MAX_BUCKET_MINUTES = 1440;
+    private const MAX_WINDOW_DAYS = 30;
     private const ALLOWED_NETWORKS = ['mainnet', 'public', 'testnet', 'test', 'futurenet', 'future'];
 
     public function __construct(
@@ -44,7 +45,7 @@ final class NetworkMetricCollectionController
         }
         if (!$this->metricCatalog->isAvailableMetric($metricKey)) {
             return $this->error(
-                sprintf('Metric "%s" is documented but is not currently populated.', $metricKey),
+                sprintf('Metric "%s" is not currently available in the public API.', $metricKey),
                 Response::HTTP_UNPROCESSABLE_ENTITY,
                 'metric_not_available'
             );
@@ -63,6 +64,13 @@ final class NetworkMetricCollectionController
                 'invalid_bucket_minutes'
             );
         }
+        if ($metricKey === 'active-addresses' && $bucketMinutes !== self::DEFAULT_BUCKET_MINUTES) {
+            return $this->error(
+                'Active addresses are only available as five-minute distinct transaction sources; larger intervals require a historical distinct-account rebuild.',
+                Response::HTTP_UNPROCESSABLE_ENTITY,
+                'metric_aggregation_not_available'
+            );
+        }
 
         $page = $this->queryPositiveInt($request, 'page', 1);
         if ($page === null) {
@@ -78,13 +86,44 @@ final class NetworkMetricCollectionController
             );
         }
 
+        if (!$request->query->has('windowDays')) {
+            return $this->error(
+                'windowDays is required. Use 1 to 30 UTC days; unbounded metric reads are not available.',
+                Response::HTTP_UNPROCESSABLE_ENTITY,
+                'window_required'
+            );
+        }
+
+        $windowDays = $this->queryPositiveInt($request, 'windowDays', 0);
+        if ($windowDays === null || $windowDays < 1 || $windowDays > self::MAX_WINDOW_DAYS || self::MAX_BUCKET_MINUTES % $bucketMinutes !== 0) {
+            return $this->error(
+                'Invalid windowDays. Use 1 to 30 UTC days with a bucket size that divides one day.',
+                Response::HTTP_BAD_REQUEST,
+                'invalid_window'
+            );
+        }
+
+        $before = null;
+        if ($request->query->has('before')) {
+            $before = $request->query->get('before');
+            if (!is_string($before) || !$this->isAlignedUtcBoundary($before, $bucketMinutes)) {
+                return $this->error(
+                    'Invalid before. Use a bucket-aligned UTC timestamp such as 2026-05-15T00:00:00Z.',
+                    Response::HTTP_BAD_REQUEST,
+                    'invalid_before'
+                );
+            }
+        }
+
         try {
             $result = $this->metricSeriesReadService->read(
                 $network,
                 $metricKey,
                 $bucketMinutes,
                 $page,
-                $itemsPerPage
+                $itemsPerPage,
+                $windowDays,
+                $before
             );
         } catch (StatisticsUnavailableException) {
             return $this->error(
@@ -102,6 +141,7 @@ final class NetworkMetricCollectionController
             'member' => $result['items'],
             'view' => $this->buildView($request, $result['page'], $result['itemsPerPage'], $result['totalItems']),
         ];
+        $payload['window'] = $result['window'];
 
         $response = new JsonResponse($payload, Response::HTTP_OK);
         $response->headers->set('Content-Type', 'application/ld+json; charset=utf-8');
@@ -123,7 +163,7 @@ final class NetworkMetricCollectionController
             'last' => $this->pageUrl($request, $lastPage),
         ];
         if ($page > 1) {
-            $view['previous'] = $this->pageUrl($request, $page - 1);
+            $view['previous'] = $this->pageUrl($request, $page > $lastPage ? $lastPage : $page - 1);
         }
         if ($page < $lastPage) {
             $view['next'] = $this->pageUrl($request, $page + 1);
@@ -160,12 +200,25 @@ final class NetworkMetricCollectionController
             return $value > 0 ? $value : null;
         }
         if (is_string($value) && preg_match('/^[0-9]+$/', trim($value)) === 1) {
-            $parsed = (int) trim($value);
+            $parsed = filter_var(ltrim(trim($value), '0'), FILTER_VALIDATE_INT);
 
-            return $parsed > 0 ? $parsed : null;
+            return $parsed !== false && $parsed > 0 ? $parsed : null;
         }
 
         return null;
+    }
+
+    private function isAlignedUtcBoundary(string $value, int $bucketMinutes): bool
+    {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $value) !== 1) {
+            return false;
+        }
+
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s\Z', $value, new \DateTimeZone('UTC'));
+
+        return $date !== false
+            && $date->format('Y-m-d\TH:i:s\Z') === $value
+            && $date->getTimestamp() % ($bucketMinutes * 60) === 0;
     }
 
     private function error(string $message, int $status, string $type): JsonResponse

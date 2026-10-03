@@ -16,7 +16,7 @@ use Symfony\Component\Console\Style\SymfonyStyle;
 
 #[AsCommand(
     name: 'app:horizon:sync-asset-market-history',
-    description: 'Extract historical asset/XLM market buckets and active asset state snapshots from the currently ingested Horizon DB chunk.',
+    description: 'Extract complete historical asset/XLM market buckets from the currently ingested Horizon DB chunk.',
 )]
 final class SyncAssetMarketHistoryCommand extends Command
 {
@@ -80,6 +80,7 @@ final class SyncAssetMarketHistoryCommand extends Command
                 ['dry_run', $result['dry_run'] ? '1' : '0'],
             ]
         );
+        $io->note('Historical asset state snapshots are disabled: current Horizon state does not prove historical supply or holder counts. Existing snapshots are unchanged.');
         $io->success($dryRun ? 'Asset market history dry-run completed.' : 'Asset market history synced.');
 
         return Command::SUCCESS;

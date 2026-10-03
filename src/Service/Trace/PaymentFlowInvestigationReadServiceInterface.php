@@ -16,6 +16,13 @@ interface PaymentFlowInvestigationReadServiceInterface
         ?int $ledgerFrom,
         ?int $ledgerTo,
         string $direction,
-        int $limit
+        int $limit,
+        ?string $cursor = null,
+        ?string $operationType = null,
+        ?string $asset = null,
+        ?string $dateFrom = null,
+        ?string $dateTo = null,
+        ?string $minAssetAmount = null,
+        int $depth = 1
     ): array;
 }

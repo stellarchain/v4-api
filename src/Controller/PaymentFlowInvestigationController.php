@@ -19,6 +19,7 @@ final class PaymentFlowInvestigationController
     private const MAX_LIMIT = 200;
     private const ALLOWED_DIRECTIONS = ['both', 'incoming', 'outgoing'];
     private const ALLOWED_NETWORKS = ['mainnet', 'public', 'testnet', 'test', 'futurenet', 'future'];
+    private const OPERATION_TYPES = ['create_account', 'payment', 'path_payment_strict_receive', 'path_payment_strict_send', 'account_merge'];
 
     public function __construct(
         private readonly PaymentFlowInvestigationReadServiceInterface $paymentFlowInvestigationReadService,
@@ -33,9 +34,11 @@ final class PaymentFlowInvestigationController
             return $this->error('Invalid network. Use mainnet, testnet, or futurenet.', Response::HTTP_BAD_REQUEST, 'invalid_network');
         }
 
-        [$address, $txHash] = $this->resolveSearchTarget($request);
-        if ($address === null && $txHash === null) {
-            return $this->error('Provide an address or txHash.', Response::HTTP_BAD_REQUEST, 'missing_target');
+        [$address, $txHash, $queryAsset] = $this->resolveSearchTarget($request);
+
+        $asset = $this->queryString($request, 'asset', $queryAsset ?? '');
+        if ($address === null && $txHash === null && $asset === '') {
+            return $this->error('Provide an address, txHash, or exact asset key.', Response::HTTP_BAD_REQUEST, 'missing_target');
         }
 
         if ($address !== null && !$this->isValidAddress($address)) {
@@ -58,9 +61,49 @@ final class PaymentFlowInvestigationController
 
         $ledgerFrom = $this->queryPositiveInt($request, 'ledgerFrom', null);
         $ledgerTo = $this->queryPositiveInt($request, 'ledgerTo', null);
+        foreach (['ledgerFrom' => $ledgerFrom, 'ledgerTo' => $ledgerTo] as $key => $value) {
+            if ($request->query->has($key) && $value === null) {
+                return $this->error($key . ' must be a positive 32-bit integer.', Response::HTTP_BAD_REQUEST, 'invalid_ledger_range');
+            }
+        }
         if ($ledgerFrom !== null && $ledgerTo !== null && $ledgerFrom > $ledgerTo) {
             return $this->error('ledgerFrom must be lower than or equal to ledgerTo.', Response::HTTP_BAD_REQUEST, 'invalid_ledger_range');
         }
+
+        $operationType = $this->queryString($request, 'operationType', '');
+        if ($operationType !== '' && !in_array($operationType, self::OPERATION_TYPES, true)) {
+            return $this->error('Invalid payment-flow operation type.', Response::HTTP_BAD_REQUEST, 'invalid_operation_type');
+        }
+        if ($asset !== '' && !$this->isValidAsset($asset)) {
+            return $this->error('Invalid asset. Use native:XLM or credit_alphanum4/12:CODE:ISSUER.', Response::HTTP_BAD_REQUEST, 'invalid_asset');
+        }
+        $minAssetAmount = $this->queryString($request, 'minAssetAmount', '');
+        if ($minAssetAmount !== '' && ($asset === '' || !$this->isValidPositiveAmount($minAssetAmount))) {
+            return $this->error('minAssetAmount requires an asset and a positive decimal with up to 20 integer and 14 fractional digits.', Response::HTTP_BAD_REQUEST, 'invalid_min_asset_amount');
+        }
+        $dateFrom = $this->queryString($request, 'dateFrom', '');
+        $dateTo = $this->queryString($request, 'dateTo', '');
+        if (($dateFrom !== '' && !$this->isValidUtcDate($dateFrom)) || ($dateTo !== '' && !$this->isValidUtcDate($dateTo))
+            || ($dateFrom !== '' && $dateTo !== '' && $dateFrom > $dateTo)) {
+            return $this->error('Invalid UTC date range. Use YYYY-MM-DD with dateFrom <= dateTo.', Response::HTTP_BAD_REQUEST, 'invalid_date_range');
+        }
+        $depth = $this->queryPositiveInt($request, 'depth', 1);
+        if ($depth === null || $depth > 2) {
+            return $this->error('Invalid depth. Use 1 or 2.', Response::HTTP_UNPROCESSABLE_ENTITY, 'invalid_depth');
+        }
+        if ($depth === 2 && $address === null) {
+            return $this->error('Two-hop tracing currently requires an account address target.', Response::HTTP_UNPROCESSABLE_ENTITY, 'depth_target_not_available');
+        }
+        $hasBoundedLedgerRange = $ledgerFrom !== null && $ledgerTo !== null;
+        $hasBoundedDateRange = $dateFrom !== '' && $dateTo !== '';
+        if ($depth === 2 && !$hasBoundedLedgerRange && !$hasBoundedDateRange) {
+            return $this->error(
+                'Two-hop tracing requires both ledger bounds or both UTC date bounds.',
+                Response::HTTP_UNPROCESSABLE_ENTITY,
+                'depth_range_required'
+            );
+        }
+        $cursor = $this->queryString($request, 'cursor', '');
 
         try {
             $payload = $this->paymentFlowInvestigationReadService->read(
@@ -70,8 +113,17 @@ final class PaymentFlowInvestigationController
                 $ledgerFrom,
                 $ledgerTo,
                 $direction,
-                $limit
+                $limit,
+                $cursor === '' ? null : $cursor,
+                $operationType === '' ? null : $operationType,
+                $asset === '' ? null : $asset,
+                $dateFrom === '' ? null : $dateFrom,
+                $dateTo === '' ? null : $dateTo,
+                $minAssetAmount === '' ? null : $minAssetAmount,
+                $depth
             );
+        } catch (\InvalidArgumentException) {
+            return $this->error('Invalid cursor. Restart pagination after changing filters.', Response::HTTP_BAD_REQUEST, 'invalid_cursor');
         } catch (StatisticsUnavailableException) {
             return $this->error('Payment flow statistics are temporarily unavailable.', Response::HTTP_SERVICE_UNAVAILABLE, 'statistics_unavailable');
         }
@@ -82,8 +134,28 @@ final class PaymentFlowInvestigationController
         return $response;
     }
 
+    #[Route('/v1/trace/address/{id}', name: 'payment_flow_trace_address', methods: ['GET'])]
+    public function traceAddress(Request $request, string $id): JsonResponse
+    {
+        $request->query->remove('q');
+        $request->query->remove('txHash');
+        $request->query->set('address', $id);
+
+        return $this->__invoke($request);
+    }
+
+    #[Route('/v1/trace/tx/{hash}', name: 'payment_flow_trace_tx', methods: ['GET'])]
+    public function traceTransaction(Request $request, string $hash): JsonResponse
+    {
+        $request->query->remove('q');
+        $request->query->remove('address');
+        $request->query->set('txHash', $hash);
+
+        return $this->__invoke($request);
+    }
+
     /**
-     * @return array{0:?string,1:?string}
+     * @return array{0:?string,1:?string,2:?string}
      */
     private function resolveSearchTarget(Request $request): array
     {
@@ -94,6 +166,8 @@ final class PaymentFlowInvestigationController
         if ($address === '' && $txHash === '' && $query !== '') {
             if ($this->isValidTxHash($query)) {
                 $txHash = strtolower($query);
+            } elseif ($this->isValidAsset($query)) {
+                return [null, null, $query];
             } else {
                 $address = strtoupper($query);
             }
@@ -102,6 +176,7 @@ final class PaymentFlowInvestigationController
         return [
             $address === '' ? null : strtoupper($address),
             $txHash === '' ? null : strtolower($txHash),
+            null,
         ];
     }
 
@@ -113,6 +188,37 @@ final class PaymentFlowInvestigationController
     private function isValidTxHash(string $txHash): bool
     {
         return preg_match('/^[a-f0-9]{64}$/', strtolower($txHash)) === 1;
+    }
+
+    private function isValidAsset(string $asset): bool
+    {
+        if ($asset === 'native:XLM') {
+            return true;
+        }
+
+        $parts = explode(':', $asset);
+        if (count($parts) !== 3 || !in_array($parts[0], ['credit_alphanum4', 'credit_alphanum12'], true)) {
+            return false;
+        }
+
+        $maxLength = $parts[0] === 'credit_alphanum4' ? 4 : 12;
+
+        return preg_match('/^[A-Za-z0-9]{1,' . $maxLength . '}$/D', $parts[1]) === 1
+            && ($parts[0] !== 'credit_alphanum12' || strlen($parts[1]) > 4)
+            && preg_match('/^G[A-Z2-7]{55}$/D', $parts[2]) === 1;
+    }
+
+    private function isValidUtcDate(string $date): bool
+    {
+        $parsed = \DateTimeImmutable::createFromFormat('!Y-m-d', $date, new \DateTimeZone('UTC'));
+
+        return $parsed !== false && $parsed->format('Y-m-d') === $date;
+    }
+
+    private function isValidPositiveAmount(string $amount): bool
+    {
+        return preg_match('/^(?:[0-9]{1,20})(?:\.[0-9]{1,14})?$/D', $amount) === 1
+            && preg_match('/[1-9]/', $amount) === 1;
     }
 
     private function queryString(Request $request, string $key, string $default): string
@@ -132,12 +238,12 @@ final class PaymentFlowInvestigationController
             return $default;
         }
         if (is_int($value)) {
-            return $value > 0 ? $value : null;
+            return $value > 0 && $value <= 2147483647 ? $value : null;
         }
         if (is_string($value) && preg_match('/^[0-9]+$/', trim($value)) === 1) {
             $parsed = (int) trim($value);
 
-            return $parsed > 0 ? $parsed : null;
+            return $parsed > 0 && $parsed <= 2147483647 ? $parsed : null;
         }
 
         return null;

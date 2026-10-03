@@ -12,6 +12,7 @@ END_LEDGER="${END_LEDGER:-}"
 HORIZON_BIN="${HORIZON_BIN:-stellar-horizon}"
 HORIZON_MODE="${HORIZON_MODE:-reingest-range}"
 HORIZON_WORKERS="${HORIZON_WORKERS:-4}"
+HORIZON_CONTEXT_LEDGERS="${HORIZON_CONTEXT_LEDGERS:-1000}"
 HORIZON_DATABASE_URL="${HORIZON_DATABASE_URL:-}"
 HORIZON_NETWORK="${HORIZON_NETWORK:-}"
 HORIZON_APP_DATABASE_URL="${HORIZON_APP_DATABASE_URL:-$HORIZON_DATABASE_URL}"
@@ -65,6 +66,7 @@ Environment:
   HORIZON_NETWORK=pubnet|testnet|futurenet|passphrase
   HORIZON_MODE=reingest-range|ingest-range
   HORIZON_WORKERS=4
+  HORIZON_CONTEXT_LEDGERS=1000  Extra ledgers on each side for complete time buckets.
   DATABASE_CONTRACTS_URL=postgresql://.../horizon_contracts
   APP_MODE=docker|host
   CONSOLE_BIN=bin/console-no-debug
@@ -91,6 +93,8 @@ Notes:
   - It does not recreate all historical charts from v3 (TPS, OPS, ledgers, tx-success, tx-failed, dex-vol, etc.).
   - HORIZON_APP_DATABASE_URL defaults to HORIZON_DATABASE_URL for Symfony history readers.
   - Contract scan, live CoinGecko and market snapshots are disabled by default and use separate pipelines.
+  - Metric writers verify complete bucket context and stop before cleanup when it is insufficient.
+  - The padded end ledger must already be available; this is a historical range worker, not a live follower.
 EOF
 }
 
@@ -232,6 +236,22 @@ run_local_reset() {
     run_console "${args[@]}"
 }
 
+run_horizon_ingest_with_context() {
+    local ingest_start="$START_LEDGER"
+    local ingest_end="$END_LEDGER"
+
+    if [[ "$RUN_NETWORK_METRICS" == "1" || "$RUN_ASSET_MARKET_HISTORY" == "1" ]]; then
+        ingest_start=$((START_LEDGER - HORIZON_CONTEXT_LEDGERS))
+        if [[ "$ingest_start" -lt 1 ]]; then
+            ingest_start=1
+        fi
+        ingest_end=$((END_LEDGER + HORIZON_CONTEXT_LEDGERS))
+        log "Including bucket context: ingest=$ingest_start..$ingest_end requested=$START_LEDGER..$END_LEDGER"
+    fi
+
+    run_horizon_ingest "$ingest_start" "$ingest_end"
+}
+
 run_stats_pipeline() {
     if [[ "$RUN_CONTRACT_SCAN" == "1" ]]; then
         log "Running contract range scan for ledgers $START_LEDGER..$END_LEDGER"
@@ -351,6 +371,7 @@ main() {
     require_positive_int "START_LEDGER" "$START_LEDGER"
     require_positive_int "END_LEDGER" "$END_LEDGER"
     require_positive_int "HORIZON_WORKERS" "$HORIZON_WORKERS"
+    require_positive_int "HORIZON_CONTEXT_LEDGERS" "$HORIZON_CONTEXT_LEDGERS"
     require_positive_int "CONTRACT_BATCH_SIZE" "$CONTRACT_BATCH_SIZE"
     require_positive_int "NETWORK_METRICS_BUCKET_MINUTES" "$NETWORK_METRICS_BUCKET_MINUTES"
     require_positive_int "PAYMENT_FLOW_BATCH_SIZE" "$PAYMENT_FLOW_BATCH_SIZE"
@@ -363,7 +384,7 @@ main() {
 
     log "Range start: network=$NETWORK ledgers=$START_LEDGER..$END_LEDGER app_mode=$APP_MODE horizon_mode=$HORIZON_MODE"
     run_local_reset
-    run_horizon_ingest "$START_LEDGER" "$END_LEDGER"
+    run_horizon_ingest_with_context
     run_stats_pipeline
     run_cleanup_hook
     log "Range finished successfully"
