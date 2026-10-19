@@ -1,0 +1,80 @@
+[
+  {
+    "id": "freighter",
+    "name": "Freighter",
+    "category": "wallets",
+    "description": "A wallet for holding Stellar assets and connecting to Stellar applications.",
+    "websiteUrl": "https://freighter.app/",
+    "trackingUrl": null,
+    "regionNotes": "Availability depends on the app store and your location.",
+    "networkNotes": "Stellar; confirm the selected network in your wallet.",
+    "status": "active",
+    "position": 0,
+    "relationship": "directory"
+  },
+  {
+    "id": "stellarx",
+    "name": "StellarX",
+    "category": "exchanges",
+    "description": "A trading interface for the Stellar decentralized exchange and liquidity pools.",
+    "websiteUrl": "https://www.stellarx.com/",
+    "trackingUrl": null,
+    "regionNotes": "Product and asset availability depend on the provider and your jurisdiction.",
+    "networkNotes": "Stellar mainnet; check the exact asset issuer before trading.",
+    "status": "active",
+    "position": 10,
+    "relationship": "directory"
+  },
+  {
+    "id": "moneygram-ramps",
+    "name": "MoneyGram Ramps",
+    "category": "ramps",
+    "description": "Cash-in and cash-out infrastructure for Stellar USDC through supported wallets and participating locations.",
+    "websiteUrl": "https://xramps.moneygram.com/",
+    "trackingUrl": null,
+    "regionNotes": "Participating locations, supported wallets and identity requirements vary. Confirm availability with MoneyGram.",
+    "networkNotes": "Stellar USDC; provider documentation also covers other networks. Select Stellar explicitly.",
+    "status": "active",
+    "position": 20,
+    "relationship": "directory"
+  },
+  {
+    "id": "stellar-rpc",
+    "name": "Stellar RPC",
+    "category": "infrastructure",
+    "description": "Documentation for querying Stellar network data and submitting transactions through RPC.",
+    "websiteUrl": "https://developers.stellar.org/docs/data/apis/rpc",
+    "trackingUrl": null,
+    "regionNotes": "Endpoint providers set their own availability and service limits.",
+    "networkNotes": "Mainnet, testnet and local networks; choose a matching endpoint.",
+    "status": "active",
+    "position": 30,
+    "relationship": "directory"
+  },
+  {
+    "id": "stellar-lab",
+    "name": "Stellar Lab",
+    "category": "developer-tools",
+    "description": "Build, sign, simulate and submit transactions, and explore Stellar APIs.",
+    "websiteUrl": "https://lab.stellar.org/",
+    "trackingUrl": null,
+    "regionNotes": "Browser-based tooling; individual network and provider availability varies.",
+    "networkNotes": "Supports multiple Stellar networks. Use testnet for experiments.",
+    "status": "active",
+    "position": 40,
+    "relationship": "directory"
+  },
+  {
+    "id": "sevio",
+    "name": "Sevio Ad Manager",
+    "category": "advertising",
+    "description": "The advertising integration used for banners on the homepage, asset pages and explorer guides.",
+    "websiteUrl": "https://sevio.com/admanager/",
+    "trackingUrl": null,
+    "regionNotes": "Campaign and ad availability vary by location and device.",
+    "networkNotes": "Advertising service; independent of the selected Stellar network.",
+    "status": "active",
+    "position": 50,
+    "relationship": "integration"
+  }
+]

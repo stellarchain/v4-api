@@ -31,9 +31,11 @@ services:
       # The two next lines can be removed after initial installation
       SYMFONY_VERSION: ${SYMFONY_VERSION:-}
       STABILITY: ${STABILITY:-stable}
+      PARTNER_ADMIN_TOKEN: ${PARTNER_ADMIN_TOKEN:-}
     volumes:
       - caddy_data:/data
       - caddy_config:/config
+      - partner_data:/app/var/partners
     ports:
       - name: http
         target: 80
@@ -73,6 +75,7 @@ services:
 ###< doctrine/doctrine-bundle ###
 
 volumes:
+  partner_data:
   caddy_data:
   caddy_config:
 ###> symfony/mercure-bundle ###
