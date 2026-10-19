@@ -6,6 +6,8 @@ Forward-only history ingestion and preview-first SQL repairs: [operational runbo
 
 Q3 bounded API compatibility, Investigator V2 and historical metric read-model gates: [Q3 read models](docs/q3-read-model-gates.md).
 
+Partner discovery, protected web administration and aggregate click CSV reports: [partner runbook](docs/partners.md).
+
 ## Implemented
 
 - API Platform with `/v1` docs and `/v1/accounts` collection.
