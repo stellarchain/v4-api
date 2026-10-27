@@ -7,6 +7,7 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
+use App\Service\ContractRead\ContractReadGateway;
 use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\Soroban\ContractRpcFallbackResolverInterface;
 use App\Service\Stellar\StellarNetworkResolver;
@@ -24,6 +25,7 @@ final class ContractItemDataProvider implements ProviderInterface
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
         private readonly ContractRpcFallbackResolverInterface $contractRpcFallbackResolver,
+        private readonly ?ContractReadGateway $contractReadGateway = null,
     ) {
     }
 
@@ -82,6 +84,22 @@ final class ContractItemDataProvider implements ProviderInterface
             ]
         );
 
+        $orionRow = $this->contractReadGateway?->findContract(
+            $contractId,
+            $network,
+            is_array($row) && is_string($row['wasm_id'] ?? null) ? $row['wasm_id'] : null,
+        );
+
+        if (!is_array($row) && $orionRow !== null) {
+            $row = $this->buildRpcFallbackRow([
+                'contractId' => $contractId,
+                'contractIdHex' => $orionRow['contract_id_hex'],
+                'wasmId' => $orionRow['wasm_id'],
+                'executableType' => $orionRow['executable_type'],
+                'isSac' => $orionRow['is_sac'],
+            ]);
+        }
+
         if (!is_array($row)) {
             $rpcContract = $this->contractRpcFallbackResolver->resolve($contractId, $network);
             if ($rpcContract === null) {
@@ -89,6 +107,12 @@ final class ContractItemDataProvider implements ProviderInterface
             }
 
             $row = $this->buildRpcFallbackRow($rpcContract);
+        }
+
+        if ($orionRow !== null) {
+            foreach ($orionRow as $key => $value) {
+                $row[$key] = str_starts_with($key, 'total_') ? max((int) ($row[$key] ?? 0), (int) $value) : $value;
+            }
         }
 
         return $this->toResponseObject($this->formatContractRow($row, $network));
@@ -182,6 +206,10 @@ final class ContractItemDataProvider implements ProviderInterface
             'id' => isset($row['id']) ? (int) $row['id'] : null,
             'contractId' => $this->nullableString($row['contract_id'] ?? null),
             'contractIdHex' => $this->nullableString($row['contract_id_hex'] ?? null),
+            'chainDataSource' => array_key_exists('orion_functions', $row) ? 'orion' : null,
+            'functions' => $row['orion_functions'] ?? [],
+            'archived' => $row['orion_archived'] ?? null,
+            'firstSeenAt' => $this->toAtom($row['orion_first_seen_at'] ?? null),
             'network' => $network,
             'assetCode' => $this->nullableString($row['asset_code'] ?? null),
             'assetAddress' => $this->nullableString($row['asset_address'] ?? null),
