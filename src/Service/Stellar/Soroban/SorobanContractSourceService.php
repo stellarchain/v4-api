@@ -13,6 +13,7 @@ final class SorobanContractSourceService
         private readonly LoggerInterface $logger,
         #[Autowire(service: 'doctrine.dbal.contracts_connection')]
         private readonly Connection $connection,
+        private readonly SorobanWasmDecompiler $decompiler,
     ) {
     }
 
@@ -188,116 +189,15 @@ final class SorobanContractSourceService
 
     private function decompileWasmWithSorobanAuditor(string $wasmBytes): ?string
     {
-        $projectRoot = dirname(__DIR__, 4);
-        $auditorBinary = $this->resolveSorobanAuditorBinary($projectRoot);
-
-        if ($auditorBinary === null) {
-            return null;
-        }
-
-        $tmpDir = rtrim((string) (getenv('SOROBAN_AUDITOR_TMP_DIR') ?: sys_get_temp_dir()), DIRECTORY_SEPARATOR);
-        $tmpWasmPath = tempnam($tmpDir, 'soroban_wasm_');
-        $tmpRsPath = tempnam($tmpDir, 'soroban_rs_');
-        if (!is_string($tmpWasmPath) || $tmpWasmPath === '' || !is_string($tmpRsPath) || $tmpRsPath === '') {
-            return null;
-        }
-
-        // Ensure .rs extension for tools/editors and deterministic behavior.
-        $tmpRsPathWithExt = $tmpRsPath . '.rs';
-        @rename($tmpRsPath, $tmpRsPathWithExt);
-        $tmpRsPath = $tmpRsPathWithExt;
-
-        if (@file_put_contents($tmpWasmPath, $wasmBytes) === false) {
-            @unlink($tmpWasmPath);
-            @unlink($tmpRsPath);
-            return null;
-        }
-
-        $descriptors = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
-        ];
-        $command = sprintf(
-            '%s %s %s',
-            escapeshellcmd($auditorBinary),
-            escapeshellarg($tmpWasmPath),
-            escapeshellarg($tmpRsPath)
-        );
-
         try {
-            $process = proc_open($command, $descriptors, $pipes);
-            if (!is_resource($process)) {
-                @unlink($tmpWasmPath);
-                @unlink($tmpRsPath);
-                return null;
-            }
-
-            $stdinWriteResult = fwrite($pipes[0], '');
-            fclose($pipes[0]);
-
-            $stdout = stream_get_contents($pipes[1]);
-            $stderr = stream_get_contents($pipes[2]);
-            fclose($pipes[1]);
-            fclose($pipes[2]);
-
-            $exitCode = proc_close($process);
-            $stdout = is_string($stdout) ? $stdout : '';
-            $stderr = is_string($stderr) ? $stderr : '';
-            $sourceCode = @file_get_contents($tmpRsPath);
-            $sourceCode = is_string($sourceCode) ? $sourceCode : '';
-
-            @unlink($tmpWasmPath);
-            @unlink($tmpRsPath);
-
-            if ($stdinWriteResult === false || $exitCode !== 0 || $sourceCode === '') {
-                $this->logger->warning('soroban-auditor failed to decompile contract WASM.', [
-                    'stdinWriteResult' => $stdinWriteResult,
-                    'exitCode' => $exitCode,
-                    'stdout' => $stdout !== '' ? $stdout : null,
-                    'stderr' => $stderr !== '' ? $stderr : null,
-                ]);
-                return null;
-            }
-
-            return $sourceCode;
+            return $this->decompiler->decompile($wasmBytes);
         } catch (\Throwable $exception) {
-            @unlink($tmpWasmPath);
-            @unlink($tmpRsPath);
-            $this->logger->warning('soroban-auditor failed with exception while decompiling contract WASM.', [
-                'message' => $exception->getMessage(),
+            $this->logger->warning('Soroban Auditor failed to decompile contract WASM.', [
+                'wasmHash' => hash('sha256', $wasmBytes),
+                'exception' => $exception,
             ]);
+
             return null;
         }
-    }
-
-    private function resolveSorobanAuditorBinary(string $projectRoot): ?string
-    {
-        $envOverride = trim((string) (getenv('SOROBAN_AUDITOR_BINARY') ?: ''));
-        if ($envOverride !== '' && is_file($envOverride) && is_executable($envOverride)) {
-            return $envOverride;
-        }
-
-        $os = strtolower((string) php_uname('s'));
-        $candidates = match (true) {
-            str_contains($os, 'darwin') => [
-                $projectRoot . '/bin/soroban-auditor-macos',
-                $projectRoot . '/bin/soroban-auditor',
-                $projectRoot . '/bin/soroban-auditor-debian13',
-            ],
-            default => [
-                $projectRoot . '/bin/soroban-auditor',
-                $projectRoot . '/bin/soroban-auditor-debian13',
-                $projectRoot . '/bin/soroban-auditor-macos',
-            ],
-        };
-
-        foreach ($candidates as $candidate) {
-            if (is_file($candidate) && is_executable($candidate)) {
-                return $candidate;
-            }
-        }
-
-        return null;
     }
 }

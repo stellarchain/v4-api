@@ -9,6 +9,12 @@ use App\Service\Stellar\Soroban\SorobanScValMapper;
 use Soneso\StellarSDK\Crypto\StrKey;
 use Soneso\StellarSDK\AbstractTransaction;
 use Soneso\StellarSDK\Network;
+use Soneso\StellarSDK\Asset;
+use Soneso\StellarSDK\Util\Hash;
+use Soneso\StellarSDK\Xdr\XdrContractIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrEnvelopeType;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimage;
+use Soneso\StellarSDK\Xdr\XdrHashIDPreimageContractID;
 use Soneso\StellarSDK\Xdr\XdrSCVal;
 
 final class ContractReadMapper
@@ -26,12 +32,12 @@ final class ContractReadMapper
         if (!in_array($executable, ['wasm', 'stellar_asset'], true)) {
             throw new \UnexpectedValueException('Unsupported contract executable.');
         }
-        $wasmHash = $record['wasm_hash'] ?? null;
+        $wasmHash = $executable === 'wasm' ? ($record['wasm_hash'] ?? null) : null;
         if ($executable === 'wasm' && (!is_string($wasmHash) || preg_match('/^[a-f0-9]{64}$/i', $wasmHash) !== 1)) {
             throw new \UnexpectedValueException('Missing contract WASM hash.');
         }
 
-        return [
+        return $this->sacMetadata($contractId, $record) + [
             'contract_id' => $contractId,
             'contract_id_hex' => StrKey::decodeContractIdHex($contractId),
             'wasm_id' => is_string($wasmHash) ? strtolower($wasmHash) : null,
@@ -48,6 +54,51 @@ final class ContractReadMapper
             'orion_functions' => is_array($record['functions'] ?? null) ? $record['functions'] : [],
             'orion_archived' => is_bool($record['archived'] ?? null) ? $record['archived'] : null,
         ];
+    }
+
+    private function sacMetadata(string $contractId, array $record): array
+    {
+        if (($record['executable_type'] ?? null) !== 'stellar_asset') {
+            return [];
+        }
+        $result = [];
+        $code = $record['asset_code'] ?? null;
+        $issuer = $record['asset_issuer'] ?? null;
+        if (is_string($code) && $code !== '') {
+            if (($record['asset_type'] ?? null) === 'native' && ($code !== 'XLM' || $issuer !== null)) {
+                throw new \UnexpectedValueException('Invalid native SAC asset identity.');
+            }
+            $asset = ($record['asset_type'] ?? null) === 'native'
+                ? Asset::native() : Asset::createNonNativeAsset($code, (string) $issuer);
+            $preimage = new XdrHashIDPreimage(new XdrEnvelopeType(XdrEnvelopeType::ENVELOPE_TYPE_CONTRACT_ID));
+            $preimage->contractID = new XdrHashIDPreimageContractID(
+                Hash::generate(Network::public()->getNetworkPassphrase()), XdrContractIDPreimage::forAsset($asset->toXdr()),
+            );
+            if (StrKey::encodeContractId(Hash::generate($preimage->encode())) !== $contractId) {
+                throw new \UnexpectedValueException('SAC asset does not match the contract address.');
+            }
+            $result = ['asset_code' => $code, 'asset_issuer' => $issuer];
+        }
+        $metadata = [];
+        foreach ($record['instance_storage'] ?? [] as $entry) {
+            if (!is_string($entry['key_xdr'] ?? null) || !is_string($entry['val_xdr'] ?? null)) {
+                continue;
+            }
+            $key = $this->scValMapper->scValToNative(XdrSCVal::fromBase64Xdr($entry['key_xdr']));
+            $value = $this->scValMapper->scValToNative(XdrSCVal::fromBase64Xdr($entry['val_xdr']));
+            if ($key === 'METADATA' && is_array($value)) {
+                foreach (['decimal' => 'decimals', 'name' => 'name', 'symbol' => 'symbol'] as $field => $target) {
+                    if (isset($value[$field]) && (is_string($value[$field]) || is_int($value[$field]))) {
+                        $metadata[$target] = $value[$field];
+                    }
+                }
+            }
+            if ($key === ['Admin'] && is_string($value)) {
+                $metadata['admin'] = $value;
+            }
+        }
+
+        return $result + ['orion_sac_metadata' => $metadata];
     }
 
     public function event(string $contractId, array $record): array
@@ -84,6 +135,30 @@ final class ContractReadMapper
             'successful' => $record['successful'] ?? null,
             'inSuccessfulContractCall' => $record['in_successful_contract_call'] ?? null,
         ];
+    }
+
+    /** @return array{binary:string,hash:string,size:int} */
+    public function wasm(string $contractId, string $expectedHash, array $record): array
+    {
+        $this->assertContract($contractId, $record);
+        $encoded = $record['wasm_base64'] ?? null;
+        if (($record['executable_type'] ?? null) !== 'wasm' || !is_string($encoded)) {
+            throw new \UnexpectedValueException('Missing WASM binary.');
+        }
+        $binary = base64_decode($encoded, true);
+        if ($binary === false || strlen($binary) > 2 * 1024 * 1024
+            || !str_starts_with($binary, "\0asm\x01\0\0\0")) {
+            throw new \UnexpectedValueException('Invalid or oversized WASM binary.');
+        }
+        $hash = hash('sha256', $binary);
+        if (!hash_equals($expectedHash, $hash) || ($record['wasm_hash'] ?? null) !== $hash) {
+            throw new \UnexpectedValueException('WASM binary does not match the contract executable hash.');
+        }
+        if (isset($record['wasm_size_bytes']) && $record['wasm_size_bytes'] !== strlen($binary)) {
+            throw new \UnexpectedValueException('WASM binary size mismatch.');
+        }
+
+        return ['binary' => $binary, 'hash' => $hash, 'size' => strlen($binary)];
     }
 
     public function transaction(string $contractId, array $record, bool $invocationsOnly): array

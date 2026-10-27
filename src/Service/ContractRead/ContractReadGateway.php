@@ -123,6 +123,30 @@ final class ContractReadGateway
         }
     }
 
+    /** @return array{binary:string,hash:string,size:int}|null */
+    public function wasm(string $contractId, string $network): ?array
+    {
+        if (!$this->supports($contractId, $network)) {
+            return null;
+        }
+        try {
+            $contract = $this->get($contractId, '', []);
+            if ($contract === null) {
+                return null;
+            }
+            $mapped = $this->mapper->contract($contractId, $contract);
+            if ($mapped['is_sac']) {
+                return null;
+            }
+            $code = $this->get($contractId, 'code', []);
+
+            return $code === null ? null : $this->mapper->wasm($contractId, $mapped['wasm_id'], $code);
+        } catch (\Throwable $exception) {
+            $this->logFailure($contractId, 'wasm', $exception);
+            throw new ServiceUnavailableHttpException(null, 'Contract WASM is temporarily unavailable or failed integrity verification.', $exception);
+        }
+    }
+
     private function readPage(string $contractId, string $kind, int $page, int $limit, ?string $cursor, string $scope, bool $invocationsOnly): ?array
     {
         $suffix = $kind === 'storage' ? 'data' : $kind;

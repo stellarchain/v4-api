@@ -46,6 +46,16 @@ php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-res
 
 ## Orion contract reads
 
+`GET /v1/contracts/{contractId}/wasm?network=mainnet` downloads the compiled
+WebAssembly binary through the backend, including contracts absent from the local
+DB. It resolves the current Orion contract executable, reads `/code`, strictly
+decodes `wasm_base64`, checks the module header/size, and verifies SHA-256 against
+both the code response and the current contract hash. Mismatches fail with 503;
+missing/non-WASM contracts and unsupported networks return 404. The response uses
+`application/wasm`, an attachment filename, a hash ETag and mandatory cache
+revalidation so upgrades do not reuse stale binaries. No DB write is performed.
+This binary download does not change source-code/build-verification status.
+
 The browser continues to use `/v1/contracts/{contractId}` and its `/events`,
 `/transactions`, and `/storage` subresources. The API reads Orion on mainnet,
 including contracts absent from the local database. These are read-only requests;
@@ -82,6 +92,29 @@ on their existing providers. Testnet and futurenet keep their existing sources.
   also has a 10-second pagination budget. Prefer `meta.nextCursor` for deep history.
 - Orion's currently unpaginated `/data` response is sliced locally for numeric
   storage pages, with exact `meta.totalItems` and `meta.hasMore`.
+
+On-demand WASM decompilation:
+
+- Opening the WASM tab calls `POST /v1/contracts/{id}/decompile?network=mainnet`
+  with JSON `{ "wasmHash": "<hash shown on the contract page>" }`. The backend
+  retrieves the WASM from Orion and verifies its SHA-256 and current executable
+  before running the same Soroban Auditor used by `app:soroban:decompile-contract`.
+- Returns `wasmHash`, `sourceCode`, `type: decompiled`, and `cached`. This output is
+  reconstructed code, not a source/build attestation. Existing indexed code is
+  displayed without starting another decompilation.
+- The process has a 20-second timeout and a 2 MiB input/output limit. Results are
+  cached for 24 hours by WASM hash (failures for 30 seconds), without writing to
+  the contracts DB. A nonblocking file lock permits one on-demand decompiler per
+  API instance; concurrent requests receive 429 with Retry-After. The browser
+  retries briefly while showing Decompiling, then offers a manual retry.
+- Deploy with `composer install --no-dev` to include `symfony/process`, and ensure
+  the existing platform-specific `bin/soroban-auditor-*` binary is executable.
+  `SOROBAN_AUDITOR_BINARY` and `SOROBAN_AUDITOR_TMP_DIR` remain supported. PHP's
+  process execution must be enabled; proxy/PHP request timeouts must exceed the
+  process timeout plus the Orion retrieval budget (at least 30 seconds).
+- SACs expose their asset identity, XDR-decoded native metadata and function
+  interface. Asset identity is checked against the derived mainnet SAC address.
+  SACs run inside Stellar's host and have no WASM to download or decompile.
 
 Focused checks (no database or network required):
 

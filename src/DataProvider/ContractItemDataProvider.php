@@ -208,6 +208,7 @@ final class ContractItemDataProvider implements ProviderInterface
             'contractIdHex' => $this->nullableString($row['contract_id_hex'] ?? null),
             'chainDataSource' => array_key_exists('orion_functions', $row) ? 'orion' : null,
             'functions' => $row['orion_functions'] ?? [],
+            'nativeMetadata' => $row['orion_sac_metadata'] ?? null,
             'archived' => $row['orion_archived'] ?? null,
             'firstSeenAt' => $this->toAtom($row['orion_first_seen_at'] ?? null),
             'network' => $network,
