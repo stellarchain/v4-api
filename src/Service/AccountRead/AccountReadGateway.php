@@ -83,7 +83,7 @@ final class AccountReadGateway
                 throw new ServiceUnavailableHttpException(null, 'Invalid account history record.');
             }
         }
-        $next = count($records) === $limit ? ($records[array_key_last($records)]['paging_token'] ?? null) : null;
+        $next = $this->nextCursor($payload, $records, $limit);
         if ($next !== null && $next === $cursor) {
             throw new ServiceUnavailableHttpException(null, 'Account history cursor did not advance.');
         }
@@ -93,6 +93,30 @@ final class AccountReadGateway
             'limit' => $limit, 'order' => $order, 'cursor' => $cursor,
             'hasMore' => $next !== null, 'nextCursor' => $next,
         ]];
+    }
+
+    private function nextCursor(array $payload, array $records, int $limit): ?string
+    {
+        if ($records === []) {
+            return null;
+        }
+        $href = $payload['_links']['next']['href'] ?? null;
+        if (is_string($href) && $href !== '') {
+            $query = parse_url($href, PHP_URL_QUERY);
+            if (!is_string($query)) {
+                throw new ServiceUnavailableHttpException(null, 'Invalid account history continuation.');
+            }
+            parse_str($query, $parameters);
+            $cursor = $parameters['cursor'] ?? null;
+            if (!is_string($cursor) || $cursor === '' || strlen($cursor) > 2048 || str_contains($cursor, "\0")) {
+                throw new ServiceUnavailableHttpException(null, 'Invalid account history continuation.');
+            }
+
+            // Extract only the cursor; never follow an upstream URL supplied in HAL.
+            return $cursor;
+        }
+
+        return count($records) === $limit ? $records[array_key_last($records)]['paging_token'] : null;
     }
 
     public function checkResponseSize(int $downloaded, int $downloadSize, array $info): void

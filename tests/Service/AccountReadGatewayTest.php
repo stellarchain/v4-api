@@ -68,6 +68,53 @@ final class AccountReadGatewayTest extends TestCase
         $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 25, 'desc', null, null);
     }
 
+    public function testShortOrionPagesRemainReadableThroughTheirHalCursor(): void
+    {
+        $first = $this->response(['_embedded' => ['records' => [['paging_token' => '100', 'hash' => str_repeat('a', 64)]]],
+            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/transactions?cursor=100&limit=50&order=desc']]]);
+        $second = $this->response(['_embedded' => ['records' => [['paging_token' => '99', 'hash' => str_repeat('b', 64)]]],
+            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/transactions?cursor=99&limit=50&order=desc']]]);
+        $gateway = $this->gateway(new MockHttpClient([$first, $second]));
+
+        $page = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', null, null);
+        self::assertCount(1, $page['records']);
+        self::assertTrue($page['meta']['hasMore']);
+        self::assertSame('100', $page['meta']['nextCursor']);
+        $next = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', $page['meta']['nextCursor'], null);
+        self::assertSame(str_repeat('b', 64), $next['records'][0]['hash']);
+        self::assertSame('99', $next['meta']['nextCursor']);
+        self::assertStringContainsString('cursor=100', $second->getRequestUrl());
+    }
+
+    public function testEmptyPageTerminatesEvenWhenHalRepeatsNextLink(): void
+    {
+        $gateway = $this->gateway(new MockHttpClient([$this->response(['_embedded' => ['records' => []],
+            '_links' => ['next' => ['href' => '?cursor=100']]])]));
+        $page = $gateway->history(self::ADDRESS, 'mainnet', 'operations', 50, 'desc', '100', null);
+        self::assertFalse($page['meta']['hasMore']);
+        self::assertNull($page['meta']['nextCursor']);
+    }
+
+    public function testNonAdvancingHalCursorIsRejected(): void
+    {
+        $gateway = $this->gateway(new MockHttpClient([$this->response(['_embedded' => ['records' => [['paging_token' => '100']]],
+            '_links' => ['next' => ['href' => '?cursor=100']]])]));
+        $this->expectException(ServiceUnavailableHttpException::class);
+        $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', '100', null);
+    }
+
+    public function testHalUrlIsNeverFollowedAndOnlyCursorIsForwarded(): void
+    {
+        $first = $this->response(['_embedded' => ['records' => [['paging_token' => '100']]],
+            '_links' => ['next' => ['href' => 'https://untrusted.example/other?cursor=100&limit=200']]]);
+        $second = $this->response(['_embedded' => ['records' => []]]);
+        $gateway = $this->gateway(new MockHttpClient([$first, $second]));
+        $page = $gateway->history(self::ADDRESS, 'mainnet', 'effects', 50, 'desc', null, null);
+        $gateway->history(self::ADDRESS, 'mainnet', 'effects', 50, 'desc', $page['meta']['nextCursor'], null);
+        self::assertStringStartsWith('https://orion.example/accounts/'.self::ADDRESS.'/effects?', $second->getRequestUrl());
+        self::assertStringContainsString('limit=50', $second->getRequestUrl());
+    }
+
     public function testWrongCurrentAccountIdentityIsNeverReturned(): void
     {
         $record = $this->accountRecord();
