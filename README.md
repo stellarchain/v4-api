@@ -21,7 +21,9 @@ The explicit synchronization method retains its existing write behavior.
 history reads through the API without requiring a local/current account record.
 It accepts `network`, `limit` (1..200), `order`, `cursor`, and `include_failed`
 for transaction/operation reads. Responses contain `records` plus `meta` with
-provider, network, continuation cursor and `hasMore`. Mainnet uses Orion;
+provider, network, continuation cursor and `hasMore`. Account transactions always
+use the selected network's configured Horizon endpoint, including on mainnet when
+Orion reads are enabled. Mainnet operations/effects continue to use Orion;
 testnet/futurenet use their configured Horizon endpoints. History failures return
 503, not an empty successful history. These endpoints do not write to the DB.
 

@@ -56,7 +56,7 @@ final class AccountReadGatewayTest extends TestCase
         $history = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 25, 'desc', null, null);
 
         self::assertCount(1, $history['records']);
-        self::assertSame('orion', $history['meta']['source']);
+        self::assertSame('horizon', $history['meta']['source']);
         self::assertFalse($history['meta']['hasMore']);
     }
 
@@ -71,19 +71,65 @@ final class AccountReadGatewayTest extends TestCase
     public function testShortOrionPagesRemainReadableThroughTheirHalCursor(): void
     {
         $first = $this->response(['_embedded' => ['records' => [['paging_token' => '100', 'hash' => str_repeat('a', 64)]]],
-            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/transactions?cursor=100&limit=50&order=desc']]]);
+            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/operations?cursor=100&limit=50&order=desc']]]);
         $second = $this->response(['_embedded' => ['records' => [['paging_token' => '99', 'hash' => str_repeat('b', 64)]]],
-            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/transactions?cursor=99&limit=50&order=desc']]]);
+            '_links' => ['next' => ['href' => 'https://orion.example/accounts/'.self::ADDRESS.'/operations?cursor=99&limit=50&order=desc']]]);
         $gateway = $this->gateway(new MockHttpClient([$first, $second]));
 
-        $page = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', null, null);
+        $page = $gateway->history(self::ADDRESS, 'mainnet', 'operations', 50, 'desc', null, null);
         self::assertCount(1, $page['records']);
         self::assertTrue($page['meta']['hasMore']);
+        self::assertSame('orion', $page['meta']['source']);
         self::assertSame('100', $page['meta']['nextCursor']);
-        $next = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', $page['meta']['nextCursor'], null);
+        $next = $gateway->history(self::ADDRESS, 'mainnet', 'operations', 50, 'desc', $page['meta']['nextCursor'], null);
         self::assertSame(str_repeat('b', 64), $next['records'][0]['hash']);
         self::assertSame('99', $next['meta']['nextCursor']);
         self::assertStringContainsString('cursor=100', $second->getRequestUrl());
+    }
+
+    public function testTransactionsUseConfiguredHorizonWithOrionEnabled(): void
+    {
+        $previous = getenv('STELLAR_HORIZON_MAINNET_URL');
+        putenv('STELLAR_HORIZON_MAINNET_URL=https://configured-horizon.example');
+        try {
+            $first = $this->response(['_embedded' => ['records' => [['paging_token' => '100']]],
+                '_links' => ['next' => ['href' => 'https://configured-horizon.example/accounts/'.self::ADDRESS.'/transactions?cursor=100']]]);
+            $second = $this->response(['_embedded' => ['records' => [['paging_token' => '99']]]]);
+            $gateway = $this->gateway(new MockHttpClient([$first, $second]));
+            $page = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', null, false);
+            $next = $gateway->history(self::ADDRESS, 'mainnet', 'transactions', 50, 'desc', $page['meta']['nextCursor'], false);
+
+            self::assertSame('horizon', $page['meta']['source']);
+            self::assertSame('horizon', $next['meta']['source']);
+            self::assertStringStartsWith('https://configured-horizon.example/accounts/'.self::ADDRESS.'/transactions?', $first->getRequestUrl());
+            self::assertStringStartsWith('https://configured-horizon.example/accounts/'.self::ADDRESS.'/transactions?', $second->getRequestUrl());
+            self::assertStringContainsString('cursor=100', $second->getRequestUrl());
+            self::assertStringContainsString('limit=50', $second->getRequestUrl());
+            self::assertStringContainsString('order=desc', $second->getRequestUrl());
+            self::assertStringContainsString('include_failed=false', $second->getRequestUrl());
+            self::assertSame('99', $next['records'][0]['paging_token']);
+        } finally {
+            putenv($previous === false ? 'STELLAR_HORIZON_MAINNET_URL' : 'STELLAR_HORIZON_MAINNET_URL='.$previous);
+        }
+    }
+
+    public function testTestnetTransactionsUseTheirOwnHorizon(): void
+    {
+        $response = $this->response(['_embedded' => ['records' => []]]);
+        $page = $this->gateway(new MockHttpClient([$response]))->history(self::ADDRESS, 'testnet', 'transactions', 50, 'desc', null, null);
+        self::assertSame('horizon', $page['meta']['source']);
+        self::assertSame('testnet', $page['meta']['network']);
+        self::assertStringStartsWith('https://horizon-testnet.stellar.org/accounts/', $response->getRequestUrl());
+    }
+
+    public function testOperationsAndEffectsContinueToUseOrion(): void
+    {
+        foreach (['operations', 'effects'] as $kind) {
+            $response = $this->response(['_embedded' => ['records' => []]]);
+            $page = $this->gateway(new MockHttpClient([$response]))->history(self::ADDRESS, 'mainnet', $kind, 50, 'desc', null, null);
+            self::assertSame('orion', $page['meta']['source']);
+            self::assertStringStartsWith('https://orion.example/accounts/'.self::ADDRESS.'/'.$kind.'?', $response->getRequestUrl());
+        }
     }
 
     public function testEmptyPageTerminatesEvenWhenHalRepeatsNextLink(): void

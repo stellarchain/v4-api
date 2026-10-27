@@ -29,8 +29,8 @@ final class AccountHistoryControllerTest extends TestCase
 
         self::assertSame(200, $result->getStatusCode());
         self::assertSame([], $body['records']);
-        self::assertSame('orion', $body['meta']['source']);
-        self::assertStringContainsString('/accounts/'.self::ADDRESS.'/transactions?', $response->getRequestUrl());
+        self::assertSame('horizon', $body['meta']['source']);
+        self::assertStringStartsWith('https://horizon.stellar.org/accounts/'.self::ADDRESS.'/transactions?', $response->getRequestUrl());
         self::assertSame(1, $http->getRequestsCount());
     }
 
