@@ -51,6 +51,9 @@ final class ContractReadMapper
             'total_invokes' => $this->count($record, 'invocations_count'),
             // First-seen and deployment are deliberately separate facts.
             'orion_first_seen_at' => $record['first_seen_at'] ?? null,
+            'orion_last_seen_at' => $record['last_seen_at'] ?? null,
+            'orion_wasm_size_bytes' => $executable === 'wasm' && is_int($record['wasm_size_bytes'] ?? null)
+                && $record['wasm_size_bytes'] >= 8 && $record['wasm_size_bytes'] <= 2 * 1024 * 1024 ? $record['wasm_size_bytes'] : null,
             'orion_functions' => is_array($record['functions'] ?? null) ? $record['functions'] : [],
             'orion_archived' => is_bool($record['archived'] ?? null) ? $record['archived'] : null,
         ];

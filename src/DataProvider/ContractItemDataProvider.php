@@ -211,6 +211,8 @@ final class ContractItemDataProvider implements ProviderInterface
             'nativeMetadata' => $row['orion_sac_metadata'] ?? null,
             'archived' => $row['orion_archived'] ?? null,
             'firstSeenAt' => $this->toAtom($row['orion_first_seen_at'] ?? null),
+            'lastSeenAt' => $this->toAtom($row['orion_last_seen_at'] ?? null),
+            'wasmSizeBytes' => $row['orion_wasm_size_bytes'] ?? null,
             'network' => $network,
             'assetCode' => $this->nullableString($row['asset_code'] ?? null),
             'assetAddress' => $this->nullableString($row['asset_address'] ?? null),

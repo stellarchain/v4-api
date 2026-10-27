@@ -34,6 +34,22 @@ final class ContractReadGatewayTest extends TestCase
         self::assertArrayNotHasKey('deploy_source_account', $result);
     }
 
+    public function testObservationMetadataDoesNotBecomeDeploymentMetadata(): void
+    {
+        $record = self::contractRecord();
+        $record['first_seen_at'] = '2025-11-14T10:20:14Z';
+        $record['last_seen_at'] = '2025-12-23T15:04:00Z';
+        $record['wasm_size_bytes'] = 9865;
+        $record['archived'] = false;
+        $result = $this->gateway([self::response($record)])->findContract(self::CONTRACT_ID, 'mainnet');
+        self::assertSame('2025-11-14T10:20:14Z', $result['orion_first_seen_at']);
+        self::assertSame('2025-12-23T15:04:00Z', $result['orion_last_seen_at']);
+        self::assertSame(9865, $result['orion_wasm_size_bytes']);
+        self::assertFalse($result['orion_archived']);
+        self::assertArrayNotHasKey('created_at', $result);
+        self::assertArrayNotHasKey('deployed_at', $result);
+    }
+
     public function testNonMainnetAndDisabledReadsNeverRequestOrion(): void
     {
         $http = new MockHttpClient([]);

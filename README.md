@@ -44,6 +44,12 @@ php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-res
 php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-result tests/DataProvider/AccountItemReadOnlyTest.php
 ```
 
+Account history follows the upstream HAL continuation cursor even when Orion
+returns fewer records than the requested limit. A short page is not treated as
+the end of history. The frontend uses `meta.hasMore` and `meta.nextCursor` for
+transaction/operation pagination; empty pages terminate the traversal and a
+non-advancing cursor fails with 503. Upstream continuation URLs are never followed.
+
 ## Orion contract reads
 
 `GET /v1/contracts/{contractId}/wasm?network=mainnet` downloads the compiled
@@ -115,6 +121,13 @@ On-demand WASM decompilation:
 - SACs expose their asset identity, XDR-decoded native metadata and function
   interface. Asset identity is checked against the derived mainnet SAC address.
   SACs run inside Stellar's host and have no WASM to download or decompile.
+
+
+Contract Overview also exposes indexed observation dates, archived status, WASM
+size and the ABI. The frontend decodes known storage keys (administrator, owner,
+active/paused state, linked CARBON/CarbonSINK contracts and raw sink minimum).
+Observation dates remain separate from verified deployment dates; no unit conversion
+or deployer identity is inferred from these values.
 
 Focused checks (no database or network required):
 
