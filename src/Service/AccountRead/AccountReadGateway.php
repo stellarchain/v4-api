@@ -61,7 +61,7 @@ final class AccountReadGateway
             throw new BadRequestHttpException('Invalid account history query.');
         }
         $network = $this->networkResolver->normalizeNetwork($network);
-        $orion = $network === 'mainnet' && $this->enabled;
+        $orion = $kind !== 'transactions' && $network === 'mainnet' && $this->enabled;
         $base = $orion ? $this->orionUrl : $this->networkResolver->resolveHorizonUrl($network);
         $query = ['limit' => $limit, 'order' => $order];
         if ($cursor !== null && $cursor !== '') {
