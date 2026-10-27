@@ -7,6 +7,7 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
+use App\Service\ContractRead\ContractReadGateway;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
@@ -28,6 +29,7 @@ final class ContractEventsCollectionProvider implements ProviderInterface
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
         private readonly ContractTransparencyCursor $cursorCodec,
+        private readonly ?ContractReadGateway $contractReadGateway = null,
     ) {
     }
 
@@ -67,6 +69,16 @@ final class ContractEventsCollectionProvider implements ProviderInterface
             [$ledgerStart, $ledgerEnd] = [$ledgerEnd, $ledgerStart];
         }
         $txHash = $this->normalizeNullableString($request?->query->get('txHash', $filters['txHash'] ?? $filters['tx_hash'] ?? null));
+
+        $orion = $this->contractReadGateway?->collection($contractId, $network, 'events', [
+            'page' => $page, 'itemsPerPage' => $itemsPerPage, 'cursor' => $cursor,
+            'beforeId' => $beforeId, 'ledgerStart' => $ledgerStart, 'ledgerEnd' => $ledgerEnd, 'txHash' => $txHash,
+        ]);
+        if ($orion !== null) {
+            $request?->attributes->set('_cursor_meta', $orion['meta']);
+
+            return $orion['items'];
+        }
 
         $contractDbId = $this->connection->fetchOne(
             'SELECT c.id

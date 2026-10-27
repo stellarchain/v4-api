@@ -8,6 +8,7 @@ use ApiPlatform\State\ProviderInterface;
 use App\Entity\Account;
 use App\Entity\AccountMetric;
 use App\Repository\AccountRepository;
+use App\Service\AccountRead\AccountReadGateway;
 use App\Service\Stellar\StellarNetworkResolver;
 use Doctrine\ORM\EntityManagerInterface;
 use Soneso\StellarSDK\Crypto\StrKey;
@@ -23,6 +24,7 @@ final class AccountItemDataProvider implements ProviderInterface
         private readonly AccountRepository $repository,
         private readonly EntityManagerInterface $entityManager,
         private readonly StellarNetworkResolver $stellarNetworkResolver,
+        private readonly AccountReadGateway $accountReadGateway,
     ) {
     }
 
@@ -40,43 +42,55 @@ final class AccountItemDataProvider implements ProviderInterface
 
         $network = $this->resolveNetwork($context);
         $networkCode = $this->stellarNetworkResolver->resolveNetworkCode($network) ?? 1;
-        $sdk = new StellarSDK($this->stellarNetworkResolver->resolveHorizonUrl($network));
+        $localAccount = $this->repository->findOneByAddressAndNetwork($address, $networkCode);
+        $chain = $this->accountReadGateway->account($address, $network);
+        if ($localAccount === null && $chain === null) {
+            return null;
+        }
 
-        $account = $this->repository->findOneByAddressAndNetwork($address, $networkCode);
-
-        try {
-            $horizonAccount = $sdk->requestAccount($address);
-        } catch (HorizonRequestException $exception) {
-            if (in_array($exception->getStatusCode(), [400, 404], true)) {
-                if ($account instanceof Account) {
-                    $this->attachLocalAccountData($account, $networkCode);
+        // GET responses are detached read models, including unknown local accounts.
+        // Never persist/flush enrichment as a side effect of viewing an address.
+        $account = $localAccount !== null ? clone $localAccount : (new Account())
+            ->setAddress($address)->setNetwork($networkCode)->setVerified(false);
+        $stellarData = $account->getStellarData() ?? [];
+        $stellarData['network'] = $network;
+        $stellarData['source'] = $chain['source'] ?? null;
+        $stellarData['horizon'] = $chain['record'] ?? null;
+        $stellarData['stateAvailable'] = $chain !== null;
+        $nativeBalance = null;
+        if ($chain !== null) {
+            $record = $chain['record'];
+            $stellarData['accountId'] = $address;
+            $stellarData['sequence'] = $record['sequence'];
+            $stellarData['subentryCount'] = $record['subentry_count'] ?? null;
+            $stellarData['lastModifiedLedger'] = $record['last_modified_ledger'] ?? null;
+            $stellarData['lastModifiedTime'] = $record['last_modified_time'] ?? null;
+            $stellarData['balances'] = [];
+            foreach ($record['balances'] as $balance) {
+                if (($balance['asset_type'] ?? null) === 'native') {
+                    $nativeBalance = (string) $balance['balance'];
                 }
-                return $account;
+                $stellarData['balances'][] = [
+                    'assetType' => $balance['asset_type'] ?? null,
+                    'assetCode' => $balance['asset_code'] ?? null,
+                    'assetIssuer' => $balance['asset_issuer'] ?? null,
+                    'balance' => $balance['balance'] ?? null,
+                    'buyingLiabilities' => $balance['buying_liabilities'] ?? null,
+                    'sellingLiabilities' => $balance['selling_liabilities'] ?? null,
+                    'limit' => $balance['limit'] ?? null,
+                ];
             }
-            throw $exception;
+            if ($nativeBalance !== null) {
+                $localMetric = $account->getAccountMetric();
+                $metric = $localMetric !== null ? clone $localMetric : new AccountMetric();
+                $metric->setAccount($account)->setNativeBalance($nativeBalance);
+                $account->setAccountMetric($metric);
+            }
         }
-
-        $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-        $isNew = false;
-
-        if ($account === null) {
-            $account = (new Account())
-                ->setAddress($address)
-                ->setNetwork($networkCode)
-                ->setVerified(false)
-                ->setCreatedAt($now)
-                ->setUpdatedAt($now);
-            $isNew = true;
-        } else {
-            $account->setUpdatedAt($now);
+        $account->setStellarData($stellarData);
+        if ($localAccount !== null) {
+            $this->attachLocalAccountData($account, $networkCode, $nativeBalance);
         }
-
-        $this->hydrateAccountFromHorizon($account, $horizonAccount, $network, $networkCode);
-
-        if ($isNew) {
-            $this->entityManager->persist($account);
-        }
-        $this->entityManager->flush();
 
         return $account;
     }

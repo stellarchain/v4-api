@@ -7,6 +7,7 @@ namespace App\DataProvider;
 use ApiPlatform\DependencyInjection\Attribute\AsTaggedItem;
 use ApiPlatform\Metadata\Operation;
 use ApiPlatform\State\ProviderInterface;
+use App\Service\ContractRead\ContractReadGateway;
 use App\Service\ContractTransparency\ContractTransparencyCursor;
 use App\Service\ContractTransparency\ContractVisibilitySql;
 use App\Service\Stellar\StellarNetworkResolver;
@@ -28,6 +29,7 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         private readonly StellarNetworkResolver $stellarNetworkResolver,
         private readonly RequestStack $requestStack,
         private readonly ContractTransparencyCursor $cursorCodec,
+        private readonly ?ContractReadGateway $contractReadGateway = null,
     ) {
     }
 
@@ -68,6 +70,17 @@ final class ContractTransactionsCollectionProvider implements ProviderInterface
         }
         $invocationsOnly = $this->parseNullableBool($request?->query->get('invocationsOnly', $filters['invocationsOnly'] ?? $filters['invocations_only'] ?? null)) === true;
         $limitForFetch = $itemsPerPage + 1;
+
+        $orion = $this->contractReadGateway?->collection($contractId, $network, 'transactions', [
+            'page' => $page, 'itemsPerPage' => $itemsPerPage, 'cursor' => $cursor,
+            'beforeId' => $beforeId, 'ledgerStart' => $ledgerStart, 'ledgerEnd' => $ledgerEnd,
+            'invocationsOnly' => $invocationsOnly,
+        ]);
+        if ($orion !== null) {
+            $request?->attributes->set('_cursor_meta', $orion['meta']);
+
+            return $orion['items'];
+        }
 
         $contractDbId = $this->connection->fetchOne(
             'SELECT c.id

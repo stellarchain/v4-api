@@ -8,6 +8,88 @@ Q3 bounded API compatibility, Investigator V2 and historical metric read-model g
 
 Partner discovery, protected web administration and aggregate click CSV reports: [partner runbook](docs/partners.md).
 
+## Orion account reads
+
+`GET /v1/accounts/{address}` reads mainnet state from Orion, with Horizon state
+fallback. Its existing local labels, verification and metrics remain available;
+`stellarData.horizon` contains the Horizon-shaped current state and
+`stellarData.source` identifies its provider. The GET returns detached account and
+metric objects and does not persist, flush or register missing local accounts.
+The explicit synchronization method retains its existing write behavior.
+
+`GET /v1/accounts/{address}/{transactions|operations|effects}` proxies bounded
+history reads through the API without requiring a local/current account record.
+It accepts `network`, `limit` (1..200), `order`, `cursor`, and `include_failed`
+for transaction/operation reads. Responses contain `records` plus `meta` with
+provider, network, continuation cursor and `hasMore`. Mainnet uses Orion;
+testnet/futurenet use their configured Horizon endpoints. History failures return
+503, not an empty successful history. These endpoints do not write to the DB.
+
+`ORION_ACCOUNT_READS_ENABLED` defaults to `1`; set `0` to use Horizon for account
+reads. `ORION_BASE_URL` is shared with contract reads. Account calls have a
+2-second inactivity timeout, 5-second deadline, 8 MiB response ceiling and no
+redirects or automatic retry loop. Deploy this backend before the account UI that
+consumes `stellarData.horizon` and the new history endpoints.
+
+A 404 current-state response does not establish that an address has no history.
+The frontend displays a separate history view without fabricated balances. For
+the address supplied on 2026-10-27, both state providers returned 404; Orion's
+transaction history returned 503 (resource limit), and operations returned 500.
+The integration preserves these upstream limitations as visible retryable errors.
+
+Focused tests:
+
+```bash
+php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-result tests/Service/AccountReadGatewayTest.php
+php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-result tests/DataProvider/AccountItemReadOnlyTest.php
+```
+
+## Orion contract reads
+
+The browser continues to use `/v1/contracts/{contractId}` and its `/events`,
+`/transactions`, and `/storage` subresources. The API reads Orion on mainnet,
+including contracts absent from the local database. These are read-only requests;
+no contract is inserted or synchronized into the database. `/v1/contracts` listing,
+local verified/source metadata, balances, activity and argument-usage indexes stay
+on their existing providers. Testnet and futurenet keep their existing sources.
+
+- `ORION_BASE_URL`: backend-only upstream URL, default `https://pubnet.stellarchain.io`.
+- `ORION_CONTRACT_READS_ENABLED`: default `1`; set `0` to use existing DB/RPC reads.
+- HTTP reads have a 2-second inactivity timeout, a 3-second per-call deadline,
+  a 4 MiB response ceiling, and no redirects. Upstream failures, incompatible
+  schemas and identity mismatches fall back to local reads on the first page.
+  Continuation failures return 503 rather than mixing upstream and local pages.
+- A local WASM hash mismatch rejects the upstream detail enrichment, preserving
+  locally stored verification/source provenance. Counts retain the larger known
+  local/upstream value; neither counts nor empty lists establish full coverage.
+- Orion `first_seen_at` is exposed as `firstSeenAt`, not as a proven deployment
+  date. `functions`, `archived`, and `chainDataSource` are additive detail fields.
+- Transaction pages are accepted only with envelope evidence of a direct call or
+  a contract-data footprint reference. `invocationsOnly=true` requires a direct
+  call. The currently observed unrelated DEX transactions are rejected; the API
+  falls back to its local history when available. Nested calls without direct
+  envelope evidence remain on local history until upstream association is verified.
+- Collections retain camelCase fields and `meta.hasMore`/`meta.nextCursor`.
+  Orion records have `id: null` and an additive `upstreamId`; they do not acquire
+  fabricated local DB identifiers. Storage exposes separate key/value ScVals as
+  `entryDecoded.key`, `entryDecoded.valueXdr`, and `entryDecoded.durability` when
+  no complete ledger-entry XDR is supplied.
+- Opaque Orion cursors bind contract, resource, page size and invocation mode.
+  They cannot be combined with local `beforeId`, ledger or transaction filters.
+  Existing local filters/cursors keep their DB semantics. Page-number clients
+  use 30-second cached continuation positions to avoid repeated prefix scans;
+  an uncached jump requiring more than 10 upstream pages returns 503. A request
+  also has a 10-second pagination budget. Prefer `meta.nextCursor` for deep history.
+- Orion's currently unpaginated `/data` response is sliced locally for numeric
+  storage pages, with exact `meta.totalItems` and `meta.hasMore`.
+
+Focused checks (no database or network required):
+
+```bash
+php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-result tests/Service/ContractRead
+php vendor/bin/simple-phpunit --bootstrap vendor/autoload.php --do-not-cache-result tests/DataProvider/OrionContractProvidersTest.php
+```
+
 ## Implemented
 
 - API Platform with `/v1` docs and `/v1/accounts` collection.
